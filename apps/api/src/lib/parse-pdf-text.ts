@@ -351,9 +351,9 @@ function extractLines(text: string): InvoiceLine[] {
 }
 
 function labeledAmount(text: string, label: string): number | null {
-  // Optional (%18) and optional colon: "Ödenecek Tutar: 5.300,00 TL"
+  // Optional (%18) / colon / TL|TRY: "ÖDENECEK TUTAR   359,96 TRY"
   const re = new RegExp(
-    `${label}(?:\\s*\\([^)]*\\))?\\s*:?\\s*([\\d.\\s]+,\\d{2})\\s*TL?`,
+    `${label}(?:\\s*\\([^)]*\\))?\\s*:?\\s*([\\d.\\s]+,\\d{2,})\\s*(?:TL|TRY)?`,
     "gi",
   );
   const matches = [...text.matchAll(re)];
@@ -389,6 +389,7 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const { date: issueDate, time: issueTimeFromDate } = parseIssueDateTime(issueRaw);
   const saati = rightField(normalized, "Fatura Saati");
   const olusma = rightField(normalized, "Oluşma Zamanı");
+  const duzenlemeZamani = rightField(normalized, "Düzenleme Zamanı");
   const issueTime =
     issueTimeFromDate ??
     (saati && /^\d{1,2}:\d{2}(:\d{2})?$/.test(saati.trim())
@@ -396,7 +397,8 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
         ? `${saati.trim()}:00`
         : saati.trim()
       : null) ??
-    (olusma?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null);
+    (olusma?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null) ??
+    (duzenlemeZamani?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null);
 
   const uuid = firstMatch(
     normalized,
@@ -454,13 +456,22 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     customer: extractCustomer(normalized),
     lines: extractLines(normalized),
     totals: {
-      lineExtensionAmount: labeledAmount(normalized, "Mal Hizmet Toplam Tutarı"),
-      discountTotal: labeledAmount(normalized, "Toplam İskonto"),
-      // Tevkifat satırını yakalamamak için önce tam eşleşme, sonra genel KDV
+      lineExtensionAmount:
+        labeledAmount(normalized, "Mal Hizmet Toplam Tutarı") ??
+        labeledAmount(normalized, "NET TOPLAM"),
+      discountTotal:
+        labeledAmount(normalized, "Toplam İskonto") ??
+        labeledAmount(normalized, "TOPLAM [İI]SKONTO"),
       withholdingVatAmount: labeledAmount(normalized, "Hesaplanan KDV Tevkifat"),
-      vatAmount: labeledAmount(normalized, "Hesaplanan KDV(?!\\s*Tevkifat)"),
-      taxInclusiveAmount: labeledAmount(normalized, "Vergiler Dahil Toplam Tutar"),
-      payableAmount: labeledAmount(normalized, "Ödenecek Tutar"),
+      vatAmount:
+        labeledAmount(normalized, "Hesaplanan KDV(?!\\s*Tevkifat)") ??
+        labeledAmount(normalized, "KDV"),
+      taxInclusiveAmount:
+        labeledAmount(normalized, "Vergiler Dahil Toplam Tutar") ??
+        labeledAmount(normalized, "VERG[İI] DAH[İI]L TOPLAM TUTAR"),
+      payableAmount:
+        labeledAmount(normalized, "Ödenecek Tutar") ??
+        labeledAmount(normalized, "ÖDENECEK TUTAR"),
       currency: "TRY",
     },
     notes,
