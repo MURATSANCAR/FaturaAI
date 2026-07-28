@@ -2,16 +2,11 @@ import { parsePercent, parseTrMoney } from "./money.js";
 import type { InvoiceLine, InvoiceParty, ParsedInvoice } from "../types.js";
 
 function rightField(text: string, label: string): string | null {
-  const re = new RegExp(
-    `${label}\\s*:\\s*([^\\n]+)`,
-    "i",
-  );
+  // "Fatura No: X" or Babymall-style "Fatura No             X" (colon optional)
+  const re = new RegExp(`${label}\\s*:?\\s*([^\\n]+)`, "i");
   const m = text.match(re);
   if (!m) return null;
-  // Layout often puts value after lots of spaces on same visual row —
-  // take last non-empty token group after label on that match.
   const raw = m[1].trim();
-  // Prefer value that appears after large whitespace gap (right column)
   const parts = raw.split(/\s{2,}/).map((p) => p.trim()).filter(Boolean);
   return (parts[parts.length - 1] ?? raw).trim() || null;
 }
@@ -54,10 +49,19 @@ function extractSupplier(text: string): InvoiceParty {
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
-    .filter((l) => !/^e-?Ar[sş]iv\s+Fatura$/i.test(l));
+    .filter((l) => !/^e-?Ar[sş]iv\s+Fatura$/i.test(l))
+    .filter((l) => !/^Sayfa\s+\d+/i.test(l));
 
-  if (lines[0] && !/^(Tel|Web|E-Posta|Vergi|TCKN|VKN|Kap[ıi])/i.test(lines[0])) {
-    party.name = lines[0].slice(0, 160);
+  if (lines[0] && !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi])/i.test(lines[0])) {
+    let name = lines[0];
+    if (
+      lines[1] &&
+      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M)/i.test(lines[1]) &&
+      !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)/i.test(lines[1])
+    ) {
+      name = `${lines[0]} ${lines[1]}`;
+    }
+    party.name = name.slice(0, 180);
   }
 
   const addrParts: string[] = [];
@@ -69,8 +73,8 @@ function extractSupplier(text: string): InvoiceParty {
   }
   party.address = addrParts.join(", ").replace(/\s+/g, " ").trim() || null;
 
-  party.phone = firstMatch(head, /Tel\s*:\s*([0-9\s]+?)(?:\s+Fax|$)/i)?.replace(/\s+/g, "") || null;
-  party.email = firstMatch(head, /E-Posta\s*:\s*([^\s]+)/i);
+  party.phone = firstMatch(head, /Tel\s*:\s*([0-9\s()]+?)(?:\s+Fax|$|\n)/i)?.replace(/\s+/g, "") || null;
+  party.email = firstMatch(head, /E-?Posta\s*:\s*([^\s]+)/i);
   party.website = firstMatch(head, /Web\s*Sitesi\s*:\s*([^\s]+)/i);
   if (party.website && /Özelleştirme/i.test(party.website)) party.website = null;
 
@@ -137,6 +141,16 @@ function extractCustomer(text: string): InvoiceParty {
     }
   }
   party.name = nameParts.join(" ").replace(/\s+/g, " ").trim() || null;
+  // "SEVECEN MARKET SEVECEN MARKET" → tek kez
+  if (party.name) {
+    const halves = party.name.split(/\s+/);
+    const mid = Math.floor(halves.length / 2);
+    if (mid > 0) {
+      const a = halves.slice(0, mid).join(" ");
+      const b = halves.slice(mid).join(" ");
+      if (a === b) party.name = a;
+    }
+  }
   party.address = addrParts.join(", ").replace(/\s+/g, " ").trim() || null;
 
   // Customer tax info sits near SAYIN block (may share line with right column)
@@ -147,15 +161,19 @@ function extractCustomer(text: string): InvoiceParty {
       ?.trim() || null;
   const vkn = firstMatch(near, /VKN\s*:\s*(\d{10})/i);
   const tckn = firstMatch(near, /TCKN\s*:\s*(\d{11})/i);
-  if (vkn) {
-    party.taxId = vkn;
-    party.taxIdScheme = "VKN";
-  } else if (tckn) {
+  const vknTckn = firstMatch(near, /VKN\s*\/\s*TCKN\s*:?\s*(\d{10,11})/i);
+  if (tckn) {
     party.taxId = tckn;
     party.taxIdScheme = "TCKN";
+  } else if (vkn) {
+    party.taxId = vkn;
+    party.taxIdScheme = "VKN";
+  } else if (vknTckn) {
+    party.taxId = vknTckn;
+    party.taxIdScheme = vknTckn.length === 11 ? "TCKN" : "VKN";
   }
 
-  party.email = firstMatch(near, /E-Posta\s*:\s*([^\s]+)/i);
+  party.email = firstMatch(near, /E-?Posta\s*:\s*([^\s]+)/i);
   if (party.email && /Özelleştirme|Senaryo/i.test(party.email)) party.email = null;
 
   return party;
@@ -172,15 +190,33 @@ const LINE_WITH_UNIT =
 const LINE_EDM =
   /^\s*(\d+)\s+(.*?)\s+(\d+(?:[.,]\d+)?)\s+([\d.\s]+,\d{2}|\d+)\s*TL\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*TL(?:\s+([\d.\s]+,\d{2})\s*TL)?\s*$/i;
 
+/**
+ * Moda Jant / ürün kodlu layout — fiyatlar üst satırda olabilir:
+ * "1  468621  205/55 R17 …  4 Adet  %18,00  808,47"
+ */
+const LINE_PRODUCT_CODE =
+  /^\s*(\d+)\s+(\d{4,})\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|NIU)\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*$/i;
+
+/**
+ * Babymall / TRY layout:
+ * "1    1,0   108,3300 TRY   33,33 TRY   %20.00   74,99 TRY"
+ */
+const LINE_TRY =
+  /^\s*(\d+)\s+(\d+,\d+)\s+([\d.]+,\d+)\s*TRY\s+([\d.]+,\d+)\s*TRY\s+%([\d.]+)\s+([\d.]+,\d+)\s*TRY\s*$/i;
+
+const MONEY_PAIR_ROW = /^\s*([\d.\s]+,\d{2})\s+([\d.\s]+,\d{2})\s*$/;
+
 function isLineContinuation(line: string): boolean {
   const t = line.trim();
   if (!t) return false;
   if (/^\d+\s/.test(t)) return false;
-  if (/^(S[ıi]ra|Mal\s+Hizmet|No\b|NOTLAR|Not:|ETTN|Ödenecek|Vergiler|Hesaplanan|Toplam|Mal Hizmet Toplam)/i.test(t)) {
+  if (/^(S[ıi]ra|Mal\s*\/?\s*Hizmet|No\b|NOTLAR|Not:|ETTN|Ödenecek|ÖDENECEK|Vergiler|Hesaplanan|Toplam|NET TOPLAM|Ta[sş][ıi]yan)/i.test(t)) {
     return false;
   }
-  if (/^[%\d]/.test(t) && /TL/.test(t)) return false;
-  return t.length > 1 && t.length < 120;
+  if (/^[%\d]/.test(t) && /TL|TRY/.test(t)) return false;
+  if (MONEY_PAIR_ROW.test(t)) return false;
+  if (LINE_TRY.test(t)) return false;
+  return t.length > 1 && t.length < 160;
 }
 
 function extractLines(text: string): InvoiceLine[] {
@@ -213,20 +249,76 @@ function extractLines(text: string): InvoiceLine[] {
       continue;
     }
 
+    const coded = row.match(LINE_PRODUCT_CODE);
+    if (coded) {
+      let unitPrice: number | null = null;
+      let lineTotal: number | null = null;
+      if (i > 0) {
+        const pair = rawLines[i - 1].match(MONEY_PAIR_ROW);
+        if (pair) {
+          unitPrice = parseTrMoney(pair[1]);
+          lineTotal = parseTrMoney(pair[2]);
+        }
+      }
+      const qty = Number.parseFloat(coded[4].replace(",", "."));
+      if (unitPrice == null && lineTotal != null && qty > 0) {
+        unitPrice = Number((lineTotal / qty).toFixed(2));
+      }
+      lines.push({
+        id: coded[1],
+        name: `${coded[2]} ${coded[3]}`.replace(/\s+/g, " ").trim(),
+        quantity: qty,
+        unit: coded[5],
+        unitPrice,
+        discountRate: null,
+        discountAmount: null,
+        vatRate: parsePercent(coded[6]),
+        vatAmount: parseTrMoney(coded[7]),
+        withholdingNote: null,
+        lineTotal,
+      });
+      continue;
+    }
+
+    const tryLine = row.match(LINE_TRY);
+    if (tryLine) {
+      const nameParts: string[] = [];
+      if (i > 0 && isLineContinuation(rawLines[i - 1])) {
+        nameParts.push(rawLines[i - 1].trim());
+      }
+      if (i + 1 < rawLines.length && isLineContinuation(rawLines[i + 1])) {
+        nameParts.push(rawLines[i + 1].trim());
+      }
+      lines.push({
+        id: tryLine[1],
+        name: nameParts.join(" ").replace(/\s+/g, " ").trim() || null,
+        quantity: Number.parseFloat(tryLine[2].replace(",", ".")),
+        unit: "Adet",
+        unitPrice: parseTrMoney(tryLine[3]),
+        discountRate: null,
+        discountAmount: parseTrMoney(tryLine[4]),
+        vatRate: parsePercent(tryLine[5]),
+        vatAmount: null,
+        withholdingNote: null,
+        lineTotal: parseTrMoney(tryLine[6]),
+      });
+      continue;
+    }
+
     const edm = row.match(LINE_EDM);
     if (!edm) continue;
 
     const nameParts: string[] = [];
     if (edm[2].trim()) nameParts.push(edm[2].replace(/\s+/g, " ").trim());
-    // Wrap: en fazla 1 satır yukarı / 1 satır aşağı (EDM çok satırlı ürün adları)
     if (i > 0 && isLineContinuation(rawLines[i - 1])) {
       nameParts.unshift(rawLines[i - 1].trim());
     }
     if (i + 1 < rawLines.length && isLineContinuation(rawLines[i + 1])) {
-      // Bir sonraki satır yeni kalem numarasıysa, aradaki wrap o kaleme aittir
       const nextIsNewLine =
         i + 2 < rawLines.length &&
-        (LINE_EDM.test(rawLines[i + 2]) || LINE_WITH_UNIT.test(rawLines[i + 2]));
+        (LINE_EDM.test(rawLines[i + 2]) ||
+          LINE_WITH_UNIT.test(rawLines[i + 2]) ||
+          LINE_PRODUCT_CODE.test(rawLines[i + 2]));
       if (!nextIsNewLine) {
         nameParts.push(rawLines[i + 1].trim());
       }
@@ -259,9 +351,9 @@ function extractLines(text: string): InvoiceLine[] {
 }
 
 function labeledAmount(text: string, label: string): number | null {
-  // Allow optional (%20) style suffix between label and amount
+  // Optional (%18) and optional colon: "Ödenecek Tutar: 5.300,00 TL"
   const re = new RegExp(
-    `${label}(?:\\s*\\([^)]*\\))?\\s+([\\d.\\s]+,\\d{2})\\s*TL?`,
+    `${label}(?:\\s*\\([^)]*\\))?\\s*:?\\s*([\\d.\\s]+,\\d{2})\\s*TL?`,
     "gi",
   );
   const matches = [...text.matchAll(re)];
@@ -288,16 +380,23 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     null;
   if (invoiceNumber) invoiceNumber = invoiceNumber.replace(/\s+/g, "").toUpperCase();
 
-  const issueRaw = rightField(normalized, "Fatura Tarihi");
+  const issueRaw =
+    rightField(normalized, "Fatura Tarihi") ||
+    firstMatch(
+      normalized,
+      /(?:^|\n)[^\n]*?\bTarih\s*:\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})/i,
+    );
   const { date: issueDate, time: issueTimeFromDate } = parseIssueDateTime(issueRaw);
   const saati = rightField(normalized, "Fatura Saati");
+  const olusma = rightField(normalized, "Oluşma Zamanı");
   const issueTime =
     issueTimeFromDate ??
     (saati && /^\d{1,2}:\d{2}(:\d{2})?$/.test(saati.trim())
       ? saati.trim().length === 5
         ? `${saati.trim()}:00`
         : saati.trim()
-      : null);
+      : null) ??
+    (olusma?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null);
 
   const uuid = firstMatch(
     normalized,
@@ -316,13 +415,29 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     .filter((n) => n && !/^#\s*$/.test(n) && n.length > 1)
     .slice(0, 12);
 
-  const notes = notesFromBlock.length > 0 ? notesFromBlock : notesFromNot;
+  const notesFromStar = [...normalized.matchAll(/^\s*\*\s*(.+)$/gim)]
+    .map((m) => m[1].trim())
+    .filter((n) => n.length > 1)
+    .slice(0, 12);
+
+  const notes =
+    notesFromBlock.length > 0
+      ? notesFromBlock
+      : notesFromNot.length > 0
+        ? notesFromNot
+        : notesFromStar;
 
   const iban =
     firstMatch(normalized, /İ?BAN\s*:\s*(TR[\d\s]+)/i)?.replace(/\s+/g, "").toUpperCase() ||
     null;
+  const bankFromIbanLine = firstMatch(
+    normalized,
+    /([A-ZÇĞİÖŞÜa-zçğıöşü ]+BANKASI)\s*\/\s*I?İ?BAN/i,
+  );
   const bankName =
-    notes.find((n) => /BANKASI|BANKA/i.test(n) && !/İBAN|IBAN/i.test(n)) ?? null;
+    bankFromIbanLine?.replace(/\s+/g, " ").trim() ??
+    notes.find((n) => /BANKASI|BANKA/i.test(n) && !/İBAN|IBAN/i.test(n)) ??
+    null;
   const bankBranch =
     notes.find((n) => /ŞUBE|SUBESI|ŞUBESİ/i.test(n)) ?? null;
 

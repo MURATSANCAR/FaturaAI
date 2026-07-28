@@ -99,3 +99,36 @@ describe("parseGibPdfText — KVI EDM sample", () => {
     assert.deepEqual(validateInvoice(invoice), []);
   });
 });
+
+describe("parseGibPdfText — MDA Moda Jant sample", () => {
+  const mdaText = readFileSync(join(root, "samples/mda.pdftotext.txt"), "utf8");
+  const invoice = parseGibPdfText(mdaText, "MDA2022000002839.pdf");
+
+  it("reads meta and parties", () => {
+    assert.equal(invoice.invoiceNumber, "MDA2022000002839");
+    assert.equal(invoice.issueDate, "2022-12-25");
+    assert.equal(invoice.issueTime, "14:37:45");
+    assert.match(invoice.supplier.name ?? "", /MODA JANT/i);
+    assert.match(invoice.supplier.name ?? "", /LTD/i);
+    assert.equal(invoice.customer.name, "SEVECEN MARKET");
+    assert.equal(invoice.customer.taxId, "47263025470");
+  });
+
+  it("reads tire line with product code", () => {
+    assert.equal(invoice.lines.length, 1);
+    assert.match(invoice.lines[0].name ?? "", /205\/55/);
+    assert.equal(invoice.lines[0].quantity, 4);
+    assert.ok(nearlyEqual(invoice.lines[0].unitPrice ?? 0, 1122.88));
+    assert.ok(nearlyEqual(invoice.lines[0].lineTotal ?? 0, 4491.53));
+    assert.ok(nearlyEqual(invoice.lines[0].vatRate ?? 0, 18));
+    assert.ok(nearlyEqual(invoice.lines[0].vatAmount ?? 0, 808.47));
+  });
+
+  it("reads totals and IBAN", () => {
+    assert.ok(nearlyEqual(invoice.totals.payableAmount ?? 0, 5300));
+    assert.ok(nearlyEqual(invoice.totals.vatAmount ?? 0, 808.47));
+    assert.equal(invoice.iban, "TR690006701000000044285758");
+    assert.match(invoice.bankName ?? "", /YAPI KRED/i);
+    assert.deepEqual(validateInvoice(invoice), []);
+  });
+});
