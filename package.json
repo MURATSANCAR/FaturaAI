@@ -1,0 +1,16 @@
+{
+  "name": "fatura-ai",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @fatura-ai/api",
+    "dev:web": "npm run dev -w @fatura-ai/web",
+    "build": "npm run build -w @fatura-ai/api && npm run build -w @fatura-ai/web",
+    "test": "npm run test -w @fatura-ai/api",
+    "start:api": "npm run start -w @fatura-ai/api"
+  }
+}

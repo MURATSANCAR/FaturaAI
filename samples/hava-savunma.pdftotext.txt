@@ -1,0 +1,57 @@
+Bahattin yıldırım
+  Kapı No:02
+ Alaca/ Çorum /
+Tel: 05377168746 Fax:
+Web Sitesi:
+E-Posta: bahattinyldrm0619@gmail.com
+Vergi Dairesi: ALACA MALMÜD./MUH MÜD.
+TCKN: 11440998130
+                                                                       e-Arşiv Fatura
+
+SAYIN
+HAVA SAVUNMA SİSTEMLERİ SANAYİ TİCARET LİMİTED
+ŞİRKETİ
+Konut kent mah. Dumlupınar Bul. no399 Ankara No:
+Kapı No:
+ / Türkiye
+Web Sitesi:                                                                                                  Özelleştirme No:        TR1.2
+E-Posta:
+                                                                                                             Senaryo:                EARSIVFATURA
+Tel: Fax:
+Vergi Dairesi: DOĞANBEY VERGİ DAİRESİ MÜD.                                                                   Fatura Tipi:            TEVKIFAT
+VKN: 4590660068                                                                                              Fatura No:              GIB2026000000059
+                                                                                                             Fatura Tarihi:          22-07-2026 11:59
+ETTN: 4176f1ad-f933-44f8-9657-8a42b3d31354
+
+
+                                                           İskonto/     İskonto/     İskonto/                                                         Mal
+Sıra                                                                                               KDV
+               Mal Hizmet         Miktar     Birim Fiyat    Arttırım     Arttırım     Arttırım               KDV Tutarı         Diğer Vergiler       Hizmet
+No                                                                                                 Oranı
+                                                             Oranı        Tutarı      Nedeni                                                         Tutarı
+                                                                                                                                     KDV TEVKİFAT 16.000,00
+ 1     Nakliye bedeli               1 Adet    16.000 TL      %0,00         0,00 TL    İskonto -    %20,00     3.200,00 TL
+                                                                                                                                (%20,00)=640,00 TL       TL
+
+                                                                                                                 Mal Hizmet Toplam Tutarı        16.000,00 TL
+                                                                                                                            Toplam İskonto            0,00 TL
+                                                                                                                   Hesaplanan KDV(%20)            3.200,00 TL
+                                                                                                            Hesaplanan KDV Tevkifat(%20)           640,00 TL
+                                                                                                                Tevkifata Tabi İşlem Tutarı      16.000,00TL
+                                                                                                  Tevkifata Tabi İşlem Üzerinden Hes. KDV         3.200,00TL
+                                                                                                               Vergiler Dahil Toplam Tutar       19.200,00 TL
+                                                                                                                            Ödenecek Tutar       18.560,00 TL
+
+
+
+
+NOTLAR :
+
+ 624-Yük Taşımacılığı Hizmeti [KDVGUT-(I/C-2.1.3.2.11)]
+ 06 BG 640
+ BAHATTİN YILDIRIM
+ ZİRAAT BANKASI
+ İBAN:TR19 0001 0000 8060 1901 6550 01
+ ÇORUM/ALACA ŞUBESİ
+ #YALNIZ: OnSekizBinBeşYüzAltmış.TRY
+

@@ -1,0 +1,17 @@
+[Unit]
+Description=FaturaAI API
+After=network.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/data/nanobaseai/fatura/apps/api
+Environment=NODE_ENV=production
+Environment=PORT=8105
+Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
