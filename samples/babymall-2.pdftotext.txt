@@ -1,0 +1,54 @@
+                                                                                                                                  Sayfa 1 / 1
+ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC
+VE SAN.AŞ.
+
+YEŞİLOVA MAH.PROF.DR.NECMETTİN ERBAKAN CAD.B
+BLOK NO:22 BA
+ ETİMESGUT ANKARA
+Tel:
+Fax:
+Vergi Dairesi: ETİMESGUT
+VKN: 6860425412
+TICARETSICILNO:                                                 e-Arşiv Fatura
+MERSISNO:
+Mersis No:
+
+SAYIN
+MURAT SANCAR
+
+ETİMESGUT/ANKARA
+Tel: 5395997107 Fax:                                                                                Özelleştirme No       TR1.2
+Vergi Dairesi: TC                                                                                   Senaryo               EARSIVFATURA
+VKN/TCKN: 11111111111                                                                               Fatura Tipi           SATIS
+                                                                                                    Fatura No             BBE2026000018085
+                                                                                                    Fatura Tarihi         19-07-2026
+                                                                                                    Düzenleme Tarihi      19-07-2026
+                                                                                                    Düzenleme Zamanı      12:00:41
+
+ETTN: 9F767339-3BA1-4C08-B43A-FACB29B5A0E4
+
+Sıra                                                                                                                Vergi    Mal Hizmet
+     Mal/Hizmet Tanımı                                                 Miktar Birim Fiyat       İskonto Tutarı
+No                                                                                                                  Oranları Tutarı
+      MLT-0022 - 8683181100022 - Multimalt Bitki Özlü %100
+1                                                                          1,0    54,4500 TRY           27,23 TRY    %10.00       27,23 TRY
+     Elma,Mango Ve Malt Suyu 250 ml
+      MLT-0022 - 8683181100022 - Multimalt Bitki Özlü %100
+2                                                                          1,0    54,4500 TRY           27,23 TRY    %10.00       27,23 TRY
+     Elma,Mango Ve Malt Suyu 250 ml
+
+Taşıyan Bilgileri
+                                                                                     NET TOPLAM                                  108,91 TRY
+                                                                                     TOPLAM İSKONTO                               54,45 TRY
+                                                                                     KDV (%10.00)                                  5,45 TRY
+                                                                                     VERGİ DAHİL TOPLAM TUTAR                     59,90 TRY
+                                                                                     ÖDENECEK TUTAR                               59,90 TRY
+Ödeme Şekli:
+
+YALNIZ : ELLİDOKUZ TRYDOKSAN KURUS
+%10 Kdv Matrahı:54,45 TRY Kdv Tutarı:5,45 TRY
+Stok Belge ID:2607222
+Alınan Ödemeler:
+Vakıfbank (Tek) - 59,90 TRY
+E-Arşiv izni kapsamında eletronik ortamda iletilmiştir. İrsaliye yerine geçer.
+

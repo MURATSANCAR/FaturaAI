@@ -443,6 +443,18 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const bankBranch =
     notes.find((n) => /ŞUBE|SUBESI|ŞUBESİ/i.test(n)) ?? null;
 
+  const netToplam =
+    labeledAmount(normalized, "Mal Hizmet Toplam Tutarı") ??
+    labeledAmount(normalized, "NET TOPLAM");
+  const discountTotal =
+    labeledAmount(normalized, "Toplam İskonto") ??
+    labeledAmount(normalized, "TOPLAM [İI]SKONTO");
+  // NET TOPLAM iskonto öncesi olabiliyor; matrah = net - iskonto
+  const lineExtensionAmount =
+    netToplam != null && discountTotal != null && discountTotal > 0
+      ? Number((netToplam - discountTotal).toFixed(2))
+      : netToplam;
+
   return {
     documentType,
     profileId,
@@ -456,12 +468,8 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     customer: extractCustomer(normalized),
     lines: extractLines(normalized),
     totals: {
-      lineExtensionAmount:
-        labeledAmount(normalized, "Mal Hizmet Toplam Tutarı") ??
-        labeledAmount(normalized, "NET TOPLAM"),
-      discountTotal:
-        labeledAmount(normalized, "Toplam İskonto") ??
-        labeledAmount(normalized, "TOPLAM [İI]SKONTO"),
+      lineExtensionAmount,
+      discountTotal,
       withholdingVatAmount: labeledAmount(normalized, "Hesaplanan KDV Tevkifat"),
       vatAmount:
         labeledAmount(normalized, "Hesaplanan KDV(?!\\s*Tevkifat)") ??

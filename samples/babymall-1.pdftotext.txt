@@ -1,0 +1,60 @@
+                                                                                                                                  Sayfa 1 / 1
+ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC
+VE SAN.AŞ.
+
+YEŞİLOVA MAH.PROF.DR.NECMETTİN ERBAKAN CAD.B
+BLOK NO:22 BA
+ ETİMESGUT ANKARA
+Tel:
+Fax:
+Vergi Dairesi: ETİMESGUT
+VKN: 6860425412
+TICARETSICILNO:                                                 e-Arşiv Fatura
+MERSISNO:
+Mersis No:
+
+SAYIN
+MURAT SANCAR
+
+ETİMESGUT/ANKARA
+Tel: 5395997107 Fax:                                                                                Özelleştirme No       TR1.2
+Vergi Dairesi: TC                                                                                   Senaryo               EARSIVFATURA
+VKN/TCKN: 11111111111                                                                               Fatura Tipi           SATIS
+                                                                                                    Fatura No             BBE2026000018417
+                                                                                                    Fatura Tarihi         22-07-2026
+                                                                                                    Düzenleme Tarihi      22-07-2026
+                                                                                                    Düzenleme Zamanı      19:10:13
+
+ETTN: 909A886E-7F55-48D8-A4D6-F29D789A5139
+
+Sıra                                                                                                                Vergi    Mal Hizmet
+       Mal/Hizmet Tanımı                                               Miktar Birim Fiyat       İskonto Tutarı
+No                                                                                                                  Oranları Tutarı
+       BM-98886 - 8697431398886 - BM Care Yenidoğan Islak
+1                                                                          1,0   108,3300 TRY           33,33 TRY    %20.00       74,99 TRY
+       Havlu 3x40lı
+       BM-98886 - 8697431398886 - BM Care Yenidoğan Islak
+2                                                                          1,0   108,3300 TRY           33,33 TRY    %20.00       74,99 TRY
+       Havlu 3x40lı
+       BM-98886 - 8697431398886 - BM Care Yenidoğan Islak
+3                                                                          1,0   108,3300 TRY           33,33 TRY    %20.00       74,99 TRY
+       Havlu 3x40lı
+       BM-98886 - 8697431398886 - BM Care Yenidoğan Islak
+4                                                                          1,0   108,3300 TRY           33,33 TRY    %20.00       74,99 TRY
+       Havlu 3x40lı
+
+Taşıyan Bilgileri
+                                                                                     NET TOPLAM                                  433,30 TRY
+                                                                                     TOPLAM İSKONTO                              133,33 TRY
+                                                                                     KDV (%20.00)                                 59,99 TRY
+                                                                                     VERGİ DAHİL TOPLAM TUTAR                    359,96 TRY
+                                                                                     ÖDENECEK TUTAR                              359,96 TRY
+Ödeme Şekli:
+
+YALNIZ : ÜÇYÜZELLİDOKUZ TRYDOKSANALTI KURUS
+%20 Kdv Matrahı:299,97 TRY Kdv Tutarı:59,99 TRY
+Stok Belge ID:2613816
+Alınan Ödemeler:
+Kuveyt Türk (TEK) - 359,96 TRY
+E-Arşiv izni kapsamında eletronik ortamda iletilmiştir. İrsaliye yerine geçer.
+

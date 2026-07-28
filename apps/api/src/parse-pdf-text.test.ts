@@ -132,3 +132,31 @@ describe("parseGibPdfText — MDA Moda Jant sample", () => {
     assert.deepEqual(validateInvoice(invoice), []);
   });
 });
+
+describe("parseGibPdfText — Babymall TRY samples", () => {
+  it("reads 1.pdf (4 wet wipes)", () => {
+    const text = readFileSync(join(root, "samples/babymall-1.pdftotext.txt"), "utf8");
+    const inv = parseGibPdfText(text, "1.pdf");
+    assert.equal(inv.invoiceNumber, "BBE2026000018417");
+    assert.equal(inv.issueDate, "2026-07-22");
+    assert.equal(inv.issueTime, "19:10:13");
+    assert.match(inv.supplier.name ?? "", /ÖZELCAN|BABYMALL/i);
+    assert.equal(inv.customer.name, "MURAT SANCAR");
+    assert.equal(inv.lines.length, 4);
+    assert.ok(nearlyEqual(inv.lines[0].lineTotal ?? 0, 74.99));
+    assert.ok(nearlyEqual(inv.totals.payableAmount ?? 0, 359.96));
+    assert.ok(nearlyEqual(inv.totals.discountTotal ?? 0, 133.33));
+    assert.deepEqual(validateInvoice(inv), []);
+  });
+
+  it("reads 2.pdf (2 multimalt)", () => {
+    const text = readFileSync(join(root, "samples/babymall-2.pdftotext.txt"), "utf8");
+    const inv = parseGibPdfText(text, "2.pdf");
+    assert.equal(inv.invoiceNumber, "BBE2026000018085");
+    assert.equal(inv.issueDate, "2026-07-19");
+    assert.equal(inv.lines.length, 2);
+    assert.match(inv.lines[0].name ?? "", /Multimalt/i);
+    assert.ok(nearlyEqual(inv.totals.payableAmount ?? 0, 59.9));
+    assert.deepEqual(validateInvoice(inv), []);
+  });
+});
