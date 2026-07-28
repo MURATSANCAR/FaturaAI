@@ -91,6 +91,14 @@ function extractSupplier(text: string): InvoiceParty {
   return party;
 }
 
+function looksLikeAddressLine(line: string): boolean {
+  return (
+    /^(Konut|Kap[ıi]|Ye[sş]il|\/\s*Türkiye)/i.test(line) ||
+    /\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|No:|daire|sitesi)\b/i.test(line) ||
+    /\b(Ankara|İstanbul|Istanbul|İzmir|Izmir|Karabük|Etimesgut|Çorum|Corum)\b/i.test(line)
+  );
+}
+
 function extractCustomer(text: string): InvoiceParty {
   const party = emptyParty();
   const sayinIdx = text.search(/\bSAYIN\b/i);
@@ -101,27 +109,34 @@ function extractCustomer(text: string): InvoiceParty {
     .split("\n")
     .map((l) => {
       // Strip right-column metadata (Özelleştirme / Senaryo / Fatura …)
-      return l.replace(/\s{2,}(Özelleştirme|Senaryo|Fatura\s+Tipi|Fatura\s+No|Fatura\s+Tarihi).*$/i, "").trim();
+      return l
+        .replace(
+          /\s{2,}(Özelleştirme|Senaryo|Fatura\s+Tipi|Fatura\s+No|Fatura\s+Tarihi|Fatura\s+Saati|Sipari[sş]\s+No|Sipari[sş]\s+Tarihi).*$/i,
+          "",
+        )
+        .trim();
     })
     .filter(Boolean);
 
   const nameParts: string[] = [];
+  const addrParts: string[] = [];
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
-    if (/^(Konut|Kap[ıi]|Web|E-Posta|Tel|Vergi|VKN|TCKN|ETTN|\/\s*Türkiye)/i.test(line)) break;
-    if (/^(S[ıi]ra|Mal\s+Hizmet|NOTLAR)/i.test(line)) break;
-    nameParts.push(line);
-    if (nameParts.length >= 3) break;
-  }
-  party.name = nameParts.join(" ").replace(/\s+/g, " ").trim() || null;
-
-  const addrParts: string[] = [];
-  for (const line of lines) {
-    if (/^(Konut|Kap[ıi]\s*No|\/\s*Türkiye)/i.test(line) || /mah\.|Bul\.|Cad\./i.test(line)) {
-      if (/^Web|^E-Posta|^Tel|^Vergi|^VKN|^TCKN/i.test(line)) continue;
+    if (/^(Web|E-Posta|Tel|Vergi|VKN|TCKN|ETTN|S[ıi]ra|Mal\s+Hizmet|NOTLAR|Not:)/i.test(line)) {
+      break;
+    }
+    if (looksLikeAddressLine(line)) {
       addrParts.push(line);
+      continue;
+    }
+    if (nameParts.length === 0) {
+      nameParts.push(line);
+    } else if (!addrParts.length && line.length < 80 && !/\d{5}/.test(line)) {
+      // rare multi-line company name
+      nameParts.push(line);
     }
   }
+  party.name = nameParts.join(" ").replace(/\s+/g, " ").trim() || null;
   party.address = addrParts.join(", ").replace(/\s+/g, " ").trim() || null;
 
   // Customer tax info sits near SAYIN block (may share line with right column)
@@ -146,56 +161,94 @@ function extractCustomer(text: string): InvoiceParty {
   return party;
 }
 
+/** Row with explicit unit (GİB classic): "1 Nakliye 1 Adet 16.000 TL %0 … %20 3.200 TL" */
+const LINE_WITH_UNIT =
+  /^\s*(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|Saat|Gün|Ay|Yıl|NIU)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+%?([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+.+?%([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?/i;
+
+/**
+ * EDM / e-ticaret layout (no Adet): 
+ * "1  Katlanabilir …  1  4.396,99 TL  %20,00  879,40 TL  4.396,99 TL"
+ */
+const LINE_EDM =
+  /^\s*(\d+)\s+(.*?)\s+(\d+(?:[.,]\d+)?)\s+([\d.\s]+,\d{2}|\d+)\s*TL\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*TL(?:\s+([\d.\s]+,\d{2})\s*TL)?\s*$/i;
+
+function isLineContinuation(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  if (/^\d+\s/.test(t)) return false;
+  if (/^(S[ıi]ra|Mal\s+Hizmet|No\b|NOTLAR|Not:|ETTN|Ödenecek|Vergiler|Hesaplanan|Toplam|Mal Hizmet Toplam)/i.test(t)) {
+    return false;
+  }
+  if (/^[%\d]/.test(t) && /TL/.test(t)) return false;
+  return t.length > 1 && t.length < 120;
+}
+
 function extractLines(text: string): InvoiceLine[] {
+  const rawLines = text.replace(/\u000c/g, "\n").split("\n");
   const lines: InvoiceLine[] = [];
-  // Typical: " 1     Nakliye bedeli               1 Adet    16.000 TL      %0,00 ..."
-  const re =
-    /^\s*(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|Saat|Gün|Ay|Yıl|NIU)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+%?([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+.+?%([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?/gim;
 
-  for (const m of text.matchAll(re)) {
-    const withholding = text
-      .slice(m.index ?? 0, (m.index ?? 0) + 350)
-      .match(/KDV\s*TEVK[İI]FAT[^\n]*\(([^)]+)\)\s*=\s*([\d.\s]+(?:,\d{2})?)/i);
+  for (let i = 0; i < rawLines.length; i++) {
+    const row = rawLines[i];
+    const withUnit = row.match(LINE_WITH_UNIT);
+    if (withUnit) {
+      const withholding = rawLines
+        .slice(i, i + 3)
+        .join("\n")
+        .match(/KDV\s*TEVK[İI]FAT[^\n]*\(([^)]+)\)\s*=\s*([\d.\s]+(?:,\d{2})?)/i);
+      lines.push({
+        id: withUnit[1],
+        name: withUnit[2].replace(/\s+/g, " ").trim(),
+        quantity: Number.parseFloat(withUnit[3].replace(",", ".")),
+        unit: withUnit[4],
+        unitPrice: parseTrMoney(withUnit[5]),
+        discountRate: parsePercent(withUnit[6]),
+        discountAmount: parseTrMoney(withUnit[7]),
+        vatRate: parsePercent(withUnit[8]),
+        vatAmount: parseTrMoney(withUnit[9]),
+        withholdingNote: withholding
+          ? `KDV Tevkifat (${withholding[1]}) = ${withholding[2].trim()} TL`
+          : null,
+        lineTotal: null,
+      });
+      continue;
+    }
 
+    const edm = row.match(LINE_EDM);
+    if (!edm) continue;
+
+    const nameParts: string[] = [];
+    if (edm[2].trim()) nameParts.push(edm[2].replace(/\s+/g, " ").trim());
+    // Wrap: en fazla 1 satır yukarı / 1 satır aşağı (EDM çok satırlı ürün adları)
+    if (i > 0 && isLineContinuation(rawLines[i - 1])) {
+      nameParts.unshift(rawLines[i - 1].trim());
+    }
+    if (i + 1 < rawLines.length && isLineContinuation(rawLines[i + 1])) {
+      // Bir sonraki satır yeni kalem numarasıysa, aradaki wrap o kaleme aittir
+      const nextIsNewLine =
+        i + 2 < rawLines.length &&
+        (LINE_EDM.test(rawLines[i + 2]) || LINE_WITH_UNIT.test(rawLines[i + 2]));
+      if (!nextIsNewLine) {
+        nameParts.push(rawLines[i + 1].trim());
+      }
+    }
+
+    const unitPrice = parseTrMoney(edm[4]);
+    const lineTotal = edm[7] ? parseTrMoney(edm[7]) : unitPrice;
     lines.push({
-      id: m[1],
-      name: m[2].replace(/\s+/g, " ").trim(),
-      quantity: Number.parseFloat(m[3].replace(",", ".")),
-      unit: m[4],
-      unitPrice: parseTrMoney(m[5]),
-      discountRate: parsePercent(m[6]),
-      discountAmount: parseTrMoney(m[7]),
-      vatRate: parsePercent(m[8]),
-      vatAmount: parseTrMoney(m[9]),
-      withholdingNote: withholding
-        ? `KDV Tevkifat (${withholding[1]}) = ${withholding[2].trim()} TL`
-        : null,
-      lineTotal: null,
+      id: edm[1],
+      name: nameParts.join(" ").replace(/\s+/g, " ").trim() || null,
+      quantity: Number.parseFloat(edm[3].replace(",", ".")),
+      unit: "Adet",
+      unitPrice,
+      discountRate: null,
+      discountAmount: null,
+      vatRate: parsePercent(edm[5]),
+      vatAmount: parseTrMoney(edm[6]),
+      withholdingNote: null,
+      lineTotal,
     });
   }
 
-  // Fallback for looser layouts: id + name + quantity unit somewhere + money tokens
-  if (lines.length === 0) {
-    const loose =
-      /^\s*(\d+)\s+([A-Za-zÇĞİÖŞÜçğıöşü0-9][^\n]{2,80}?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM)\b[^\n]*?([\d.\s]+,\d{2})\s*TL[^\n]*?%([\d.,]+)[^\n]*?([\d.\s]+,\d{2})\s*TL/gim;
-    for (const m of text.matchAll(loose)) {
-      lines.push({
-        id: m[1],
-        name: m[2].replace(/\s+/g, " ").trim(),
-        quantity: Number.parseFloat(m[3].replace(",", ".")),
-        unit: m[4],
-        unitPrice: parseTrMoney(m[5]),
-        discountRate: null,
-        discountAmount: null,
-        vatRate: parsePercent(m[6]),
-        vatAmount: parseTrMoney(m[7]),
-        withholdingNote: null,
-        lineTotal: parseTrMoney(m[5]),
-      });
-    }
-  }
-
-  // Fill line totals from "Mal Hizmet Tutarı" column when present near line
   for (const line of lines) {
     if (line.lineTotal == null && line.unitPrice != null && line.quantity != null) {
       line.lineTotal = Number((line.unitPrice * line.quantity).toFixed(2));
@@ -236,7 +289,15 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   if (invoiceNumber) invoiceNumber = invoiceNumber.replace(/\s+/g, "").toUpperCase();
 
   const issueRaw = rightField(normalized, "Fatura Tarihi");
-  const { date: issueDate, time: issueTime } = parseIssueDateTime(issueRaw);
+  const { date: issueDate, time: issueTimeFromDate } = parseIssueDateTime(issueRaw);
+  const saati = rightField(normalized, "Fatura Saati");
+  const issueTime =
+    issueTimeFromDate ??
+    (saati && /^\d{1,2}:\d{2}(:\d{2})?$/.test(saati.trim())
+      ? saati.trim().length === 5
+        ? `${saati.trim()}:00`
+        : saati.trim()
+      : null);
 
   const uuid = firstMatch(
     normalized,
@@ -244,11 +305,18 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   )?.toLowerCase() || null;
 
   const notesBlock = normalized.split(/NOTLAR\s*:/i)[1] ?? "";
-  const notes = notesBlock
+  const notesFromBlock = notesBlock
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && !/^#?\s*$/.test(l))
+    .filter((l) => l && !/^#?\s*$/.test(l) && !/^e-Ar[sş]iv izni/i.test(l) && !/^Bu Fatura/i.test(l))
     .slice(0, 12);
+
+  const notesFromNot = [...normalized.matchAll(/^\s*Not:\s*(.+)$/gim)]
+    .map((m) => m[1].trim())
+    .filter((n) => n && !/^#\s*$/.test(n) && n.length > 1)
+    .slice(0, 12);
+
+  const notes = notesFromBlock.length > 0 ? notesFromBlock : notesFromNot;
 
   const iban =
     firstMatch(normalized, /İ?BAN\s*:\s*(TR[\d\s]+)/i)?.replace(/\s+/g, "").toUpperCase() ||

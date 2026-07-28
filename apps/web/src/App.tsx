@@ -16,7 +16,7 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
 function docTypeLabel(t: string): string {
   if (t === "earsiv") return "e-Arşiv Fatura";
   if (t === "efatura") return "e-Fatura";
-  if (t === "ubl") return "UBL-TR";
+  if (t === "ubl") return "Elektronik Fatura";
   return t;
 }
 
@@ -178,16 +178,12 @@ export default function App() {
                     ? "Kısmi okuma"
                     : "Başarısız"}
               </span>
-              <span className="rounded-full bg-violet-100 px-3 py-1 text-xs font-semibold text-violet-800">
-                {result.method === "ubl" ? "UBL-TR" : "pdftotext"}
-              </span>
             </div>
             <div className="text-right">
               <div className="label">Okuma süresi</div>
               <div className="font-display text-2xl font-bold text-violet-700">
                 {formatSeconds(result.durationMs)}
               </div>
-              <div className="text-xs text-slate-500">{result.durationMs} ms</div>
             </div>
           </div>
 
@@ -377,7 +373,7 @@ export default function App() {
       )}
 
       <footer className="mt-10 pb-6 text-center text-xs text-slate-500">
-        FaturaAI · pdftotext (Poppler) · Nanobase
+        FaturaAI · Nanobase
       </footer>
 
       <style>{`

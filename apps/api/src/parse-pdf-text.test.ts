@@ -68,3 +68,34 @@ describe("parseGibPdfText — HAVA SAVUNMA sample", () => {
     assert.deepEqual(warnings, []);
   });
 });
+
+describe("parseGibPdfText — KVI EDM sample", () => {
+  const kviText = readFileSync(join(root, "samples/kvi.pdftotext.txt"), "utf8");
+  const invoice = parseGibPdfText(kviText, "earsiv_faturaKVI2026000009854.pdf");
+
+  it("reads meta and parties", () => {
+    assert.equal(invoice.invoiceNumber, "KVI2026000009854");
+    assert.equal(invoice.issueDate, "2026-06-22");
+    assert.equal(invoice.issueTime, "11:36:57");
+    assert.match(invoice.supplier.name ?? "", /KAMPVE/i);
+    assert.equal(invoice.customer.name, "MURAT SANCAR");
+    assert.equal(invoice.customer.taxId, "11111111111");
+  });
+
+  it("reads both line items including wrapped names", () => {
+    assert.equal(invoice.lines.length, 2);
+    assert.match(invoice.lines[0].name ?? "", /Mangal/i);
+    assert.match(invoice.lines[0].name ?? "", /M1\.2|Alev/i);
+    assert.doesNotMatch(invoice.lines[0].name ?? "", /KINDLE/);
+    assert.ok(nearlyEqual(invoice.lines[0].unitPrice ?? 0, 4396.99));
+    assert.ok(nearlyEqual(invoice.lines[0].vatAmount ?? 0, 879.4));
+    assert.match(invoice.lines[1].name ?? "", /KINDLE|Çıra|Cira/i);
+    assert.doesNotMatch(invoice.lines[1].name ?? "", /Mangal/);
+    assert.ok(nearlyEqual(invoice.lines[1].unitPrice ?? 0, 0));
+  });
+
+  it("reads totals without line warning", () => {
+    assert.ok(nearlyEqual(invoice.totals.payableAmount ?? 0, 5276.39));
+    assert.deepEqual(validateInvoice(invoice), []);
+  });
+});
