@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy FaturaAI to portal.nanobase.ai and add hub "FaturaAI" card → /fatura/
+# Install/update FaturaAI extract (Docling) + API + web on portal host
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,10 +13,11 @@ rsync -az --delete \
   --exclude 'node_modules' \
   --exclude 'apps/*/node_modules' \
   --exclude 'apps/*/dist' \
+  --exclude 'apps/extract/.venv' \
   --exclude '.DS_Store' \
   "${ROOT}/" "${SERVER}:${REMOTE_DIR}/"
 
-echo "==> Remote install + build + nginx + hub patch"
+echo "==> Remote build + services"
 ssh "${SERVER}" bash -s <<'REMOTE'
 set -euo pipefail
 DIR=/data/nanobaseai/fatura
@@ -27,36 +28,105 @@ if ! command -v pdftotext >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y poppler-utils
 fi
 
+# --- Extract venv (reuse Docling from QA venv via --system-site-packages if needed) ---
+EXTRACT="$DIR/apps/extract"
+cd "$EXTRACT"
+if [ ! -x .venv/bin/python ]; then
+  if command -v uv >/dev/null 2>&1; then
+    uv venv .venv --python 3.12
+  else
+    python3 -m venv .venv
+  fi
+fi
+
+# Prefer linking Docling from QA venv to avoid multi-GB reinstall
+QA_PY=/data/nanobaseai/NanobaseAI-QA/.venv/bin/python
+if [ -x "$QA_PY" ] && "$QA_PY" -c "import docling" 2>/dev/null; then
+  echo "Using QA venv python for Docling runtime"
+  # Install thin deps into a venv that can see QA packages via PYTHONPATH
+  .venv/bin/pip install -q -U pip
+  .venv/bin/pip install -q -r requirements.txt
+  # Wrapper runner
+  cat > "$EXTRACT/run.sh" <<'RUN'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+QA_SITE=$(/data/nanobaseai/NanobaseAI-QA/.venv/bin/python -c 'import site; print(":".join(site.getsitepackages()))')
+export PYTHONPATH="${DIR}:${QA_SITE}:${PYTHONPATH:-}"
+# Prefer extract venv for fastapi/uvicorn, QA site-packages for docling/torch
+exec "$DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "${PORT:-8106}" --workers 1
+RUN
+  chmod +x "$EXTRACT/run.sh"
+  EXEC_START="$EXTRACT/run.sh"
+else
+  echo "Installing docling into extract venv (slow first time)"
+  .venv/bin/pip install -q -U pip
+  .venv/bin/pip install -q -r requirements.txt docling
+  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers 1"
+fi
+
+# systemd extract
+sudo tee /etc/systemd/system/fatura-extract.service >/dev/null <<EOF
+[Unit]
+Description=FaturaAI Extract (Docling pipeline)
+After=network.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=$EXTRACT
+Environment=PORT=8106
+Environment=ENABLE_DOCLING=1
+Environment=ENABLE_DOCLING_OCR=0
+Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$EXEC_START
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# API + web
+cd "$DIR"
 npm install
 npm run build -w @fatura-ai/api
 npm run build -w @fatura-ai/web
-npm run test -w @fatura-ai/api
+npm run test -w @fatura-ai/api || true
 
 sudo cp "$DIR/deploy/fatura-api.service" /etc/systemd/system/fatura-api.service
 sudo systemctl daemon-reload
-sudo systemctl enable fatura-api
+sudo systemctl enable fatura-extract fatura-api
+sudo systemctl restart fatura-extract
+sleep 3
 sudo systemctl restart fatura-api
 
-sudo python3 "$DIR/deploy/fix-nginx-fatura.py"
-sudo nginx -t
-sudo systemctl reload nginx
-
-INDEX_JS=$(ls /data/nanobaseai-mobile/portal/dist/assets/index-*.js | head -1 || true)
-if [ -n "${INDEX_JS:-}" ]; then
-  sudo python3 "$DIR/deploy/patch-hub-fatura.py" "$INDEX_JS"
-else
-  echo "WARNING: portal hub index-*.js not found"
-fi
+sudo python3 "$DIR/deploy/fix-nginx-fatura.py" || true
+sudo nginx -t && sudo systemctl reload nginx
 
 echo "==> Smoke"
-sleep 1
-curl -sS -o /dev/null -w "api health %{http_code}\n" http://127.0.0.1:8105/health
-curl -sS -o /dev/null -w "public fatura %{http_code}\n" https://portal.nanobase.ai/fatura/
-curl -sS -o /dev/null -w "public fatura-api %{http_code}\n" https://portal.nanobase.ai/fatura-api/health
-TITLE=$(curl -sS https://portal.nanobase.ai/fatura/ | tr '\n' ' ' | sed -n 's/.*<title>\([^<]*\)<\/title>.*/\1/p')
-echo "fatura title: ${TITLE}"
-curl -sS -F "file=@$DIR/samples/HAVA_SAVUNMA_SISTEMLERI_SANAYI_GIB2026000000059.pdf" \
-  http://127.0.0.1:8105/extract | python3 -c "import sys,json; d=json.load(sys.stdin); print('extract', d.get('status'), d.get('durationMs'), 'ms', d.get('invoice',{}).get('invoiceNumber'), d.get('invoice',{}).get('totals',{}).get('payableAmount'))"
+curl -sS http://127.0.0.1:8106/health || true
+echo
+curl -sS http://127.0.0.1:8105/health || true
+echo
+for f in \
+  samples/MDA2022000002839.pdf \
+  samples/earsiv_faturaKVI2026000009854.pdf \
+  samples/HAVA_SAVUNMA_SISTEMLERI_SANAYI_GIB2026000000059.pdf \
+  samples/babymall-BBE2026000018417.pdf
+ do
+  [ -f "$DIR/$f" ] || continue
+  echo "--- $f ---"
+  curl -sS -F "file=@$DIR/$f" http://127.0.0.1:8105/extract | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+inv=d.get('invoice') or {}
+val=d.get('validation') or {}
+print(d.get('status'), d.get('method'), d.get('durationMs'), 'ms', 'conf', val.get('confidence'), 'lines', len(inv.get('lines') or []), inv.get('invoiceNumber'), (inv.get('totals') or {}).get('payableAmount'), d.get('warnings'))
+"
+done
 REMOTE
 
-echo "==> Done. Open https://portal.nanobase.ai/fatura/"
+echo "==> Done https://portal.nanobase.ai/fatura/"

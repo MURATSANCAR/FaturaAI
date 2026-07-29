@@ -4,22 +4,21 @@ Nanobase Portal üzerinde e-Arşiv / e-Fatura PDF okuma.
 
 - UI: https://portal.nanobase.ai/fatura/
 - API: https://portal.nanobase.ai/fatura-api/health
+- Extract: `127.0.0.1:8106` (Docling + pdftotext pipeline)
 
-## Nasıl çalışır
+## Pipeline (prod)
 
-1. PDF yüklenir → `pdftotext -layout` (Poppler) metni çıkarır
-2. GİB alanları parse edilir (gömülü UBL varsa UBL-TR)
-3. Ekranda tüm alanlar + okuma süresi (`durationMs`) gösterilir
-
-## Geliştirme
-
-```bash
-# Sunucuda (Node + poppler-utils gerekir)
-npm install
-npm run dev:api   # :8105
-npm run dev:web   # :5173 → /fatura-api proxy
-npm test
 ```
+PDF
+ ├─ UBL gömülü mü?
+ ├─ pdftotext (hızlı alanlar)
+ ├─ Docling structure + tablolar (CPU)
+ ├─ (opsiyonel) Docling OCR — ENABLE_DOCLING_OCR=1
+ ├─ Pydantic Invoice JSON
+ └─ Matematik doğrulama → confidence
+```
+
+Node API (`8105`) extract v2 servisine proxy eder; servis düşerse legacy parser’a düşer.
 
 ## Deploy
 
@@ -27,4 +26,4 @@ npm test
 ./deploy/deploy-to-portal.sh
 ```
 
-Örnek fatura: `samples/HAVA_SAVUNMA_SISTEMLERI_SANAYI_GIB2026000000059.pdf`
+Servisler: `fatura-extract`, `fatura-api`

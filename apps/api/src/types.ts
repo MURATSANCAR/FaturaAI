@@ -54,11 +54,19 @@ export type ParsedInvoice = {
 
 export type ExtractStatus = "ok" | "partial" | "failed";
 
+export type ExtractValidation = {
+  totalsMatch: boolean;
+  confidence: number;
+  checks: string[];
+};
+
 export type ExtractResult = {
   status: ExtractStatus;
-  method: "ubl" | "pdf-text";
+  method: string;
   durationMs: number;
   warnings: string[];
   invoice: ParsedInvoice | null;
   rawTextPreview: string | null;
+  validation?: ExtractValidation | null;
+  pipeline?: string[];
 };

@@ -52,11 +52,17 @@ export type ParsedInvoice = {
 
 export type ExtractResult = {
   status: "ok" | "partial" | "failed";
-  method: "ubl" | "pdf-text";
+  method: string;
   durationMs: number;
   warnings: string[];
   invoice: ParsedInvoice | null;
   rawTextPreview: string | null;
+  validation?: {
+    totalsMatch: boolean;
+    confidence: number;
+    checks: string[];
+  } | null;
+  pipeline?: string[];
 };
 
 export function formatMoney(n: number | null | undefined, currency = "TRY"): string {

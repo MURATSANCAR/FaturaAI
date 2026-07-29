@@ -9,9 +9,13 @@ WorkingDirectory=/data/nanobaseai/fatura/apps/api
 Environment=NODE_ENV=production
 Environment=PORT=8105
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
+Environment=EXTRACT_V2_URL=http://127.0.0.1:8106
+Environment=EXTRACT_V2_ENABLED=1
 ExecStart=/usr/bin/node dist/index.js
 Restart=on-failure
 RestartSec=3
+# Wait for extract service
+ExecStartPre=/bin/sleep 1
 
 [Install]
 WantedBy=multi-user.target

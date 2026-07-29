@@ -217,22 +217,29 @@ export default function App() {
 
       {result && (
         <div className="mt-5 space-y-3 animate-[fadeIn_0.35s_ease] sm:mt-6 sm:space-y-4">
-          <div className="glass flex items-center justify-between gap-3 p-3.5 sm:p-4">
-            <span
-              className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                result.status === "ok"
-                  ? "bg-emerald-100 text-emerald-800"
+          <div className="glass flex flex-wrap items-center justify-between gap-3 p-3.5 sm:p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                  result.status === "ok"
+                    ? "bg-emerald-100 text-emerald-800"
+                    : result.status === "partial"
+                      ? "bg-amber-100 text-amber-900"
+                      : "bg-red-100 text-red-800"
+                }`}
+              >
+                {result.status === "ok"
+                  ? "Tam okundu"
                   : result.status === "partial"
-                    ? "bg-amber-100 text-amber-900"
-                    : "bg-red-100 text-red-800"
-              }`}
-            >
-              {result.status === "ok"
-                ? "Tam okundu"
-                : result.status === "partial"
-                  ? "Kısmi okuma"
-                  : "Başarısız"}
-            </span>
+                    ? "Kısmi okuma"
+                    : "Başarısız"}
+              </span>
+              {result.validation && (
+                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                  Güven %{Math.round(result.validation.confidence * 100)}
+                </span>
+              )}
+            </div>
             <div className="text-right">
               <div className="label">Okuma süresi</div>
               <div className="font-display text-xl font-bold text-violet-700 sm:text-2xl">
