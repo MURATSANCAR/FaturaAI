@@ -37,7 +37,7 @@ PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
-IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "3.0"))
+IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -272,16 +272,30 @@ def normalize_ocr_text(text: str) -> str:
         (r"\bETTN\b", "ETTN"),
         (r"\bFatera\b", "Fatura"),
         (r"\bFatara\b", "Fatura"),
+        (r"\bFataca\b", "Fatura"),
+        (r"\bPatara\b", "Fatura"),
+        (r"\bFatara\s*Na\b", "Fatura No"),
+        (r"\bFataca\s*Na\b", "Fatura No"),
+        (r"\bPatara\s*Na\b", "Fatura No"),
         (r"\bYarihi\b", "Tarihi"),
         (r"\bTanible\b", "Tarihi"),
         (r"\bTartht\b", "Tarihi"),
+        (r"\bTaribi\b", "Tarihi"),
+        (r"\bTarihl\b", "Tarihi"),
+        (r"\bTarila\b", "Tarihi"),
         (r"\b[ÖO]DENECEKTUTAR\b", "ÖDENECEK TUTAR"),
         (r"\b[ÖO]denecek\s*Tutar\b", "ÖDENECEK TUTAR"),
         (r"\b[ÖO]denecek\s*Tuter\b", "ÖDENECEK TUTAR"),
         (r"\benecel\s*Tutar\b", "ÖDENECEK TUTAR"),
+        # Photo OCR mangling: Odesecch / Öfenecets / Ofesecck / Ödesectk …
+        (r"\b[ÖO][df]?e[sş]?e?ne[cçkhs]{1,4}\s*[:.]?\s*T[ou]tar\b", "ÖDENECEK TUTAR"),
+        (r"\b[ÖO]fenec+e?t?s?\s*Totar\b", "ÖDENECEK TUTAR"),
         (r"\bVergies?\s*Dald\s*Teglam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVergiler\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVerg[il]+[eo]r\s*Dah[il]+\s*Topl[ae]m\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bVarg[iı]kr\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bWerglker\s*Dahil\s*Teplamn?\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bVergilker\s*Dahil\s*Teplamn?\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bBesaplaesnKOV\b", "Hesaplanan KDV"),
         (r"\bHesaplanan\s*K\.?\s*D\.?\s*V\.?\b", "Hesaplanan KDV"),
         (r"\bAlica\b", "Alıcı"),
@@ -585,6 +599,40 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 unitPrice=unit_price,
                 vatRate=vat_rate,
                 vatAmount=parse_tr_money(m.group("vatAmt")),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
+    # Photo OCR: "... HP 146GB ... 6Ade 3.749,16TL … 22.495,00TL"
+    ade_row = re.compile(
+        rf"(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{8,200}}?)\s+"
+        rf"(?P<qty>\d{{1,3}})\s*Ade[t1l]?\s+"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*T?L?\s+"
+        rf".{{0,80}}?"
+        rf"(?P<total>{_MONEY_TOKEN})\s*T?L?\b",
+        re.I,
+    )
+    for i, m in enumerate(ade_row.finditer(text), start=1):
+        name = re.sub(r"\s+", " ", m.group("name")).strip(" -|")
+        # Prefer product fragment after part numbers when present
+        hp = re.search(r"(HP\s+.+)$", name, re.I)
+        if hp and len(hp.group(1)) >= 8:
+            name = hp.group(1).strip()
+        if re.search(r"Toplam|Iskonto|Ödenecek|Vergi\s*Dahil|Mal\s*Hizmet\s*Toplam", name, re.I):
+            continue
+        total = parse_tr_money(m.group("total"))
+        if total is None or total < 1:
+            continue
+        qty = float(m.group("qty").replace(",", "."))
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=qty,
+                unit="Adet",
+                unitPrice=parse_tr_money(m.group("unitPrice")),
                 lineTotal=total,
             )
         )
@@ -1044,6 +1092,43 @@ def _is_registry_or_chrome_line(ln: str) -> bool:
     )
 
 
+def _fix_gib_year_digits(digits: str) -> str:
+    """Repair OCR year prefix in GİB serial (e.g. 2826 → 2026)."""
+    if len(digits) < 4 or not digits[:4].isdigit():
+        return digits
+    year = int(digits[:4])
+    if 1990 <= year <= 2100:
+        return digits[:13] if len(digits) > 13 else digits
+    pairs = {
+        "8": "0",
+        "0": "8",
+        "3": "2",
+        "2": "3",
+        "5": "6",
+        "6": "5",
+        "1": "7",
+        "7": "1",
+        "4": "9",
+        "9": "4",
+    }
+    ychars = list(digits[:4])
+    for i, ch in enumerate(ychars):
+        alt = pairs.get(ch)
+        if not alt:
+            continue
+        trial = ychars.copy()
+        trial[i] = alt
+        y2 = int("".join(trial))
+        if 1990 <= y2 <= 2100:
+            out = "".join(trial) + digits[4:]
+            return out[:13] if len(out) >= 13 else out
+    # 28xx / 29xx → 20xx (common closed-loop OCR)
+    if digits.startswith(("28", "29")):
+        out = "20" + digits[2:]
+        return out[:13] if len(out) >= 13 else out
+    return digits[:13] if len(digits) > 13 else digits
+
+
 def normalize_gib_invoice_number(num: str) -> str:
     """Fix common Latin OCR confusions in GİB fatura no (3-char series + digits)."""
     compact = re.sub(r"[^A-Z0-9]", "", num.upper())
@@ -1057,11 +1142,15 @@ def normalize_gib_invoice_number(num: str) -> str:
         series, digits = m.group(1), m.group(2)
     # Series OCR: 8↔B (closed bowl). Keep intentional digits (e.g. C0Y).
     series = "".join("B" if ch == "8" else ch for ch in series)
+    # VAU→YAU / V↔Y when second letter is A (common Latin OCR)
+    if len(series) >= 2 and series[0] == "V" and series[1] == "A":
+        series = "Y" + series[1:]
     # First-letter E↔B when second is B (EBx… → BBx…)
     if len(series) >= 2 and series[0] == "E" and series[1] == "B":
         series = "B" + series[1:]
-    # Digit tail confusions
+    # Digit tail confusions + year repair
     digits = digits.translate(str.maketrans("OILTS", "01115"))
+    digits = _fix_gib_year_digits(digits)
     return series + digits
 
 
@@ -1081,7 +1170,8 @@ def gib_invoice_number(text: str, file_name: str = "") -> str | None:
     if chrome:
         return normalize_gib_invoice_number(chrome.group(1))
     labeled = re.search(
-        r"(?:Fatura\s*No|Fatera\s*No|Invoice\s*No|B[EÉ]?[LİI1]?GE\s*N[O0]|BELGE\s*NO)\s*[:\-.]?\s*"
+        r"(?:Fatura\s*No|Fatera\s*No|Fatara\s*Na|Fataca\s*Na|Patara\s*Na|"
+        r"Invoice\s*No|B[EÉ]?[LİI1]?GE\s*N[O0]|BELGE\s*NO)\s*[:\-.]?\s*"
         r"([A-Za-z0-9]{2,5}[\s\-]*\d{10,20}|\d{12,22})",
         text,
         re.I,
@@ -1090,11 +1180,12 @@ def gib_invoice_number(text: str, file_name: str = "") -> str | None:
         compact = re.sub(r"[\s\-]+", "", labeled.group(1).upper())
         if is_gib_invoice_number(compact):
             return normalize_gib_invoice_number(compact) if re.search(r"[A-Z]", compact) else compact
+    # Compact search: do not require trailing \b — OCR often glues next token (…3538TA:)
     compact = re.sub(r"[\s|]+", "", text.upper()).replace("-", "")
-    m = re.search(rf"\b({_GIB_NO})\b", compact)
+    m = re.search(rf"(?<![A-Z0-9])({_GIB_NO})(?!\d)", compact)
     if m:
         return normalize_gib_invoice_number(m.group(1))
-    m = re.search(rf"\b({_GIB_NO_LOOSE})\b", compact)
+    m = re.search(rf"(?<![A-Z0-9])({_GIB_NO_LOOSE})(?!\d)", compact)
     if m:
         return normalize_gib_invoice_number(m.group(1))
     m = first_match(file_name, rf"({_GIB_NO_LOOSE})")
@@ -1455,11 +1546,39 @@ def extract_payable_from_ocr(text: str) -> float | None:
         amt = parse_tr_money(bank.group(1))
         if amt is not None:
             return amt
+    oden = None
+    dahil = None
     for label in (
         r"[ÖO]DENECEK\s+TUTAR",
         r"Ödenecek\s+Tutar",
+        r"[ÖO][df]?e[sş]?e?ne[cçkhs]{1,4}\s+T[OU]TAR",
+    ):
+        amt = labeled_amount(text, label)
+        if amt is not None and amt >= 1:
+            oden = amt
+            break
+    for label in (
         r"VERG[İIEÉ]\s+DAH[İI]L\s+TOPLAM\s+TUTAR",
         r"Vergiler\s+Dahil\s+Toplam\s+Tutar",
+        r"Varg[iı]kr\s+Dahil\s+Toplam\s+Tutar",
+    ):
+        amt = labeled_amount(text, label)
+        if amt is not None and amt >= 1:
+            dahil = amt
+            break
+    # When OCR flips leading digit on ödenecek (36.994 vs 26.994), prefer vergi dahil
+    if oden is not None and dahil is not None:
+        if abs(oden - dahil) < 0.05:
+            return oden
+        # Same magnitude, one digit OCR slip on the thousands
+        if abs(oden - dahil) >= 1000 and abs(oden - dahil) < 20000:
+            return dahil
+        return oden
+    if oden is not None:
+        return oden
+    if dahil is not None:
+        return dahil
+    for label in (
         r"(?<!ARA\s)TOPLAM(?!\s*ISKONTO|\s*[İI]SKONTO)",
         r"Genel\s+Toplam",
     ):
@@ -1971,6 +2090,9 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     labeled_no = (
         right_field(text, "Fatura No")
         or right_field(text, "Fatera No")
+        or right_field(text, "Fatara Na")
+        or right_field(text, "Fataca Na")
+        or right_field(text, "Patara Na")
         or right_field(text, "Belge No")
         or right_field(text, "BELGE NO")
         or first_match(
@@ -1990,6 +2112,20 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             inv_no = None
 
     issue_date, issue_time = prefer_invoice_issue_date(text)
+    # Align OCR date year with GİB serial year when off by one digit (2036 vs 2026)
+    if inv_no and issue_date:
+        ym = re.match(r"[A-Z]{2,5}(\d{4})", inv_no)
+        if ym:
+            series_year = int(ym.group(1))
+            try:
+                date_year = int(issue_date[:4])
+            except ValueError:
+                date_year = 0
+            if 1990 <= series_year <= 2100 and date_year != series_year:
+                sa, sb = f"{date_year:04d}", f"{series_year:04d}"
+                diffs = sum(a != b for a, b in zip(sa, sb))
+                if diffs <= 1 and abs(date_year - series_year) <= 100:
+                    issue_date = f"{series_year:04d}{issue_date[4:]}"
     for label in (
         "Fatura Saati",
         "Düzenleme Zamanı",
@@ -2772,7 +2908,8 @@ def get_docling_converter(ocr: bool, for_image: bool = False):
 
     options = PdfPipelineOptions()
     options.do_ocr = ocr
-    options.do_table_structure = True
+    # Table structure is expensive; for photos RapidOCR already supplies lines.
+    options.do_table_structure = not (for_image and ocr)
     if for_image and ocr:
         # Higher scale improves phone-photo OCR quality
         try:
@@ -2918,6 +3055,7 @@ async def extract(
         if as_image:
             pipeline.append("image-input")
             photo_text = ""
+            photo_meta: dict[str, Any] = {}
             if PHOTO_OCR_ENABLED:
                 try:
                     from photo_ocr import ocr_image
@@ -2946,6 +3084,7 @@ async def extract(
             need_docling = not strong_photo_invoice(
                 invoice, validate_invoice(invoice)[1]
             )
+            photo_struct = int(photo_meta.get("structureScore") or 0)
             if ENABLE_DOCLING and need_docling:
                 try:
                     use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
@@ -2976,7 +3115,8 @@ async def extract(
                 except Exception as exc:  # noqa: BLE001
                     pipeline.append(f"docling-image-error:{exc}")
 
-            if need_docling or not invoice.invoiceNumber:
+            # Skip redundant Tesseract when photo OCR already saw invoice structure
+            if (need_docling or not invoice.invoiceNumber) and photo_struct < 6:
                 try:
                     tess = await asyncio.to_thread(tesseract_ocr, path)
                     if tess.strip():
