@@ -1,13 +1,14 @@
 """High-quality photo OCR for Turkish invoices / receipts.
 
 Stack (open-source, CPU):
-  OpenCV preprocess → RapidOCR PP-OCRv5 Latin (Turkish-capable) + PP-OCRv6 fallback
-  → optional Tesseract tur+eng merge for stubborn thermal prints
+  OpenCV preprocess → RapidOCR Latin PP-OCRv5 (primary) + PP-OCRv6
+  → Tesseract tur+eng only as last-resort if RapidOCR structure is weak
 """
 
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -17,9 +18,9 @@ import cv2
 import numpy as np
 
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
-PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "2000"))
-PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "3200"))
-PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "4200"))
+PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1800"))
+PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2800"))
+PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "3600"))
 PHOTO_OCR_CLAHE = os.getenv("PHOTO_OCR_CLAHE", "1") == "1"
 PHOTO_OCR_DUAL = os.getenv("PHOTO_OCR_DUAL", "1") == "1"
 PHOTO_OCR_TESSERACT = os.getenv("PHOTO_OCR_TESSERACT", "1") == "1"
@@ -27,6 +28,19 @@ PHOTO_OCR_TESSERACT = os.getenv("PHOTO_OCR_TESSERACT", "1") == "1"
 _engine_latin = None
 _engine_v6 = None
 _engine_lock = threading.Lock()
+
+_STRUCT_RE = re.compile(
+    r"(?:"
+    r"\bETTN\b|\bTOPLAM\b|\bTOPKDV\b|\bARA\s*TOPLAM\b|"
+    r"\bBELGE\s*N[O0]\b|\bBE[LİI]?GE\s*N[O0]\b|"
+    r"\bFATURA\s*N[O0]\b|\bFATERA\s*N[O0]\b|"
+    r"\bVKN\b|\bKDV\b|\badet\s*[x×X]\b|"
+    r"\bTAR[İI]H\b|\bMERS[İI]S\b|\b[ÖO]DENECEK\b|"
+    r"\be-?Ar[sş]iv\b|\bB[İI]LG[İI]\s*F[İIİI]?[ŞS]\b|"
+    r"\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}"
+    r")",
+    re.I,
+)
 
 
 def _make_latin_engine():
@@ -84,7 +98,6 @@ def _load_bgr(path: Path) -> np.ndarray:
 
 
 def _deskew(gray: np.ndarray) -> np.ndarray:
-    """Light deskew using minAreaRect on ink pixels."""
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
     coords = np.column_stack(np.where(thr > 0))
     if len(coords) < 500:
@@ -92,7 +105,7 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
     angle = cv2.minAreaRect(coords)[-1]
     if angle < -45:
         angle = 90 + angle
-    if abs(angle) < 0.3 or abs(angle) > 15:
+    if abs(angle) < 0.3 or abs(angle) > 12:
         return gray
     h, w = gray.shape[:2]
     m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
@@ -101,11 +114,12 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
     )
 
 
-def preprocess_bgr(img: np.ndarray) -> np.ndarray:
+def preprocess_bgr(img: np.ndarray, *, strong: bool = False) -> np.ndarray:
     h, w = img.shape[:2]
     long_side = max(h, w)
+    target = PHOTO_OCR_TARGET_SIDE if not strong else min(PHOTO_OCR_MAX_SIDE, 3200)
     if long_side < PHOTO_OCR_MIN_SIDE:
-        scale = PHOTO_OCR_TARGET_SIDE / long_side
+        scale = target / long_side
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
     elif long_side > PHOTO_OCR_MAX_SIDE:
         scale = PHOTO_OCR_MAX_SIDE / long_side
@@ -114,13 +128,14 @@ def preprocess_bgr(img: np.ndarray) -> np.ndarray:
     if PHOTO_OCR_CLAHE:
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        l = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(l)
+        clip = 2.5 if strong else 2.0
+        l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
         img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    # Mild denoise + unsharp for thermal / phone photos
-    img = cv2.bilateralFilter(img, 5, 40, 40)
-    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
-    img = cv2.addWeighted(img, 1.25, blur, -0.25, 0)
+    if strong:
+        img = cv2.bilateralFilter(img, 5, 35, 35)
+        blur = cv2.GaussianBlur(img, (0, 0), 0.9)
+        img = cv2.addWeighted(img, 1.2, blur, -0.2, 0)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = _deskew(gray)
@@ -179,11 +194,34 @@ def _turkish_richness(text: str) -> int:
     return sum(1 for ch in text if ch in "çğıöşüÇĞİÖŞÜâîûÂÎÛ")
 
 
+def structure_score(text: str) -> int:
+    return len(_STRUCT_RE.findall(text or ""))
+
+
+def _rank_key(c: tuple[str, str, float, int]) -> tuple:
+    eng, text, mean, n = c
+    struct = structure_score(text)
+    # Tesseract often invents Turkish diacritics on noise — demote unless structure wins clearly
+    engine_boost = {
+        "latin-ppocrv5": 8.0,
+        "latin-ppocrv5-strong": 6.0,
+        "ppocrv6": 5.0,
+        "ppocrv6-strong": 4.0,
+        "tesseract-tur": -25.0,
+    }.get(eng, 0.0)
+    return (
+        struct + engine_boost,
+        mean * 40.0,
+        _turkish_richness(text) * 0.15,
+        min(n, 150) * 0.02,
+    )
+
+
 def _tesseract_tur(path: Path) -> str:
     import subprocess
     import tempfile
 
-    img = preprocess_bgr(_load_bgr(path))
+    img = preprocess_bgr(_load_bgr(path), strong=False)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         cv2.imwrite(tmp.name, img)
         tmp_path = tmp.name
@@ -206,7 +244,8 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         return "", {"engine": "disabled", "lineCount": 0, "elapsedMs": 0}
 
     started = time.perf_counter()
-    img = preprocess_bgr(_load_bgr(path))
+    raw = _load_bgr(path)
+    img = preprocess_bgr(raw, strong=False)
     latin, v6 = get_engines()
 
     candidates: list[tuple[str, str, float, int]] = []
@@ -222,28 +261,33 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         except Exception:
             pass
 
-    if PHOTO_OCR_TESSERACT:
+    best_so_far = max(candidates, key=_rank_key)
+    # Second pass with stronger enhance only if structure is thin (thermal / glare)
+    if structure_score(best_so_far[1]) < 8:
+        img2 = preprocess_bgr(raw, strong=True)
+        try:
+            t2, m2, n2 = _result_to_text(latin(img2))
+            candidates.append(("latin-ppocrv5-strong", t2, m2, n2))
+        except Exception:
+            pass
+        if v6 is not None:
+            try:
+                t2, m2, n2 = _result_to_text(v6(img2))
+                candidates.append(("ppocrv6-strong", t2, m2, n2))
+            except Exception:
+                pass
+        best_so_far = max(candidates, key=_rank_key)
+
+    if PHOTO_OCR_TESSERACT and structure_score(best_so_far[1]) < 6:
         try:
             tess = _tesseract_tur(path)
             if tess.strip():
-                candidates.append(("tesseract-tur", tess, 0.7, tess.count("\n") + 1))
+                candidates.append(("tesseract-tur", tess, 0.55, tess.count("\n") + 1))
         except Exception:
             pass
 
-    # Rank: turkish richness, then mean score, then line count
-    best = max(
-        candidates,
-        key=lambda c: (_turkish_richness(c[1]) * 2 + c[2] * 100 + min(c[3], 120) * 0.05),
-    )
-    # Prefer primary text for parsing (alts only in meta — avoids duplicate lines)
+    best = max(candidates, key=_rank_key)
     text = best[1]
-    # If primary misses Turkish product names but another engine has richer TR chars,
-    # merge missing high-value lines (name-like) from the richest alternate.
-    richest_alt = max(candidates, key=lambda c: _turkish_richness(c[1]))
-    if richest_alt[0] != best[0] and _turkish_richness(richest_alt[1]) > _turkish_richness(best[1]) + 2:
-        text = richest_alt[1]
-        best = richest_alt
-
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return text, {
         "engine": best[0],
@@ -253,5 +297,6 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         "preprocessedShape": list(img.shape[:2]),
         "meanScore": best[2],
         "turkishChars": _turkish_richness(best[1]),
-        "altLineCounts": {c[0]: c[3] for c in candidates},
+        "structureScore": structure_score(best[1]),
+        "altStructure": {c[0]: structure_score(c[1]) for c in candidates},
     }

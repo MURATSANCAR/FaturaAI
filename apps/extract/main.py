@@ -642,7 +642,7 @@ def normalize_ocr_uuid(raw: str) -> str | None:
 def gib_invoice_number(text: str, file_name: str = "") -> str | None:
     """GIB-style fatura/belge no (tolerate OCR spaces/hyphens)."""
     labeled = re.search(
-        r"(?:Fatura\s*No|Fatera\s*No|Invoice\s*No|Belge\s*No|BELGE\s*NO)\s*[:\-.]?\s*"
+        r"(?:Fatura\s*No|Fatera\s*No|Invoice\s*No|B[EÉ]?[LİI1]?GE\s*N[O0]|BELGE\s*NO)\s*[:\-.]?\s*"
         r"([A-Za-z]{2,5}[\s\-]*\d{10,20}|\d{12,22})",
         text,
         re.I,
@@ -674,9 +674,13 @@ def format_uuid_hex(raw: str) -> str | None:
 def clean_retail_product_name(name: str) -> str:
     """Light OCR cleanup for Turkish retail product names (no invented brands)."""
     name = re.sub(r"\s+", " ", name).strip(" -*|")
-    # Common OCR confusions on thermal / phone photos
+    # Strip glued VAT / SKU / brand suffixes from OCR
+    name = re.sub(r"(?:HOMEND|H0WEND|HOWEND).*$", "HOMEND", name, flags=re.I)
+    name = re.sub(r"[%xX×]\s*\d{1,2}\s*$", "", name)
+    name = re.sub(r"\d{3,}H?\s*$", "", name)
     fixes = (
         (r"\bSARJAI\b", "ŞARJLI"),
+        (r"\bSARJRI\b", "ŞARJLI"),
         (r"\bSARJLI\b", "ŞARJLI"),
         (r"\bDiK\b", "DİK"),
         (r"\bDIK\b", "DİK"),
@@ -684,7 +688,6 @@ def clean_retail_product_name(name: str) -> str:
         (r"\bSUPURG[EÉ]\b", "SÜPÜRGE"),
         (r"\bCAMASIR\b", "ÇAMAŞIR"),
         (r"\bÇAMASIR\b", "ÇAMAŞIR"),
-        (r"\bKIRLI\b", "KIRLI"),
         (r"\bBILGI\b", "BİLGİ"),
         (r"\bFIS[Iİ]?\b", "FİŞİ"),
         (r"HOMENDX\d+$", "HOMEND"),
@@ -1213,6 +1216,10 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         or right_field(text, "Fatera No")
         or right_field(text, "Belge No")
         or right_field(text, "BELGE NO")
+        or first_match(
+            text,
+            r"(?:B[EÉ]?[LİI1]?GE|BELGE)\s*N[O0]\s*[:\-.]?\s*([A-Za-z]{2,5}[\s\-]*\d{10,20}|\d{12,22})",
+        )
     )
     if labeled_no:
         cleaned = re.sub(r"[^A-Za-z0-9]", "", labeled_no).upper()
@@ -1264,7 +1271,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     if not ocr_lines:
         ocr_lines = parse_retail_pos_lines(text)
     retail_fiş = bool(
-        re.search(r"\badet\s*x\b|B[İI]LG[İI]\s*F[İI][ŞS]|TOPKDV|BELGE\s*NO", text, re.I)
+        re.search(r"\badet\s*[x×X]\b|B[İI]LG[İI]\s*F[İI][ŞS]|TOPKDV|BELGE\s*N[O0]|BEBGE\s*N[O0]", text, re.I)
     )
     lines_sum = None
     if ocr_lines:
