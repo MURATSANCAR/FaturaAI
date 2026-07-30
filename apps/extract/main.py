@@ -32,6 +32,9 @@ FORCE_IMAGE_OCR = os.getenv("FORCE_IMAGE_OCR", "1") == "1"
 # Skip Docling when pdftotext already yields a strong invoice (metadata+totals).
 FAST_PATH_PDF = os.getenv("FAST_PATH_PDF", "1") == "1"
 FAST_PATH_MIN_CONF = float(os.getenv("FAST_PATH_MIN_CONF", "0.82"))
+# Photo path: RapidOCR PP-OCRv6 (ONNX) before Docling/Tesseract.
+PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
+PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
@@ -65,6 +68,7 @@ _metrics = {
     "extract_partial": 0,
     "extract_failed": 0,
     "fast_path": 0,
+    "photo_ocr": 0,
     "docling_calls": 0,
     "inflight": 0,
 }
@@ -308,6 +312,9 @@ def extract_embedded_ubl(data: bytes) -> str | None:
 def right_field(text: str, label: str) -> str | None:
     m = re.search(rf"{label}\s*:?\s*([^\n]+)", text, re.I)
     if not m:
+        # Label on one line, value on next (common OCR): "Fatura No\n:BBE-..."
+        m = re.search(rf"{label}\s*:?\s*\n\s*:?\s*([^\n]+)", text, re.I)
+    if not m:
         # Markdown table: | Label: | value |
         m = re.search(
             rf"\|\s*{label}\s*:?\s*\|?\s*([^|\n]+)\|?",
@@ -393,6 +400,17 @@ def extract_withholding_vat_amount(text: str) -> float | None:
     return labeled_amount(text, "KDV Tevkifat")
 
 
+def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
+    """Enough fields from photo OCR to skip heavy Docling."""
+    if inv.invoiceNumber and inv.totals.payableAmount is not None:
+        return True
+    if inv.invoiceNumber and inv.issueDate and (inv.customer.name or inv.supplier.name):
+        return True
+    if validation.confidence >= PHOTO_OCR_MIN_CONF and inv.invoiceNumber:
+        return True
+    return False
+
+
 def normalize_ocr_uuid(raw: str) -> str | None:
     """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, B→8)."""
     cleaned = raw.strip().upper()
@@ -408,7 +426,7 @@ def normalize_ocr_uuid(raw: str) -> str | None:
                 .replace("I", "1")
                 .replace("L", "1")
                 .replace("S", "5")
-                .replace("B", "8")
+                .replace("P", "F")  # common OCR: F→P
             )
             p = re.sub(r"[^0-9A-F]", "", p)
             if len(p) > n:
@@ -423,7 +441,7 @@ def normalize_ocr_uuid(raw: str) -> str | None:
             .replace("I", "1")
             .replace("L", "1")
             .replace("S", "5")
-            .replace("B", "8")
+            .replace("P", "F")
         )
     cleaned = cleaned.lower()
     if re.fullmatch(
@@ -435,13 +453,42 @@ def normalize_ocr_uuid(raw: str) -> str | None:
 
 
 def gib_invoice_number(text: str, file_name: str = "") -> str | None:
-    """GIB-style fatura no: 3 letters + 13 digits (tolerate OCR spaces)."""
+    """GIB-style fatura no: 3 letters + 13 digits (tolerate OCR spaces/hyphens)."""
+    # Prefer labeled matches first (OCR often puts ":BBE-2026...")
+    labeled = re.search(
+        r"(?:Fatura\s*No|Fatera\s*No|Invoice\s*No)\s*[:\-.]?\s*([A-Za-z]{2,5}[\s\-]*\d{10,16})",
+        text,
+        re.I,
+    )
+    if labeled:
+        compact = re.sub(r"[\s\-]+", "", labeled.group(1).upper())
+        if re.fullmatch(r"[A-Z]{2,5}\d{10,16}", compact):
+            return compact
     compact = re.sub(r"[\s|]+", "", text.upper())
+    compact = compact.replace("-", "")
     m = re.search(r"\b([A-Z]{2,5}\d{10,16})\b", compact)
     if m:
         return m.group(1)
     m = first_match(file_name, r"([A-Z]{2,5}\d{10,})")
     return m.upper() if m else None
+
+
+def extract_ettn_candidate(text: str) -> str | None:
+    """Find ETTN even when OCR glues label+uuid (ETTN9A83...)."""
+    m = re.search(
+        r"ETTN\s*[:\-]?\s*([0-9A-Fa-fİILOSBloş]{8}[-‑]?[0-9A-Fa-fİILOSBloş]{4}[-‑]?"
+        r"[0-9A-Fa-fİILOSBloş]{4}[-‑]?[0-9A-Fa-fİILOSBloş]{4}[-‑]?[0-9A-Fa-fİILOSBloş]{12})",
+        text,
+        re.I,
+    )
+    if m:
+        return normalize_ocr_uuid(m.group(1).replace("‑", "-"))
+    m = re.search(
+        r"\b([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\b",
+        text,
+        re.I,
+    )
+    return normalize_ocr_uuid(m.group(1)) if m else None
 
 
 def tesseract_ocr(path: Path) -> str:
@@ -520,6 +567,23 @@ def extract_supplier(text: str) -> Party:
 
 def extract_customer(text: str) -> Party:
     party = empty_party()
+    # Thermal / POS prints often use "MÜŞTERİ: NAME"
+    musteri = re.search(
+        r"M[ÜU][ŞS]TER[İIÍ]\s*:\s*([A-ZÇĞİÖŞÜa-zçğıöşü .'\-]{3,80})",
+        text,
+        re.I,
+    )
+    if musteri:
+        party.name = musteri.group(1).strip(" :.-")
+        tckn = first_match(text, r"\bTC(?:KN)?\s*:?\s*(\d{11})\b")
+        if tckn:
+            party.taxId = tckn
+            party.taxIdScheme = "TCKN"
+        phone = first_match(text, r"(\+90\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})")
+        if phone:
+            party.phone = phone
+        return party
+
     sayin = re.search(r"\bSAYIN\b", text, re.I)
     if not sayin:
         return party
@@ -740,7 +804,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         doc_type = "efatura"
 
     inv_no = gib_invoice_number(text, file_name)
-    labeled_no = right_field(text, "Fatura No")
+    labeled_no = right_field(text, "Fatura No") or right_field(text, "Fatera No")
     if labeled_no:
         cleaned = re.sub(r"[^A-Za-z0-9]", "", labeled_no).upper()
         if re.fullmatch(r"[A-Z]{2,5}\d{10,16}", cleaned):
@@ -752,14 +816,23 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 
     issue_raw = (
         right_field(text, "Fatura Tarihi")
+        or right_field(text, "Tarih")
+        or right_field(text, "Tarth")  # OCR typo
         or first_match(
             text,
-            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})",
+            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
         )
         or first_match(
-            text, r"(?:^|\n)[^\n]*?\bTarih\s*:?\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})"
+            text,
+            r"(?:^|\n)[^\n]*?\bTarih\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+        )
+        or first_match(
+            text,
+            r":\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
         )
     )
+    if issue_raw:
+        issue_raw = issue_raw.replace(",", ".")
     issue_date, issue_time = parse_issue_date(issue_raw)
     for label in ("Fatura Saati", "Düzenleme Zamanı", "Oluşma Zamanı"):
         raw = right_field(text, label)
@@ -768,12 +841,14 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             if tm:
                 issue_time = tm.group(1)
 
-    uuid = first_match(
-        text,
-        r"ETTN\s*:?\s*([0-9a-fA-FOoİIlLSBb]{8}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{12})",
-    )
-    if uuid:
-        uuid = normalize_ocr_uuid(uuid)
+    uuid = extract_ettn_candidate(text)
+    if not uuid:
+        uuid = first_match(
+            text,
+            r"ETTN\s*:?\s*([0-9a-fA-FOoİIlLSBb]{8}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{12})",
+        )
+        if uuid:
+            uuid = normalize_ocr_uuid(uuid)
 
     net = (
         labeled_amount(text, "Mal Hizmet Toplam Tutarı")
@@ -797,9 +872,25 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         labeled_amount(text, "Ödenecek Tutar")
         or labeled_amount(text, "ÖDENECEK TUTAR")
         or labeled_amount(text, "Odenecek Tutar")
+        or labeled_amount(text, "Genel Toplam")
+        or labeled_amount(text, "Gaal Taplain")  # OCR: Genel Toplam
+        or labeled_amount(text, "Genel Taplain")
     )
-    tax_inclusive = labeled_amount(text, "Vergiler Dahil Toplam Tutar") or labeled_amount(
-        text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR"
+    # POS / bank payment line often clearer on thermal print OCR
+    if payable is None:
+        pay_m = re.search(
+            r"(?:Kuveyt|Ziraat|Garanti|İş\s*Bank|Akbank|Yap[ıi]\s*Kredi|TEK)[^\n]{0,40}?"
+            r"(\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+[.,]\d{2})\s*TRY",
+            text,
+            re.I,
+        )
+        if pay_m:
+            payable = parse_tr_money(pay_m.group(1))
+    tax_inclusive = (
+        labeled_amount(text, "Vergiler Dahil Toplam Tutar")
+        or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR")
+        or labeled_amount(text, "Genel Toplam")
+        or payable
     )
     vat = extract_vat_amount(text)
     withholding = extract_withholding_vat_amount(text)
@@ -1047,6 +1138,7 @@ def health() -> dict[str, Any]:
         "docling": ENABLE_DOCLING,
         "doclingOcr": ENABLE_DOCLING_OCR,
         "forceImageOcr": FORCE_IMAGE_OCR,
+        "photoOcr": PHOTO_OCR_ENABLED,
         "fastPathPdf": FAST_PATH_PDF,
         "doclingMaxInflight": DOCLING_MAX_INFLIGHT,
         "doclingTimeoutS": DOCLING_TIMEOUT_S,
@@ -1121,44 +1213,65 @@ async def extract(
 
         if as_image:
             pipeline.append("image-input")
-            if not ENABLE_DOCLING:
-                _metrics["extract_failed"] += 1
-                return ExtractResponse(
-                    status="failed",
-                    method="none",
-                    durationMs=int((time.perf_counter() - started) * 1000),
-                    warnings=["Fotoğraf okuma için Docling gerekli (ENABLE_DOCLING=1)"],
-                    pipeline=pipeline,
-                )
-            try:
-                use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
-                md, table_lines = await run_docling(path, ocr=use_ocr, for_image=True)
-                pipeline.append("docling-image-ocr" if use_ocr else "docling-image")
-                if table_lines:
-                    invoice.lines = table_lines
-                    pipeline.append(f"docling-tables:{len(table_lines)}")
-                if md.strip():
-                    inv_md = parse_text_invoice(md.replace("\t", " "), name)
-                    invoice = merge_invoice(invoice, inv_md)
-                    if not invoice.lines and inv_md.lines:
-                        invoice.lines = inv_md.lines
-            except Exception as exc:  # noqa: BLE001
-                pipeline.append(f"docling-image-error:{exc}")
-                md = ""
+            photo_text = ""
+            if PHOTO_OCR_ENABLED:
+                try:
+                    from photo_ocr import ocr_image
 
-            try:
-                tess = await asyncio.to_thread(tesseract_ocr, path)
-                if tess.strip():
-                    pipeline.append("tesseract")
-                    text = tess
-                    inv_tess = parse_text_invoice(tess, name)
-                    invoice = merge_invoice(invoice, inv_tess)
-                    if not md.strip():
-                        md = tess
-                    else:
-                        md = md + "\n\n" + tess
-            except Exception as exc:  # noqa: BLE001
-                pipeline.append(f"tesseract-error:{exc}")
+                    photo_text, photo_meta = await asyncio.to_thread(ocr_image, path)
+                    pipeline.append(
+                        f"rapidocr-ppocrv6:{photo_meta.get('elapsedMs', 0)}ms:"
+                        f"{photo_meta.get('lineCount', 0)}"
+                    )
+                    _metrics["photo_ocr"] += 1
+                    if photo_text.strip():
+                        text = photo_text
+                        md = photo_text
+                        inv_photo = parse_text_invoice(photo_text, name)
+                        invoice = merge_invoice(invoice, inv_photo)
+                        if not invoice.lines and inv_photo.lines:
+                            invoice.lines = inv_photo.lines
+                        warnings_ph, validation_ph = validate_invoice(invoice)
+                        if strong_photo_invoice(invoice, validation_ph):
+                            pipeline.append("photo-ocr-fast-path")
+                except Exception as exc:  # noqa: BLE001
+                    pipeline.append(f"photo-ocr-error:{exc}")
+
+            # Heavy Docling only if photo OCR missed critical fields
+            need_docling = not strong_photo_invoice(
+                invoice, validate_invoice(invoice)[1]
+            )
+            if ENABLE_DOCLING and need_docling:
+                try:
+                    use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
+                    md2, table_lines = await run_docling(path, ocr=use_ocr, for_image=True)
+                    pipeline.append("docling-image-ocr" if use_ocr else "docling-image")
+                    if table_lines:
+                        invoice.lines = table_lines or invoice.lines
+                        pipeline.append(f"docling-tables:{len(table_lines)}")
+                    if md2.strip():
+                        inv_md = parse_text_invoice(md2.replace("\t", " "), name)
+                        invoice = merge_invoice(invoice, inv_md)
+                        if not invoice.lines and inv_md.lines:
+                            invoice.lines = inv_md.lines
+                        md = (md + "\n\n" + md2).strip() if md else md2
+                except Exception as exc:  # noqa: BLE001
+                    pipeline.append(f"docling-image-error:{exc}")
+
+            if need_docling or not invoice.invoiceNumber:
+                try:
+                    tess = await asyncio.to_thread(tesseract_ocr, path)
+                    if tess.strip():
+                        pipeline.append("tesseract")
+                        text = (text + "\n\n" + tess).strip() if text else tess
+                        inv_tess = parse_text_invoice(tess, name)
+                        invoice = merge_invoice(invoice, inv_tess)
+                        if not md.strip():
+                            md = tess
+                        else:
+                            md = md + "\n\n" + tess
+                except Exception as exc:  # noqa: BLE001
+                    pipeline.append(f"tesseract-error:{exc}")
 
             if (
                 not invoice.invoiceNumber

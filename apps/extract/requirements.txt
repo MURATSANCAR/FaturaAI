@@ -4,3 +4,8 @@ pydantic==2.11.7
 python-multipart==0.0.20
 # Optional: iPhone HEIC → JPEG (falls back to heif-convert/magick if missing)
 pillow-heif>=0.16.0; platform_system != "Windows"
+# Photo OCR: RapidOCR PP-OCRv6 (ONNX) + OpenCV preprocess
+onnxruntime>=1.17
+opencv-python-headless>=4.8
+rapidocr>=3.0
+numpy<2.3

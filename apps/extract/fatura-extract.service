@@ -10,6 +10,7 @@ Environment=PORT=8106
 Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
 Environment=FORCE_IMAGE_OCR=1
+Environment=PHOTO_OCR_ENABLED=1
 Environment=FAST_PATH_PDF=1
 Environment=DOCLING_MAX_INFLIGHT=1
 Environment=DOCLING_TIMEOUT_S=120
@@ -20,8 +21,8 @@ ExecStart=/data/nanobaseai/fatura/apps/extract/run.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
-# ~2GB per worker × 4 ≈ 8GB + headroom
-MemoryMax=12G
+# RapidOCR + Docling headroom (~2–3GB/worker × 4)
+MemoryMax=16G
 
 [Install]
 WantedBy=multi-user.target
