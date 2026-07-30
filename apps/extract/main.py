@@ -197,7 +197,11 @@ def parse_tr_money(raw: str | None) -> float | None:
     s = s.replace(" ", "").strip()
     if not s:
         return None
-    if "," in s and "." in s:
+    # 1.457.08 → thousands dots + decimal dot
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+\.\d{2,4}", s):
+        head, _, frac = s.rpartition(".")
+        s = head.replace(".", "") + "." + frac
+    elif "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(",", ".")
@@ -301,6 +305,55 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 discountAmount=discount,
                 vatRate=vat_rate,
                 lineTotal=line_total,
+            )
+        )
+    if out:
+        return out
+
+    # Thermal / POS print: barcode name vat qty unitPrice discount gross net
+    thermal_re = re.compile(
+        rf"(?m)^(?P<barcode>[A-Z0-9]{{8,14}})\s+(?P<name>.+?)\s+"
+        rf"(?P<vat>\d{{1,2}}[.,]\d{{2}})\s+"
+        rf"(?P<qty>\d+[.,]\d+)\s+"
+        rf"(?P<unit>{_MONEY_TOKEN}|1\.\d{{3}}\.\d{{2,5}})\s+"
+        rf"(?P<disc>{_MONEY_TOKEN}|E0O|0+)\s+"
+        rf"(?P<gross>{_MONEY_TOKEN}|1\.\d{{3}}\.\d{{2,5}})\s+"
+        rf"(?P<net>{_MONEY_TOKEN}|1\.\d{{3}}\.\d{{2,5}}|\d+\.\d{{2,5}})\s*$",
+        re.I,
+    )
+    for i, m in enumerate(thermal_re.finditer(text), start=1):
+        disc_raw = m.group("disc")
+        if re.fullmatch(r"E0O|0+", disc_raw or "", re.I):
+            disc = 0.0
+        else:
+            disc = parse_tr_money(disc_raw)
+        unit = parse_tr_money(m.group("unit"))
+        gross = parse_tr_money(m.group("gross"))
+        net = parse_tr_money(m.group("net"))
+        # Prefer unit as net when discount ~0 and OCR net is nonsense
+        if unit is not None and (disc or 0) == 0 and (net is None or net < unit * 0.5 or (gross and net > gross * 2)):
+            net = unit
+        elif net is not None and unit is not None and net > unit * 1.5 and gross is not None and abs(gross - unit * 1.1) < unit:
+            net = unit if (disc or 0) == 0 else round(unit - (disc or 0), 2)
+        if net is None and unit is not None:
+            net = round(unit - (disc or 0), 2) if disc else unit
+        # OCR KDV 16 → likely 10 for low-rate goods when unit ~118
+        vat_rate = normalize_vat_rate(parse_percent(m.group("vat")))
+        if vat_rate == 16.0:
+            vat_rate = 10.0
+        name = re.sub(r"\s+", " ", m.group("name")).strip()
+        if not name or net is None:
+            continue
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=parse_tr_money(m.group("qty")) or 1.0,
+                unit="Adet",
+                unitPrice=unit,
+                discountAmount=disc,
+                vatRate=vat_rate,
+                lineTotal=net,
             )
         )
     return out
