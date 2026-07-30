@@ -372,21 +372,36 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
     tiny = long0 < 700
     # Tall phone screenshots / chat exports: deskew often smears fine fonts
     screenshotish = tiny or (h0 > w0 * 1.35 and long0 < 1400)
-    latin, _ = get_engines(need_v6=PHOTO_OCR_DUAL)
+    latin, _ = get_engines(need_v6=PHOTO_OCR_DUAL or screenshotish)
     v6 = None
     candidates: list[tuple[str, str, float, int]] = []
 
-    # Pass 1: single latin (nodeskew for screenshots)
+    # Screenshots (chat/UI): PP-OCRv6 reads dense GİB layouts better.
     img = preprocess_bgr(raw, strong=False, deskew=not screenshotish)
-    _run_engine(latin, img, "latin-ppocrv5", candidates)
-    best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
     early = False
-
-    if candidates and _good_enough(best[1]) and not PHOTO_OCR_DUAL:
-        early = True
+    if screenshotish:
+        _, v6 = get_engines(need_v6=True)
+        if v6 is not None:
+            _run_engine(v6, img, "ppocrv6", candidates)
+        best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+        if candidates and _good_enough(best[1]):
+            early = True
+        else:
+            _run_engine(latin, img, "latin-ppocrv5", candidates)
+            best = max(candidates, key=_rank_key) if candidates else best
+            if candidates and _good_enough(best[1]):
+                early = True
     else:
-        # Pass 2: second engine only when needed (or dual forced)
-        if PHOTO_OCR_DUAL or not _good_enough(best[1], PHOTO_OCR_EARLY_STRUCT):
+        _run_engine(latin, img, "latin-ppocrv5", candidates)
+        best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+        if candidates and _good_enough(best[1]) and not PHOTO_OCR_DUAL:
+            early = True
+
+    if not early:
+        # Extra engine / preprocess only when the first pass is weak
+        if not screenshotish and (
+            PHOTO_OCR_DUAL or not _good_enough(best[1], PHOTO_OCR_EARLY_STRUCT)
+        ):
             _, v6 = get_engines(need_v6=True)
             if v6 is not None:
                 _run_engine(v6, img, "ppocrv6", candidates)
@@ -397,7 +412,6 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         else:
             if v6 is None:
                 _, v6 = get_engines(need_v6=True)
-            # Pass 3: nodeskew / strong only if still weak
             if screenshotish or structure_score(best[1]) < PHOTO_OCR_EARLY_STRUCT + 2:
                 img_nd = preprocess_bgr(raw, strong=False, deskew=False)
                 _run_engine(latin, img_nd, "latin-ppocrv5-nodeskew", candidates)

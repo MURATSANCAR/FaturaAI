@@ -254,6 +254,12 @@ def normalize_ocr_text(text: str) -> str:
     text = re.sub(r"(?i)\bPDF\s*indir\b|\bXML\s*indir\b", " ", text)
     # Money OCR: "2.008, 30" → "2.008,30"
     text = re.sub(r"(\d),(\s+)(\d{2})\b", r"\1,\3", text)
+    # OCR: "35.99L00TL" / "4,459;00" → proper decimals
+    text = re.sub(r"(\d+[.,]\d{2})[Ll](\d{2})\b", r"\1,\2", text)
+    text = re.sub(r"(\d+[.,]\d{3})[Ll](\d{2})\b", r"\1,\2", text)
+    text = re.sub(r"(\d+[.,]\d{2,3});(\d{2})\b", r"\1,\2", text)
+    text = re.sub(r"℃\s*L\b", "TL", text)
+    text = re.sub(r"(\d)℃L\b", r"\1TL", text)
     # OCR: "1.49,83" → "1.499,83" (dropped thousands digit)
     text = re.sub(
         r"\b(\d+)\.(\d{2}),(\d{2})\b",
@@ -283,16 +289,20 @@ def normalize_ocr_text(text: str) -> str:
         (r"\bTaribi\b", "Tarihi"),
         (r"\bTarihl\b", "Tarihi"),
         (r"\bTarila\b", "Tarihi"),
+        (r"\bTariba\b", "Tarihi"),
+        (r"\bTarthi\b", "Tarihi"),
+        (r"\bPataca\b", "Fatura"),
+        (r"\bDatara\b", "Fatura"),
         (r"\b[ÖO]DENECEKTUTAR\b", "ÖDENECEK TUTAR"),
         (r"\b[ÖO]denecek\s*Tutar\b", "ÖDENECEK TUTAR"),
         (r"\b[ÖO]denecek\s*Tuter\b", "ÖDENECEK TUTAR"),
         (r"\benecel\s*Tutar\b", "ÖDENECEK TUTAR"),
-        # Photo OCR mangling: Odesecch / Öfenecets / Ofesecck / Ödesectk …
-        (r"\b[ÖO][df]?e[sş]?e?ne[cçkhs]{1,4}\s*[:.]?\s*T[ou]tar\b", "ÖDENECEK TUTAR"),
-        (r"\b[ÖO]fenec+e?t?s?\s*Totar\b", "ÖDENECEK TUTAR"),
+        # Photo OCR mangling: Odesecck / Öfenecets / Ofesecck / Ödesectk …
+        (r"\b[ÖO][A-Za-zçğıöşü]{5,14}\s+T[ou]tar\b", "ÖDENECEK TUTAR"),
         (r"\bVergies?\s*Dald\s*Teglam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVergiler\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVerg[il]+[eo]r\s*Dah[il]+\s*Topl[ae]m\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bVarg[iı]kr\s*Dahil\s*Topla[ae]\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVarg[iı]kr\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bWerglker\s*Dahil\s*Teplamn?\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVergilker\s*Dahil\s*Teplamn?\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
@@ -620,7 +630,7 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         hp = re.search(r"(HP\s+.+)$", name, re.I)
         if hp and len(hp.group(1)) >= 8:
             name = hp.group(1).strip()
-        if re.search(r"Toplam|Iskonto|Ödenecek|Vergi\s*Dahil|Mal\s*Hizmet\s*Toplam", name, re.I):
+        if re.search(r"Toplam|Iskonto|Ödenecek|Vergi\s*Dahil|Mal\s*Hizmet\s*Toplam|ETT?N", name, re.I):
             continue
         total = parse_tr_money(m.group("total"))
         if total is None or total < 1:
@@ -631,6 +641,31 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 id=str(i),
                 name=name[:240],
                 quantity=qty,
+                unit="Adet",
+                unitPrice=parse_tr_money(m.group("unitPrice")),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
+    # Photo OCR without glued qty: "HP 146GB…\n… 3.749,… 22.495,00TL"
+    hp_block = re.compile(
+        rf"(?P<name>HP\s+[^\n]{{6,80}})\s*(?:\n[^\n]{{0,160}}?)?"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*T?L?\s+"
+        rf".{{0,80}}?"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL\b",
+        re.I,
+    )
+    for i, m in enumerate(hp_block.finditer(text), start=1):
+        total = parse_tr_money(m.group("total"))
+        if total is None or total < 10:
+            continue
+        out.append(
+            Line(
+                id=str(i),
+                name=re.sub(r"\s+", " ", m.group("name")).strip()[:240],
+                quantity=1.0,
                 unit="Adet",
                 unitPrice=parse_tr_money(m.group("unitPrice")),
                 lineTotal=total,
@@ -1205,6 +1240,12 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
         return False
     if not inv.lines:
         return False
+    # GİB serial year must look real after OCR repair
+    ym = re.match(r"^[A-Z]{2,5}(\d{4})", inv.invoiceNumber)
+    if ym:
+        year = int(ym.group(1))
+        if year < 2010 or year > 2100:
+            return False
     # Reject when line totals are clearly not the invoice (bad thermal OCR names)
     line_sum = sum(l.lineTotal or 0.0 for l in inv.lines if l.lineTotal is not None)
     payable = inv.totals.payableAmount or 0.0
@@ -1216,11 +1257,21 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
         junk = 0
         for l in inv.lines:
             n = (l.name or "").strip()
+            if re.search(r"Mal\s*Hizmet\s*Toplam|Toplam\s*Tutar|Iskonto", n, re.I):
+                junk += 2
+            if re.search(r"(?i)\bETT?N\b|[0-9a-f]{6,}-[0-9a-f-]{6,}", n):
+                junk += 2
             letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", n)
+            digits = re.sub(r"\D", "", n)
+            if len(digits) >= 6 and len(letters) <= 2:
+                junk += 2
             vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
             if len(letters) >= 8 and vowels <= 1:
                 junk += 1
         if junk >= max(1, len(inv.lines) // 2):
+            return False
+        # Tiny "payable" while line OCR is UUID noise — not a real invoice total
+        if payable < 20 and line_sum < 20:
             return False
     if inv.issueDate and (inv.customer.name or inv.supplier.name):
         return True
@@ -2238,6 +2289,31 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         payable = tax_inclusive
     if tax_inclusive is None and payable is not None:
         tax_inclusive = payable
+    # Photo OCR often flips the leading digit (36.994 vs 26.994). Prefer the
+    # candidate that matches line totals × (1+KDV) when available.
+    if lines_sum and lines_sum >= 10:
+        expected_cands = [round(lines_sum * (1 + r), 2) for r in (0.20, 0.18, 0.10, 0.08, 0.01, 0.0)]
+        pool = [a for a in (payable, tax_inclusive, odenecek, vergi_dahil) if a is not None]
+        best = None
+        for exp in expected_cands:
+            for a in pool:
+                if abs(a - exp) < 1.0:
+                    best = exp
+                    break
+            if best is not None:
+                break
+        if best is None:
+            for exp in expected_cands:
+                for a in pool:
+                    # leading-digit slip (~10k on mid invoices)
+                    if 5000 <= abs(a - exp) <= 15000:
+                        best = exp
+                        break
+                if best is not None:
+                    break
+        if best is not None:
+            payable = best
+            tax_inclusive = best
 
     bank_pay = None
     bank_name_pay = None
