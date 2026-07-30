@@ -1906,6 +1906,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         # OCR: common misspellings of MAGAZACILIK
         supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
         supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
+        # Strip leading short POS/OCR prefixes ("6A ", "hgz ") before company title
+        supplier.name = re.sub(r"^[0-9A-Za-z]{1,3}\s+(?=\S{3,})", "", supplier.name).strip()
         # Drop POS store-label tails glued onto company title (generic)
         supplier.name = re.split(
             r"\s+(?:Hgz\s*Ad[iı]|Mgz\s*Kodu|Ma[ğg]aza\s*(?:Ad[iı]|Kodu))\s*:",
