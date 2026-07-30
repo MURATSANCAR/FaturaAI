@@ -1561,13 +1561,14 @@ def extract_supplier(text: str) -> Party:
                     ln,
                     re.I,
                 )
-                and not re.search(r"^(?:PDF|XML|Page|Adres|Tel|Web|Vergi|VKN|VIN)", ln, re.I)
+                and not re.search(r"^(?:PDF|XML|Page|Adres|Tel|Web|Vergi|VKN|VIN|Kurumsal\s+Ofis)", ln, re.I)
                 and not _is_registry_or_chrome_line(ln)
+                and not _looks_like_address_party_line(ln)
             ),
             None,
         )
         if company_idx is not None:
-            company = lines[company_idx]
+            company = re.sub(r"^#+\s*", "", lines[company_idx]).strip()
             # Address + legal form glued: keep the legal-entity segment
             if re.search(r"\b(?:MAH\.|CAD\.|SOK\.|NO:)\b", company, re.I):
                 ent = re.search(
@@ -1598,29 +1599,39 @@ def extract_supplier(text: str) -> Party:
                     company = f"{company} {nxt}"
             party.name = company[:180]
         elif lines and not re.match(
-            r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Telefon|Adres)", lines[0], re.I
+            r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Telefon|Adres|#)", lines[0], re.I
         ):
-            name = lines[0]
+            name = re.sub(r"^#+\s*", "", lines[0]).strip()
             if (
                 len(lines) > 1
                 and re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M)", lines[1], re.I)
                 and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)", lines[1], re.I)
             ):
-                name = f"{lines[0]} {lines[1]}"
-            if not _is_registry_or_chrome_line(name):
+                nxt = re.sub(r"^#+\s*", "", lines[1]).strip()
+                name = f"{name} {nxt}"
+            if (
+                name
+                and not _is_registry_or_chrome_line(name)
+                and not _looks_like_address_party_line(name)
+            ):
                 party.name = name[:180]
     if party.name:
+        party.name = re.sub(r"^#+\s*", "", party.name).strip()
         party.name = re.sub(
             r"^(?:Sat[ıi]c[ıi]\s*(?:\([^)]*\)|\{[^}]*\}|\[[^\]]*\])?\s*:?\s*)",
             "",
             party.name,
             flags=re.I,
         )
+        # Docling / markdown headings
+        party.name = re.sub(r"^#+\s*", "", party.name).strip()
         party.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
         party.name = re.sub(r"\bMA[ČĆC]AZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
         party.name = re.sub(r"\bDA[ČĆC]IT[İI]N\b", "DAGITIM", party.name, flags=re.I)
         party.name = re.sub(r"\bSANLAS\.?\b", "SAN.A.S.", party.name, flags=re.I)
         party.name = re.sub(r"\s+", " ", party.name).strip(" :.-[]{}")[:180]
+        if party.name and _looks_like_address_party_line(party.name):
+            party.name = None
     # Address lines before SAYIN (MAH./CAD./NO:)
     addr_parts = [
         ln
@@ -2310,8 +2321,13 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         # OCR: common misspellings of MAGAZACILIK
         supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
         supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
-        # Strip leading short POS/OCR prefixes ("6A ", "hgz ") before company title
-        supplier.name = re.sub(r"^[0-9A-Za-z]{1,3}\s+(?=\S{3,})", "", supplier.name).strip()
+        # Strip leading short POS/OCR prefixes ("6A ", "hgz ") — not English "THE "
+        supplier.name = re.sub(
+            r"^(?:[a-z]{1,3}\d*|\d{1,3}[A-Za-z]{0,2})\s+(?=\S{3,})",
+            "",
+            supplier.name,
+        ).strip()
+        supplier.name = re.sub(r"^#+\s*", "", supplier.name).strip()
         # Drop POS store-label tails glued onto company title (generic)
         supplier.name = re.split(
             r"\s+(?:Hgz\s*Ad[iı]|Mgz\s*Kodu|Ma[ğg]aza\s*(?:Ad[iı]|Kodu))\s*:",
@@ -2429,21 +2445,29 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 payable = line_sum
                 tax_inclusive = line_sum
 
-    # Reject junk supplier names
+    # Reject junk supplier names (never replace with address / office lines)
     if supplier.name and (
-        _party_name_quality(supplier.name) < 6 or _is_registry_or_chrome_line(supplier.name)
+        _party_name_quality(supplier.name) < 6
+        or _is_registry_or_chrome_line(supplier.name)
+        or _looks_like_address_party_line(supplier.name)
     ):
         better = next(
             (
-                ln.strip()
+                re.sub(r"^#+\s*", "", ln.strip()).strip()
                 for ln in text.splitlines()
-                if _party_name_quality(ln.strip()) >= 20 and not _is_registry_or_chrome_line(ln)
+                if _party_name_quality(ln.strip()) >= 20
+                and not _is_registry_or_chrome_line(ln)
+                and not _looks_like_address_party_line(ln.strip())
             ),
             None,
         )
         if better:
             supplier.name = better[:180]
-        elif _party_name_quality(supplier.name) < 4 or _is_registry_or_chrome_line(supplier.name):
+        elif (
+            _party_name_quality(supplier.name) < 4
+            or _is_registry_or_chrome_line(supplier.name)
+            or _looks_like_address_party_line(supplier.name)
+        ):
             supplier.name = None
 
     # If supplier phone empty but a Tel exists only under SAYIN, keep on customer;
@@ -2495,10 +2519,43 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     )
 
 
+def _looks_like_address_party_line(name: str) -> bool:
+    """True when a line is an office/address block, not a legal company title."""
+    n = name.strip()
+    if re.match(
+        r"^(?:Kurumsal\s+Ofis|Merkez(?:\s+Ofis)?|Adres|Ofis)\s*:",
+        n,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"(?:Kurumsal\s+Ofis|Merkez\s*:)\s*.{0,40}(?:Mahallesi|Cadde|Bulvar|Sokak|No:)",
+        n,
+        re.I,
+    ):
+        return True
+    # Long line dominated by address tokens without a clean legal-form title
+    addr_hits = len(
+        re.findall(
+            r"\b(?:Mahallesi|Mah\.|Cadde(?:si)?|Cad\.|Bulvar[ıi]?|Sokak|Sk\.|No:|Kat:|Blok)\b",
+            n,
+            re.I,
+        )
+    )
+    if addr_hits >= 2 and not re.search(
+        r"(?:ANON[İI]M\s+Ş[İI]RKET|A\.?\s*Ş\.?|LTD\.?\s*ŞT[İI])\s*$",
+        n,
+        re.I,
+    ):
+        return True
+    return False
+
+
 def _party_name_quality(name: str | None) -> int:
     if not name:
         return 0
-    n = name.strip()
+    # Docling markdown headings: "## COMPANY A.Ş."
+    n = re.sub(r"^#+\s*", "", name.strip()).strip()
     if len(n) < 3 or re.fullmatch(r"[=_\-—.\s]+", n):
         return 0
     if re.search(
@@ -2509,16 +2566,22 @@ def _party_name_quality(name: str | None) -> int:
         re.I,
     ):
         return 0
+    if _looks_like_address_party_line(n):
+        return 0
     letters = len(re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]", n))
     if letters < 4:
         return 0
     score = letters
-    if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|MA[ĞG]AZA|DAGITIM)", n, re.I):
+    if re.search(
+        r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|ANON[İI]M|Ş[İI]RKET|MA[ĞG]AZA|DAGITIM|TEKNOLOJ)",
+        n,
+        re.I,
+    ):
         score += 20
         # Registry labels containing TICARET are not company titles
         if re.search(r"TICARETSICIL|T[İI]CARET\s*S[İI]C[İI]L", n, re.I):
             score -= 40
-    if re.search(r"Senaryo|Fatura\s*Tipi|==|^[#]+", n, re.I):
+    if re.search(r"Senaryo|Fatura\s*Tipi|==", n, re.I):
         score -= 30
     return score
 
