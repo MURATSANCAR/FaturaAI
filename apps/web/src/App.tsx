@@ -88,25 +88,78 @@ export default function App() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [result, setResult] = useState<ExtractResult | null>(null);
   const [showRaw, setShowRaw] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
 
   const upload = useCallback(async (file: File) => {
     setError(null);
     setResult(null);
     setFileName(file.name);
     setLoading(true);
+    setProgress("Kuyruğa alınıyor…");
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`${API_BASE}/extract`, { method: "POST", body: form });
-      const data = (await res.json()) as ExtractResult;
-      if (!res.ok && !data.invoice) {
-        throw new Error(data.warnings?.[0] ?? `HTTP ${res.status}`);
+      const create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+      const created = (await create.json()) as {
+        jobId?: string | null;
+        status?: string;
+        queuePosition?: number | null;
+        warnings?: string[];
+      };
+      if (!create.ok || !created.jobId) {
+        throw new Error(created.warnings?.[0] ?? `HTTP ${create.status}`);
       }
-      setResult(data);
+
+      const jobId = created.jobId;
+      if (created.queuePosition && created.queuePosition > 1) {
+        setProgress(`Sırada (#${created.queuePosition})…`);
+      } else {
+        setProgress("Okunuyor…");
+      }
+
+      const started = Date.now();
+      while (Date.now() - started < 180_000) {
+        await new Promise((r) => setTimeout(r, 700));
+        const res = await fetch(`${API_BASE}/jobs/${jobId}`);
+        const job = (await res.json()) as {
+          status: string;
+          queuePosition?: number | null;
+          result?: ExtractResult | null;
+          error?: string | null;
+          warnings?: string[];
+        };
+        if (!res.ok) {
+          throw new Error(job.warnings?.[0] ?? job.error ?? `HTTP ${res.status}`);
+        }
+        if (job.status === "queued") {
+          setProgress(
+            job.queuePosition && job.queuePosition > 1
+              ? `Sırada (#${job.queuePosition})…`
+              : "Sırada…",
+          );
+          continue;
+        }
+        if (job.status === "running") {
+          setProgress("Okunuyor…");
+          continue;
+        }
+        if (job.status === "done" || job.status === "failed") {
+          if (!job.result) {
+            throw new Error(job.error ?? "Okuma sonucu alınamadı");
+          }
+          if (job.status === "failed" && !job.result.invoice) {
+            throw new Error(job.error ?? job.result.warnings?.[0] ?? "Okuma başarısız");
+          }
+          setResult(job.result);
+          return;
+        }
+      }
+      throw new Error("Okuma zaman aşımına uğradı");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   }, []);
 
@@ -184,7 +237,7 @@ export default function App() {
               disabled={loading}
               onClick={() => uploadInputRef.current?.click()}
             >
-              {loading ? "Okunuyor…" : "Yükle"}
+              {loading ? progress ?? "Okunuyor…" : "Yükle"}
             </button>
             <button
               type="button"

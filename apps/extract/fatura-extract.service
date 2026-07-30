@@ -10,12 +10,18 @@ Environment=PORT=8106
 Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
 Environment=FORCE_IMAGE_OCR=1
+Environment=FAST_PATH_PDF=1
+Environment=DOCLING_MAX_INFLIGHT=1
+Environment=DOCLING_TIMEOUT_S=120
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/data/nanobaseai/fatura/apps/extract/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers 1
+# run.sh / uvicorn workers set by deploy script
+ExecStart=/data/nanobaseai/fatura/apps/extract/run.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+# ~2GB per worker × 4 ≈ 8GB + headroom
+MemoryMax=12G
 
 [Install]
 WantedBy=multi-user.target

@@ -75,7 +75,8 @@ locations = """
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
-        proxy_read_timeout 120s;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
         client_max_body_size 25M;
         proxy_pass http://fatura_api/;
     }

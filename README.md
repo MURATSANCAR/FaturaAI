@@ -1,36 +1,34 @@
 # FaturaAI
 
-Nanobase Portal üzerinde e-Arşiv / e-Fatura okuma (PDF + fotoğraf).
+Nanobase Portal üzerinde e-Arşiv / e-Fatura okuma (PDF + fotoğraf) — prod ölçekli kuyruk.
 
 - UI: https://portal.nanobase.ai/fatura/
 - API: https://portal.nanobase.ai/fatura-api/health
-- Extract: `127.0.0.1:8106` (Docling + pdftotext pipeline)
+- Metrics: https://portal.nanobase.ai/fatura-api/metrics
+- Extract: `127.0.0.1:8106` (Docling workers)
+
+## Prod mimari
+
+```
+Browser
+  → POST /fatura-api/jobs   (202 + jobId)
+  → GET  /fatura-api/jobs/:id  (poll: queued|running|done)
+API (:8105)
+  ├─ rate limit (IP)
+  ├─ job queue (max inflight 8, max queue 200)
+  ├─ PDF fast-path: pdftotext/UBL (~ms–sn)
+  └─ weak PDF / foto → Extract v2 Docling
+Extract (:8106, uvicorn workers=4)
+  ├─ asyncio.to_thread(Docling) + semaphore
+  ├─ FAST_PATH_PDF (text-layer güçlüyse Docling skip)
+  └─ image OCR (Tesseract + Docling)
+```
 
 ## Desteklenen girdiler
 
-- **PDF** — e-Arşiv ve e-Fatura (metin katmanı / gömülü UBL)
-- **Fotoğraf** — JPG, PNG, WEBP (+ HEIC best-effort); mobilde **Yükle** ve **Foto çek**
-- Belge tipi heuristic: `earsiv` | `efatura` | `ubl` | `unknown`
-
-## Pipeline (prod)
-
-```
-PDF
- ├─ UBL gömülü mü?
- ├─ pdftotext (hızlı alanlar)
- ├─ Docling structure + tablolar (CPU)
- ├─ (opsiyonel) Docling OCR — ENABLE_DOCLING_OCR=1
- ├─ Pydantic Invoice JSON
- └─ Matematik doğrulama → confidence
-
-Fotoğraf / kamera
- ├─ (HEIC ise) JPEG’e çevir
- ├─ Docling IMAGE + OCR (FORCE_IMAGE_OCR=1, varsayılan açık)
- ├─ Aynı alan çıkarımı + doğrulama
- └─ confidence
-```
-
-Node API (`8105`) extract v2 servisine proxy eder; PDF’de servis düşerse legacy parser’a düşer. Fotoğraflar için extract v2 zorunludur.
+- PDF — e-Arşiv / e-Fatura
+- Fotoğraf — JPG/PNG/WEBP (+ HEIC best-effort); mobilde **Foto çek**
+- Sync `POST /extract` hâlâ var (script/load test)
 
 ## Deploy
 

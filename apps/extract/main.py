@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
@@ -28,6 +29,10 @@ ENABLE_DOCLING = os.getenv("ENABLE_DOCLING", "1") == "1"
 ENABLE_DOCLING_OCR = os.getenv("ENABLE_DOCLING_OCR", "0") == "1"
 # Phone photos always OCR; PDF OCR stays behind ENABLE_DOCLING_OCR unless forced.
 FORCE_IMAGE_OCR = os.getenv("FORCE_IMAGE_OCR", "1") == "1"
+# Skip Docling when pdftotext already yields a strong invoice (metadata+totals).
+FAST_PATH_PDF = os.getenv("FAST_PATH_PDF", "1") == "1"
+FAST_PATH_MIN_CONF = float(os.getenv("FAST_PATH_MIN_CONF", "0.82"))
+DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
 
@@ -53,6 +58,54 @@ app.add_middleware(
 )
 
 _docling_converter = None
+_docling_sem: asyncio.Semaphore | None = None
+_metrics = {
+    "extract_total": 0,
+    "extract_ok": 0,
+    "extract_partial": 0,
+    "extract_failed": 0,
+    "fast_path": 0,
+    "docling_calls": 0,
+    "inflight": 0,
+}
+
+
+def get_docling_sem() -> asyncio.Semaphore:
+    global _docling_sem
+    if _docling_sem is None:
+        _docling_sem = asyncio.Semaphore(DOCLING_MAX_INFLIGHT)
+    return _docling_sem
+
+
+async def run_docling(
+    path: Path, ocr: bool = False, for_image: bool = False
+) -> tuple[str, list[Line]]:
+    """Run Docling off the event loop with concurrency + timeout caps."""
+    sem = get_docling_sem()
+    await sem.acquire()
+    _metrics["inflight"] += 1
+    _metrics["docling_calls"] += 1
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(docling_convert, path, ocr, for_image),
+            timeout=DOCLING_TIMEOUT_S,
+        )
+    finally:
+        _metrics["inflight"] = max(0, _metrics["inflight"] - 1)
+        sem.release()
+
+
+def strong_text_invoice(inv: Invoice, validation: Validation) -> bool:
+    if validation.confidence < FAST_PATH_MIN_CONF:
+        return False
+    if not inv.invoiceNumber or inv.totals.payableAmount is None:
+        return False
+    if not inv.supplier.name or not inv.customer.name:
+        return False
+    # Lines preferred; allow strong metadata-only if conf still high after soft line miss
+    if inv.lines:
+        return True
+    return validation.confidence >= 0.9 and bool(inv.issueDate)
 
 
 class Party(BaseModel):
@@ -889,8 +942,29 @@ def health() -> dict[str, Any]:
         "docling": ENABLE_DOCLING,
         "doclingOcr": ENABLE_DOCLING_OCR,
         "forceImageOcr": FORCE_IMAGE_OCR,
+        "fastPathPdf": FAST_PATH_PDF,
+        "doclingMaxInflight": DOCLING_MAX_INFLIGHT,
+        "doclingTimeoutS": DOCLING_TIMEOUT_S,
+        "inflight": _metrics["inflight"],
+        "metrics": dict(_metrics),
         "imageFormats": sorted(ext.lstrip(".") for ext in IMAGE_EXTENSIONS),
     }
+
+
+@app.get("/metrics")
+def metrics_prom() -> Any:
+    from fastapi.responses import PlainTextResponse
+
+    lines = [
+        f"fatura_extract_total {_metrics['extract_total']}",
+        f"fatura_extract_ok {_metrics['extract_ok']}",
+        f"fatura_extract_partial {_metrics['extract_partial']}",
+        f"fatura_extract_failed {_metrics['extract_failed']}",
+        f"fatura_extract_fast_path {_metrics['fast_path']}",
+        f"fatura_extract_docling_calls {_metrics['docling_calls']}",
+        f"fatura_extract_inflight {_metrics['inflight']}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 @app.post("/extract", response_model=ExtractResponse)
@@ -902,7 +976,9 @@ async def extract(
     pipeline: list[str] = []
     name = filename or file.filename or "invoice.pdf"
     data = await file.read()
+    _metrics["extract_total"] += 1
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        _metrics["extract_failed"] += 1
         return ExtractResponse(
             status="failed",
             method="none",
@@ -921,10 +997,11 @@ async def extract(
         if as_image and path.suffix.lower() in {".heic", ".heif"}:
             jpeg_path = Path(tmp) / "invoice.jpg"
             try:
-                convert_heic_to_jpeg(path, jpeg_path)
+                await asyncio.to_thread(convert_heic_to_jpeg, path, jpeg_path)
                 path = jpeg_path
                 pipeline.append("heic-jpeg")
             except Exception as exc:  # noqa: BLE001
+                _metrics["extract_failed"] += 1
                 return ExtractResponse(
                     status="failed",
                     method="none",
@@ -940,6 +1017,7 @@ async def extract(
         if as_image:
             pipeline.append("image-input")
             if not ENABLE_DOCLING:
+                _metrics["extract_failed"] += 1
                 return ExtractResponse(
                     status="failed",
                     method="none",
@@ -949,7 +1027,7 @@ async def extract(
                 )
             try:
                 use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
-                md, table_lines = docling_convert(path, ocr=use_ocr, for_image=True)
+                md, table_lines = await run_docling(path, ocr=use_ocr, for_image=True)
                 pipeline.append("docling-image-ocr" if use_ocr else "docling-image")
                 if table_lines:
                     invoice.lines = table_lines
@@ -963,9 +1041,8 @@ async def extract(
                 pipeline.append(f"docling-image-error:{exc}")
                 md = ""
 
-            # Supplemental Tesseract pass — often cleaner for GIB labels/totals
             try:
-                tess = tesseract_ocr(path)
+                tess = await asyncio.to_thread(tesseract_ocr, path)
                 if tess.strip():
                     pipeline.append("tesseract")
                     text = tess
@@ -978,7 +1055,13 @@ async def extract(
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"tesseract-error:{exc}")
 
-            if not invoice.invoiceNumber and not invoice.totals.payableAmount and not invoice.lines and not invoice.supplier.name:
+            if (
+                not invoice.invoiceNumber
+                and not invoice.totals.payableAmount
+                and not invoice.lines
+                and not invoice.supplier.name
+            ):
+                _metrics["extract_failed"] += 1
                 return ExtractResponse(
                     status="failed",
                     method="none",
@@ -987,31 +1070,29 @@ async def extract(
                     pipeline=pipeline,
                 )
         else:
-            # 1) UBL
             ubl = extract_embedded_ubl(data)
             if ubl and re.search(r"<(?:\w+:)?Invoice[\s>]", ubl, re.I):
                 pipeline.append("ubl")
-                # Minimal UBL handling — defer to text path if complex; still mark method
-                # For now continue with text sources which also see UUID etc.
 
-            # 2) pdftotext heuristics
             try:
-                text = pdftotext(path)
+                text = await asyncio.to_thread(pdftotext, path)
                 pipeline.append("pdftotext")
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"pdftotext-error:{exc}")
 
             invoice = parse_text_invoice(text, name) if text.strip() else Invoice()
+            warnings_fp, validation_fp = validate_invoice(invoice)
 
-            # 3) Docling structure/tables
-            if ENABLE_DOCLING:
+            if FAST_PATH_PDF and strong_text_invoice(invoice, validation_fp):
+                pipeline.append("fast-path")
+                _metrics["fast_path"] += 1
+            elif ENABLE_DOCLING:
                 try:
-                    md, table_lines = docling_convert(path, ocr=False, for_image=False)
+                    md, table_lines = await run_docling(path, ocr=False, for_image=False)
                     pipeline.append("docling-structure")
                     if table_lines:
                         invoice.lines = table_lines
                         pipeline.append(f"docling-tables:{len(table_lines)}")
-                    # Merge metadata from docling markdown too
                     if md.strip():
                         inv_md = parse_text_invoice(md.replace("\t", " "), name)
                         invoice = merge_invoice(invoice, inv_md)
@@ -1022,7 +1103,6 @@ async def extract(
 
         warnings, validation = validate_invoice(invoice)
 
-        # Sanitize nonsense unit prices from mis-mapped tables
         for line in invoice.lines:
             if (
                 line.quantity
@@ -1035,9 +1115,9 @@ async def extract(
                 else:
                     line.unitPrice = round(line.lineTotal / line.quantity, 2)
 
-        # 4) OCR fallback if weak PDF result (images already OCR'd above)
         need_ocr = (
             not as_image
+            and "fast-path" not in pipeline
             and ENABLE_DOCLING
             and ENABLE_DOCLING_OCR
             and (
@@ -1048,7 +1128,7 @@ async def extract(
         )
         if need_ocr:
             try:
-                md2, table_lines2 = docling_convert(path, ocr=True, for_image=False)
+                md2, table_lines2 = await run_docling(path, ocr=True, for_image=False)
                 pipeline.append("docling-ocr")
                 if table_lines2:
                     invoice.lines = table_lines2
@@ -1061,7 +1141,9 @@ async def extract(
         method = "+".join(
             p
             for p in pipeline
-            if not p.endswith("-error") and not p.startswith("docling-error") and not p.startswith("docling-image-error")
+            if not p.endswith("-error")
+            and not p.startswith("docling-error")
+            and not p.startswith("docling-image-error")
         ) or "none"
         if "ubl" in pipeline:
             method = "ubl+" + method if method != "none" else "ubl"
@@ -1070,6 +1152,13 @@ async def extract(
         status = status_from(warnings, validation)
         if not invoice.invoiceNumber and not invoice.totals.payableAmount and not invoice.lines:
             status = "failed"
+
+        if status == "ok":
+            _metrics["extract_ok"] += 1
+        elif status == "partial":
+            _metrics["extract_partial"] += 1
+        else:
+            _metrics["extract_failed"] += 1
 
         return ExtractResponse(
             status=status,

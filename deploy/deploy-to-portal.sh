@@ -54,7 +54,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 QA_SITE=$(/data/nanobaseai/NanobaseAI-QA/.venv/bin/python -c 'import site; print(":".join(site.getsitepackages()))')
 export PYTHONPATH="${DIR}:${QA_SITE}:${PYTHONPATH:-}"
 # Prefer extract venv for fastapi/uvicorn, QA site-packages for docling/torch
-exec "$DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "${PORT:-8106}" --workers 1
+WORKERS="${EXTRACT_WORKERS:-4}"
+exec "$DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "${PORT:-8106}" --workers "$WORKERS"
 RUN
   chmod +x "$EXTRACT/run.sh"
   EXEC_START="$EXTRACT/run.sh"
@@ -62,7 +63,7 @@ else
   echo "Installing docling into extract venv (slow first time)"
   .venv/bin/pip install -q -U pip
   .venv/bin/pip install -q -r requirements.txt docling
-  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers 1"
+  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers ${EXTRACT_WORKERS:-4}"
 fi
 
 # systemd extract
@@ -79,12 +80,17 @@ Environment=PORT=8106
 Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
 Environment=FORCE_IMAGE_OCR=1
+Environment=FAST_PATH_PDF=1
+Environment=DOCLING_MAX_INFLIGHT=1
+Environment=DOCLING_TIMEOUT_S=120
+Environment=EXTRACT_WORKERS=4
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+MemoryMax=12G
 
 [Install]
 WantedBy=multi-user.target
