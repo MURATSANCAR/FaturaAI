@@ -411,33 +411,250 @@ function extractVatAmount(text: string): number | null {
 function extractWithholdingVatAmount(text: string): number | null {
   const summed = sumLabeledAmounts(text, "Hesaplanan KDV Tevkifat");
   if (summed != null) return summed;
-  return labeledAmount(text, "KDV Tevkifat");
+  // "KDV TEVKİFAT" / tevkifat tutarı variants
+  const alt =
+    sumLabeledAmounts(text, "KDV Tevkifat") ??
+    labeledAmount(text, "Tevkifat Tutarı") ??
+    labeledAmount(text, "Hesaplanan Tevkifat");
+  return alt;
+}
+
+const EARSIV_PROFILES = ["EARSIVFATURA", "EARSIV"];
+const EFATURA_PROFILES = [
+  "TEMELFATURA",
+  "TICARIFATURA",
+  "IHRACAT",
+  "IHRACATFATURA",
+  "YOLCUBERABER",
+  "YOLCUBERABERFATURA",
+  "KAMU",
+  "KAMUFATURA",
+  "ENERJI",
+  "ILAC_TIBBICIHAZ",
+  "HKS",
+];
+
+function asciiUpper(s: string): string {
+  return s
+    .replace(/İ/g, "I")
+    .replace(/İ/g, "I")
+    .replace(/ı/g, "I")
+    .replace(/Ş/g, "S")
+    .replace(/ş/g, "S")
+    .replace(/Ğ/g, "G")
+    .replace(/ğ/g, "G")
+    .replace(/Ü/g, "U")
+    .replace(/ü/g, "U")
+    .replace(/Ö/g, "O")
+    .replace(/ö/g, "O")
+    .replace(/Ç/g, "C")
+    .replace(/ç/g, "C")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]/g, "");
+}
+
+function normalizeProfileId(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const p = asciiUpper(raw.trim());
+  return p || null;
+}
+
+function normalizeInvoiceTypeCode(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const t = asciiUpper(raw.trim());
+  // common UI typos / spaced forms
+  if (t === "SATIS" || t === "SATIŞ") return "SATIS";
+  return t || null;
+}
+
+function detectDocumentType(
+  text: string,
+  profileId: string | null,
+): ParsedInvoice["documentType"] {
+  const p = profileId ?? "";
+  if (EARSIV_PROFILES.some((x) => p.includes(x)) || /EARSIV/i.test(p)) return "earsiv";
+  if (EFATURA_PROFILES.some((x) => p.includes(x))) return "efatura";
+  if (/e-?Ar[sş]iv(?:\s+Fatura)?|EARSIVFATURA|e-?Ar[sş]iv\s+izni/i.test(text)) return "earsiv";
+  if (
+    /e-?Fatura\b|EFATURA|TEMELFATURA|TICARIFATURA|IHRACAT|KAMUFATURA|YOLCUBERABER/i.test(
+      text,
+    )
+  ) {
+    return "efatura";
+  }
+  return "unknown";
+}
+
+function firstAmount(text: string, labels: string[]): number | null {
+  for (const label of labels) {
+    const v = labeledAmount(text, label);
+    if (v != null) return v;
+  }
+  return null;
+}
+
+function extractTotals(text: string): ParsedInvoice["totals"] {
+  const netToplam = firstAmount(text, [
+    "Mal Hizmet Toplam Tutarı",
+    "Mal/?Hizmet Toplam Tutarı",
+    "NET TOPLAM",
+    "Ara Toplam",
+    "Vergiler Hariç Toplam",
+    "Vergiler Hariç Tutar",
+    "TaxExclusiveAmount",
+  ]);
+  // Explicit matrah rows (sometimes after discount)
+  const matrahLabeled =
+    sumLabeledAmounts(text, "KDV Matrahı") ??
+    labeledAmount(text, "Matrah") ??
+    labeledAmount(text, "TaxExclusiveAmount");
+
+  const discountTotal = firstAmount(text, [
+    "Toplam İskonto",
+    "TOPLAM [İI]SKONTO",
+    "Toplam Iskonto",
+    "İskonto Toplamı",
+    "AllowanceTotalAmount",
+  ]);
+
+  let lineExtensionAmount: number | null = null;
+  if (matrahLabeled != null) {
+    lineExtensionAmount = matrahLabeled;
+  } else if (netToplam != null && discountTotal != null && discountTotal > 0) {
+    lineExtensionAmount = Number((netToplam - discountTotal).toFixed(2));
+  } else {
+    lineExtensionAmount = netToplam;
+  }
+
+  const taxInclusiveAmount = firstAmount(text, [
+    "Vergiler Dahil Toplam Tutar",
+    "VERG[İI] DAH[İI]L TOPLAM TUTAR",
+    "Vergiler Dahil Toplam",
+    "TaxInclusiveAmount",
+  ]);
+  const payableAmount = firstAmount(text, [
+    "Ödenecek Tutar",
+    "ÖDENECEK TUTAR",
+    "Odenecek Tutar",
+    "PayableAmount",
+  ]);
+
+  return {
+    lineExtensionAmount,
+    discountTotal,
+    withholdingVatAmount: extractWithholdingVatAmount(text),
+    vatAmount: extractVatAmount(text),
+    taxInclusiveAmount,
+    payableAmount,
+    currency: "TRY",
+  };
+}
+
+/**
+ * Auto-heal common GIB total inconsistencies (multi-rate KDV miss, missing vat, etc.).
+ */
+export function reconcileTotals(invoice: ParsedInvoice): void {
+  const t = invoice.totals;
+  const near = (a: number, b: number, eps = 0.05) => Math.abs(a - b) <= eps;
+
+  // If matrah + vat != ti, prefer implied VAT from ti - matrah (covers missed rate rows)
+  if (
+    t.lineExtensionAmount != null &&
+    t.taxInclusiveAmount != null &&
+    t.taxInclusiveAmount >= t.lineExtensionAmount
+  ) {
+    const impliedVat = Number(
+      (t.taxInclusiveAmount - t.lineExtensionAmount).toFixed(2),
+    );
+    if (t.vatAmount == null) {
+      t.vatAmount = impliedVat;
+    } else if (!near(t.lineExtensionAmount + t.vatAmount, t.taxInclusiveAmount)) {
+      // Under/over-count VAT rates → trust arithmetic from solid totals
+      t.vatAmount = impliedVat;
+    }
+  }
+
+  // ISTISNA / 0% : vat may be 0
+  if (
+    t.lineExtensionAmount != null &&
+    t.taxInclusiveAmount != null &&
+    near(t.lineExtensionAmount, t.taxInclusiveAmount) &&
+    (t.vatAmount == null || t.vatAmount === 0)
+  ) {
+    t.vatAmount = 0;
+  }
+
+  // Payable defaults to taxInclusive when no withholding
+  if (t.payableAmount == null && t.taxInclusiveAmount != null) {
+    if (t.withholdingVatAmount != null) {
+      t.payableAmount = Number(
+        (t.taxInclusiveAmount - t.withholdingVatAmount).toFixed(2),
+      );
+    } else {
+      t.payableAmount = t.taxInclusiveAmount;
+    }
+  }
+
+  // If payable + withholding ≈ taxInclusive but withholding null, leave as-is
+  if (
+    t.taxInclusiveAmount != null &&
+    t.payableAmount != null &&
+    t.withholdingVatAmount == null &&
+    t.taxInclusiveAmount > t.payableAmount + 0.05
+  ) {
+    t.withholdingVatAmount = Number(
+      (t.taxInclusiveAmount - t.payableAmount).toFixed(2),
+    );
+  }
+
+  // Fill matrah from payable - vat when missing
+  if (
+    t.lineExtensionAmount == null &&
+    t.payableAmount != null &&
+    t.vatAmount != null &&
+    t.withholdingVatAmount == null
+  ) {
+    t.lineExtensionAmount = Number((t.payableAmount - t.vatAmount).toFixed(2));
+  }
+  if (
+    t.lineExtensionAmount == null &&
+    t.taxInclusiveAmount != null &&
+    t.vatAmount != null
+  ) {
+    t.lineExtensionAmount = Number(
+      (t.taxInclusiveAmount - t.vatAmount).toFixed(2),
+    );
+  }
 }
 
 export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const normalized = text.replace(/\u000c/g, "\n");
 
-  let documentType: ParsedInvoice["documentType"] = "unknown";
-  if (/e-?Ar[sş]iv\s+Fatura/i.test(normalized) || /EARSIVFATURA/i.test(normalized)) {
-    documentType = "earsiv";
-  } else if (
-    /e-?Fatura/i.test(normalized) ||
-    /EFATURA|TICARIFATURA|TEMELFATURA|IHRACATFATURA|KAMUFATURA/i.test(normalized)
-  ) {
-    documentType = "efatura";
-  }
-
   const customizationId = rightField(normalized, "Özelleştirme No");
-  const profileId = rightField(normalized, "Senaryo");
-  const invoiceTypeCode = rightField(normalized, "Fatura Tipi");
+  const profileIdRaw =
+    rightField(normalized, "Senaryo") ||
+    firstMatch(normalized, /ProfileID\s*:?\s*([A-Z0-9_]+)/i);
+  const profileId = profileIdRaw ? normalizeProfileId(profileIdRaw) : null;
+  const invoiceTypeRaw =
+    rightField(normalized, "Fatura Tipi") ||
+    firstMatch(normalized, /InvoiceTypeCode\s*:?\s*([A-ZÇĞİÖŞÜ0-9_]+)/i);
+  const invoiceTypeCode = invoiceTypeRaw
+    ? normalizeInvoiceTypeCode(invoiceTypeRaw)
+    : null;
+  const documentType = detectDocumentType(normalized, profileId);
+
   let invoiceNumber =
     rightField(normalized, "Fatura No") ||
     firstMatch(fileName, /([A-Z]{2,5}\d{10,})/i)?.toUpperCase() ||
     null;
-  if (invoiceNumber) invoiceNumber = invoiceNumber.replace(/\s+/g, "").toUpperCase();
+  if (invoiceNumber) {
+    invoiceNumber = invoiceNumber.replace(/\s+/g, "").toUpperCase();
+    if (!/^[A-Z]{2,5}\d{10,16}$/.test(invoiceNumber)) invoiceNumber = null;
+  }
 
   const issueRaw =
     rightField(normalized, "Fatura Tarihi") ||
+    rightField(normalized, "Düzenleme Tarihi") ||
     firstMatch(
       normalized,
       /(?:^|\n)[^\n]*?\bTarih\s*:\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})/i,
@@ -458,7 +675,7 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
 
   const uuid = firstMatch(
     normalized,
-    /ETTN\s*:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    /ETTN\s*:?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
   )?.toLowerCase() || null;
 
   const notesBlock = normalized.split(/NOTLAR\s*:/i)[1] ?? "";
@@ -499,19 +716,7 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const bankBranch =
     notes.find((n) => /ŞUBE|SUBESI|ŞUBESİ/i.test(n)) ?? null;
 
-  const netToplam =
-    labeledAmount(normalized, "Mal Hizmet Toplam Tutarı") ??
-    labeledAmount(normalized, "NET TOPLAM");
-  const discountTotal =
-    labeledAmount(normalized, "Toplam İskonto") ??
-    labeledAmount(normalized, "TOPLAM [İI]SKONTO");
-  // NET TOPLAM iskonto öncesi olabiliyor; matrah = net - iskonto
-  const lineExtensionAmount =
-    netToplam != null && discountTotal != null && discountTotal > 0
-      ? Number((netToplam - discountTotal).toFixed(2))
-      : netToplam;
-
-  return {
+  const invoice: ParsedInvoice = {
     documentType,
     profileId,
     customizationId,
@@ -523,27 +728,19 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     supplier: extractSupplier(normalized),
     customer: extractCustomer(normalized),
     lines: extractLines(normalized),
-    totals: {
-      lineExtensionAmount,
-      discountTotal,
-      withholdingVatAmount: extractWithholdingVatAmount(normalized),
-      vatAmount: extractVatAmount(normalized),
-      taxInclusiveAmount:
-        labeledAmount(normalized, "Vergiler Dahil Toplam Tutar") ??
-        labeledAmount(normalized, "VERG[İI] DAH[İI]L TOPLAM TUTAR"),
-      payableAmount:
-        labeledAmount(normalized, "Ödenecek Tutar") ??
-        labeledAmount(normalized, "ÖDENECEK TUTAR"),
-      currency: "TRY",
-    },
+    totals: extractTotals(normalized),
     notes,
     iban,
     bankName,
     bankBranch,
   };
+  reconcileTotals(invoice);
+  return invoice;
 }
 
 export function validateInvoice(invoice: ParsedInvoice): string[] {
+  // Reconcile again in case caller mutated totals
+  reconcileTotals(invoice);
   const warnings: string[] = [];
   if (!invoice.invoiceNumber) warnings.push("Fatura numarası bulunamadı");
   if (!invoice.uuid) warnings.push("ETTN bulunamadı");
