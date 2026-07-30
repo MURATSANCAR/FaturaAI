@@ -372,18 +372,6 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 vat_rate = 20.0
         line_total = parse_tr_money(total_raw)
         name_clean = re.sub(r"\s+", " ", name).strip(" -")
-        # Drop leading OCR junk words glued before SKU
-        name_clean = re.sub(
-            r"^(?:Aynasa|Asorti\w*(?:\s*//\s*Asorti\w*)*|Hav[il]u\s*3x40\w*:?\s*)",
-            "",
-            name_clean,
-            flags=re.I,
-        )
-        name_clean = re.sub(r"^(?:Asorti\w*\s*//\s*)+", "", name_clean, flags=re.I).strip(" -")
-        name_clean = re.sub(r"\bIstak\b", "Islak", name_clean, flags=re.I)
-        name_clean = re.sub(r"\bHlaslu\b", "Havlu", name_clean, flags=re.I)
-        name_clean = re.sub(r"\bHaviu\b", "Havlu", name_clean, flags=re.I)
-        name_clean = re.sub(r"3x405\b", "3x40h", name_clean, flags=re.I)
         if not name_clean or line_total is None:
             continue
         out.append(
@@ -401,26 +389,30 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
-    # GİB table OCR: "1 21.560 kg 0,089TL %0,00 0,00TL … %18,00 345,39 TL 1.918,84"
+    # GİB table OCR: "1 21.560 kg 0,089TL … %18,00 345,39 TL 1.918,84"
+    # Tolerates OCR junk between unit price and the final %KDV + amounts.
     gib_qty = re.compile(
         rf"(?m)^(?P<seq>\d{{1,3}})\s+"
         rf"(?P<name>.*?)\s*"
         rf"(?P<qty>\d{{1,3}}(?:[.,]\d+)?|\d+[.,]\d+)\s*"
-        rf"(?P<unit>kg|adet|ad|NIU|C62|KGM|MTR|LTR)?\s+"
+        rf"(?P<unit>kg|adet|ad|NIU|C62|KGM|MTR|LTR)?\s*[|\]]?\s+"
         rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL?\s+"
-        rf"(?:%?\s*(?P<discRate>[\d.,]+)\s+)?"
-        rf"(?:(?P<discAmt>{_MONEY_TOKEN}|L\d+[^\s]*)\s*TL?\s+)?"
-        rf".{{0,48}}?"
+        rf".{{0,80}}?"
         rf"%\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
-        rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s+"
+        rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s*[|\]]?\s*"
         rf"(?P<total>{_MONEY_TOKEN})",
         re.I,
     )
     for m in gib_qty.finditer(text):
-        name = re.sub(r"\s+", " ", (m.group("name") or "")).strip(" -")
-        if not name or re.match(
+        name = re.sub(r"\s+", " ", (m.group("name") or "")).strip(" -|]")
+        if name and re.match(
             r"^(?:ARA|TOPLAM|KDV|Mal\s*Hizmet|Vergi|S[ıi]ra|No\b)", name, re.I
         ):
+            continue
+        if not name or len(name) < 2:
+            name = f"Kalem {m.group('seq')}"
+        # Drop OCR leftovers glued into name (unit-price fragments)
+        if re.search(r"kg|TL|%\d", name, re.I) and len(name) > 40:
             name = f"Kalem {m.group('seq')}"
         total = parse_tr_money(m.group("total"))
         if total is None or total <= 0:
@@ -428,7 +420,15 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         qty = parse_tr_money(m.group("qty")) or float(m.group("qty").replace(",", "."))
         unit_price = parse_tr_money(m.group("unitPrice"))
         vat_rate = normalize_vat_rate(parse_percent(m.group("vat")))
-        disc_amt = parse_tr_money(m.group("discAmt")) if m.groupdict().get("discAmt") else None
+        # Skip the first %0 discount rate if we grabbed it — prefer last % in row
+        vat_candidates = re.findall(r"%\s*(\d{1,2}(?:[.,]\d+)?)", m.group(0))
+        if vat_candidates:
+            # Prefer standard GİB rates from the row
+            for cand in reversed(vat_candidates):
+                vr = normalize_vat_rate(parse_percent(cand))
+                if vr in (1.0, 8.0, 10.0, 18.0, 20.0):
+                    vat_rate = vr
+                    break
         out.append(
             Line(
                 id=m.group("seq"),
@@ -436,7 +436,6 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 quantity=qty,
                 unit=(m.group("unit") or "Adet"),
                 unitPrice=unit_price,
-                discountAmount=disc_amt,
                 vatRate=vat_rate,
                 vatAmount=parse_tr_money(m.group("vatAmt")),
                 lineTotal=total,
@@ -1050,33 +1049,40 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
 
     # Single-line / glued: "PRODUCT…%20" then nearby "%20 *3.499,00" or "*3.499,00"
     glued = re.compile(
-        rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{5,70}}?)[%\s]*"
+        rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{5,70}}?)[%\s]*"
         rf"(?P<vat>\d{{1,2}})?\s*$"
     )
-    star_amt = re.compile(rf"%?\s*(?P<vat>\d{{1,2}})?\s*\*?\s*(?P<total>{_MONEY_TOKEN})")
+    star_amt = re.compile(rf"%\s*(?P<vat>\d{{1,2}})\s*\*?\s*(?P<total>{_MONEY_TOKEN})")
+    skip_glued = re.compile(
+        r"^(?:ARA|TOPLAM|TOPKDV|KDV|TARIH|BELGE|ETTN|Mgz|FAT|KASIYER|http|www|"
+        r"BANKA|BANKASI|BU\s+BELGE|ONAY|KART|AID|YIGIN|SIRA|Provizyon|"
+        r"TERMINAL|ISYERI|CHIP|Fatura|E-?AR[SŞ]|B[İI]LG[İI]|"
+        r"Hgz\s*Ad[iı]|Mgz\s*Kodu|Ma[ğg]aza\s*(?:Ad[iı]|Kodu))",
+        re.I,
+    )
     lines_txt = text.splitlines()
     for i, ln in enumerate(lines_txt):
         gm = glued.match(ln.strip())
         if not gm:
             continue
         name = clean_retail_product_name(gm.group("name"))
-        if len(name) < 6 or re.search(
-            r"^(?:ARA|TOPLAM|TOPKDV|KDV|TARIH|BELGE|ETTN|Mgz|FAT|KASIYER|http)",
-            name,
-            re.I,
-        ):
+        if len(name) < 8 or skip_glued.search(name):
+            continue
+        # Require product-like: has vowel and not mostly digits/slashes
+        letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", name)
+        vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
+        if vowels < 2 or len(letters) < 6:
             continue
         vat = normalize_vat_rate(float(gm.group("vat"))) if gm.group("vat") else None
         total = None
-        for look in lines_txt[i : i + 4]:
+        for look in lines_txt[i : i + 5]:
             sm = star_amt.search(look)
             if not sm:
                 continue
             cand = parse_tr_money(sm.group("total"))
             if cand is not None and cand >= 1:
                 total = cand
-                if sm.group("vat"):
-                    vat = normalize_vat_rate(float(sm.group("vat"))) or vat
+                vat = normalize_vat_rate(float(sm.group("vat"))) or vat
                 break
         if total is None:
             continue
@@ -1110,7 +1116,11 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
         name = m.group("name").strip()
         if skip.search(name):
             continue
-        if re.search(r"https?://|KASIYER|CHIP|ONAY|TERMINAL|ISYERI|MASTER|AID:", name, re.I):
+        if re.search(
+            r"https?://|KASIYER|CHIP|ONAY|TERMINAL|ISYERI|AID:|BANKA|BANKASI|KART",
+            name,
+            re.I,
+        ):
             continue
         total = parse_tr_money(m.group("total"))
         if total is None or total < 1:
@@ -1225,8 +1235,8 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
 def extract_payable_from_ocr(text: str) -> float | None:
     """Prefer bank/payment lines and OCR-tolerant 'ödenecek/vergi dahil/toplam' labels."""
     bank = re.search(
-        rf"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
-        rf"Halkbank|İş\s*Bank|TEB|QNB|Enpara|Banka\s*/\s*Kredi\s*Kart[ıi]|KRED[İI]\s*KART)"
+        rf"(?:BANKASI|Banka\s*/\s*Kredi\s*Kart[ıi]|KRED[İI]\s*KART[İI]?|"
+        rf"Kart\s*(?:ile|ödeme)|POS)"
         rf"[^\n]{{0,48}}?\*?\s*({_MONEY_TOKEN})",
         text,
         re.I,
@@ -1772,8 +1782,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 
     bank_pay = None
     bank_m = re.search(
-        rf"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
-        rf"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{{0,48}}?"
+        rf"(?:BANKASI|Banka\s*/\s*Kredi\s*Kart[ıi]|KRED[İI]\s*KART[İI]?)"
+        rf"[^\n]{{0,48}}?"
         rf"({_MONEY_TOKEN})\s*TRY",
         text,
         re.I,
@@ -1805,6 +1815,20 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 
     # Retail POS: line totals are usually tax-inclusive
     if retail_fiş and lines_sum is not None:
+        # Keep only product lines that match TOPLAM when OCR invented footer junk
+        if payable is not None and ocr_lines:
+            matching = [
+                l
+                for l in ocr_lines
+                if l.lineTotal is not None and nearly_equal(l.lineTotal, payable, 1.5)
+            ]
+            if matching:
+                # Prefer vowel-rich product names
+                matching.sort(
+                    key=lambda l: -len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", l.name or ""))
+                )
+                ocr_lines = matching[:1]
+                lines_sum = ocr_lines[0].lineTotal
         if payable is None or (payable is not None and nearly_equal(payable, lines_sum, 1.0)):
             payable = lines_sum
         tax_inclusive = payable
@@ -1882,6 +1906,13 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         # OCR: common misspellings of MAGAZACILIK
         supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
         supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
+        # Drop POS store-label tails glued onto company title (generic)
+        supplier.name = re.split(
+            r"\s+(?:Hgz\s*Ad[iı]|Mgz\s*Kodu|Ma[ğg]aza\s*(?:Ad[iı]|Kodu))\s*:",
+            supplier.name,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()[:180]
         # Drop address tokens glued onto company title (any issuer)
         supplier.name = re.split(
             r"\s+(?:MAH\.|CAD\.|SK\.|SOK\.|BULVAR|NO:|Kap[ıi]\s*No|PROF\.)",
@@ -1889,11 +1920,12 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             maxsplit=1,
             flags=re.I,
         )[0].strip()[:180]
-        # Drop OCR junk prefixes (short codes) when a better MAGAZACILIK/A.Ş title exists later
+        # Drop OCR junk prefixes (short codes) when a better legal-form title exists later
         if (
             len(supplier.name) < 4
             or "mgzkodu" in supplier.name.lower()
             or re.match(r"^[a-z]{2,4}\d", supplier.name, re.I)
+            or re.match(r"^\d*[A-Z]{1,3}\s+", supplier.name)  # leading POS junk like "6A "
         ):
             better = first_match(
                 text,
@@ -1902,6 +1934,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             )
             if better:
                 supplier.name = re.sub(r"\s+", " ", better).strip()[:180]
+                supplier.name = re.sub(r"^\d*[A-Z]{0,3}\s+", "", supplier.name).strip()[:180]
 
     customer = extract_customer(text)
     if musteri_vkn:
@@ -1933,7 +1966,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 customer.name = cand[:80]
     if not customer.name:
         near_card = first_match(text, r"(?m)^([A-ZÇĞİÖŞÜ ]{5,40})\s*\nAID:")
-        if near_card and not re.search(r"MASTER|KART|CHIP|ONAY", near_card, re.I):
+        if near_card and not re.search(r"KART|CHIP|ONAY|AID|BANKA", near_card, re.I):
             customer.name = near_card.strip()[:120]
         else:
             customer.name = "Nihai Tüketici"
@@ -2009,7 +2042,9 @@ def _party_name_quality(name: str | None) -> int:
     if len(n) < 3 or re.fullmatch(r"[=_\-—.\s]+", n):
         return 0
     if re.search(
-        r"(?:[İI]mza|PDF\s*indir|XML\s*indir|<!--\s*image|Page\s+\d+|adet\s*[x×]|Higz\s*Adi)",
+        r"(?:[İI]mza|PDF\s*indir|XML\s*indir|<!--\s*image|Page\s+\d+|adet\s*[x×]|"
+        r"Hgz\s*Ad[iı]|Mgz\s*Kodu|Ma[ğg]aza\s*(?:Ad[iı]|Kodu)|"
+        r"^Vergi\s*Daires|^file:|^https?://)",
         n,
         re.I,
     ):
