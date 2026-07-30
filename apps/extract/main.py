@@ -1255,6 +1255,7 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
             return False
         # Names that look like OCR noise (almost no vowels / too short words)
         junk = 0
+        useful = 0
         for l in inv.lines:
             n = (l.name or "").strip()
             if re.search(r"Mal\s*Hizmet\s*Toplam|Toplam\s*Tutar|Iskonto", n, re.I):
@@ -1268,11 +1269,16 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
             vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
             if len(letters) >= 8 and vowels <= 1:
                 junk += 1
+            if (l.lineTotal or 0) >= 10 and len(letters) >= 4 and vowels >= 1:
+                useful += 1
         if junk >= max(1, len(inv.lines) // 2):
             return False
         # Tiny "payable" while line OCR is UUID noise — not a real invoice total
         if payable < 20 and line_sum < 20:
             return False
+        # Number + payable + at least one real product line is enough to skip Docling
+        if useful >= 1 and payable >= 20:
+            return True
     if inv.issueDate and (inv.customer.name or inv.supplier.name):
         return True
     return validation.confidence >= PHOTO_OCR_MIN_CONF
@@ -3184,6 +3190,15 @@ async def extract(
                         # Avoid Docling markdown party junk (<!-- image -->) clobbering photo OCR
                         if inv_md.supplier and _party_name_quality(inv_md.supplier.name) < 8:
                             inv_md.supplier.name = None
+                        if inv_md.customer and _party_name_quality(inv_md.customer.name) < 8:
+                            inv_md.customer.name = None
+                        # Table-cell soup (pipes / Senaryo glued into name)
+                        for party in (inv_md.supplier, inv_md.customer):
+                            if party and party.name and (
+                                "|" in party.name
+                                or re.search(r"Senaryo|Fatura\s*No|Sipari[sş]", party.name, re.I)
+                            ):
+                                party.name = None
                         invoice = merge_invoice(invoice, inv_md)
                         if not _lines_useful(invoice.lines) and _lines_useful(inv_md.lines):
                             invoice.lines = inv_md.lines
