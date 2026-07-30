@@ -4,8 +4,10 @@ import { formatDate, formatMoney, formatSeconds } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/fatura-api";
 /** Max parallel create+poll cycles — avoids browser ERR_INSUFFICIENT_RESOURCES and API 429. */
-const UPLOAD_CONCURRENCY = 4;
-const CREATE_MAX_ATTEMPTS = 12;
+const UPLOAD_CONCURRENCY = 3;
+/** Pace POSTs so we stay under API token-bucket (~600/min with burst). */
+const CREATE_MIN_INTERVAL_MS = 200;
+const CREATE_MAX_ATTEMPTS = 40;
 
 type UploadItemStatus = "queued" | "uploading" | "reading" | "done" | "failed";
 
@@ -378,6 +380,8 @@ export default function App() {
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const uploadQueueRef = useRef<PendingUpload[]>([]);
   const activeUploadsRef = useRef(0);
+  const lastCreateAtRef = useRef(0);
+  const createLockRef = useRef(Promise.resolve());
   const [dragging, setDragging] = useState(false);
   const [items, setItems] = useState<UploadItem[]>([]);
   const [showRawIds, setShowRawIds] = useState<Record<string, boolean>>({});
@@ -417,15 +421,30 @@ export default function App() {
         for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++) {
           const form = new FormData();
           form.append("file", file);
-          create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+
+          const prev = createLockRef.current;
+          let release!: () => void;
+          createLockRef.current = new Promise<void>((r) => {
+            release = r;
+          });
+          await prev;
+          try {
+            const wait = Math.max(0, lastCreateAtRef.current + CREATE_MIN_INTERVAL_MS - Date.now());
+            if (wait > 0) await sleep(wait);
+            lastCreateAtRef.current = Date.now();
+            create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+          } finally {
+            release();
+          }
           created = (await create.json()) as typeof created;
 
           if (create.status === 429 || create.status === 503) {
-            const retryAfter = Number(create.headers.get("Retry-After") || "2");
-            const waitMs = Math.min(30_000, Math.max(1, retryAfter) * 1000) + Math.random() * 400;
+            const retryAfter = Number(create.headers.get("Retry-After") || "3");
+            const waitMs =
+              Math.min(45_000, Math.max(2, retryAfter) * 1000) + attempt * 250 + Math.random() * 500;
             patchItem(id, {
               status: "queued",
-              progress: `Sunucu meşgul, tekrar denenecek (${attempt}/${CREATE_MAX_ATTEMPTS})…`,
+              progress: `Rate limit — ${Math.ceil(waitMs / 1000)} sn sonra tekrar (${attempt}/${CREATE_MAX_ATTEMPTS})…`,
             });
             await sleep(waitMs);
             continue;

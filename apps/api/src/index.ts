@@ -49,8 +49,20 @@ function clientKey(c: { req: { header: (name: string) => string | undefined } })
   return c.req.header("x-real-ip") || "local";
 }
 
+function isLoopbackKey(key: string): boolean {
+  const k = key.replace(/^\[|\]$/g, "").replace(/^::ffff:/i, "").toLowerCase();
+  return (
+    k === "local" ||
+    k === "localhost" ||
+    k === "127.0.0.1" ||
+    k === "::1" ||
+    k === "0:0:0:0:0:0:0:1"
+  );
+}
+
 function allowWithoutRateLimit(key: string): boolean {
-  return key === "local" || key === "127.0.0.1" || key === "::1";
+  if (process.env.RATE_LIMIT_DISABLED === "1") return true;
+  return isLoopbackKey(key);
 }
 
 async function readUpload(c: {

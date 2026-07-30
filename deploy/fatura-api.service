@@ -15,8 +15,8 @@ Environment=EXTRACT_V2_ENABLED=1
 Environment=PDF_FAST_PATH=1
 Environment=JOB_MAX_INFLIGHT=8
 Environment=JOB_MAX_QUEUE=200
-Environment=RATE_LIMIT_PER_MIN=120
-Environment=RATE_LIMIT_BURST=40
+Environment=RATE_LIMIT_PER_MIN=600
+Environment=RATE_LIMIT_BURST=80
 Environment=MAX_UPLOAD_MB=20
 Environment=JOB_DIR=/tmp/fatura-jobs
 ExecStart=/usr/bin/node dist/index.js
