@@ -161,6 +161,65 @@ def nearly_equal(a: float, b: float, eps: float = 0.05) -> bool:
     return abs(a - b) <= eps
 
 
+def sniff_extension(data: bytes, filename: str) -> str:
+    """Return a filesystem extension including the leading dot."""
+    name_ext = Path(filename).suffix.lower()
+    if data[:4] == b"%PDF":
+        return ".pdf"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:2] in (b"II", b"MM") and len(data) > 3:
+        return ".tiff"
+    if data[:4] == b"BM":
+        return ".bmp"
+    # HEIC/HEIF brand in ftyp box
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heif", b"mif1", b"msf1", b"heix", b"heim"):
+            return ".heic"
+    if name_ext in IMAGE_EXTENSIONS or name_ext == ".pdf":
+        return name_ext
+    return name_ext or ".bin"
+
+
+def is_image_ext(ext: str) -> bool:
+    return ext.lower() in IMAGE_EXTENSIONS
+
+
+def convert_heic_to_jpeg(src: Path, dest: Path) -> None:
+    """Best-effort HEIC → JPEG for Docling (no native HEIC in many builds)."""
+    try:
+        from pillow_heif import register_heif_opener  # type: ignore
+
+        register_heif_opener()
+        from PIL import Image
+
+        with Image.open(src) as im:
+            rgb = im.convert("RGB")
+            rgb.save(dest, format="JPEG", quality=92)
+            return
+    except Exception:
+        pass
+    for cmd in (
+        ["heif-convert", str(src), str(dest)],
+        ["magick", str(src), str(dest)],
+        ["convert", str(src), str(dest)],
+    ):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            if r.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                return
+        except Exception:
+            continue
+    raise RuntimeError(
+        "HEIC fotoğraf dönüştürülemedi. Lütfen JPG/PNG olarak kaydedip tekrar yükleyin."
+    )
+
+
 def pdftotext(path: Path) -> str:
     r = subprocess.run(
         ["pdftotext", "-layout", str(path), "-"],
@@ -598,29 +657,46 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
     return warnings, Validation(totalsMatch=totals_match and len(warnings) == 0, confidence=round(score, 3), checks=checks)
 
 
-def get_docling_converter(ocr: bool):
+def get_docling_converter(ocr: bool, for_image: bool = False):
     global _docling_converter
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
 
-    # Cache non-OCR converter (common path)
-    if not ocr and _docling_converter is not None:
+    # Cache non-OCR PDF converter (common path)
+    if not ocr and not for_image and _docling_converter is not None:
         return _docling_converter
 
     options = PdfPipelineOptions()
     options.do_ocr = ocr
     options.do_table_structure = True
-    converter = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
-    )
-    if not ocr:
+    if for_image and ocr:
+        # Higher scale improves phone-photo OCR quality
+        try:
+            options.images_scale = IMAGE_OCR_SCALE
+        except Exception:
+            pass
+        try:
+            from docling.datamodel.pipeline_options import EasyOcrOptions
+
+            options.ocr_options = EasyOcrOptions(lang=["tr", "en"])
+        except Exception:
+            pass
+
+    format_options: dict[Any, Any] = {
+        InputFormat.PDF: PdfFormatOption(pipeline_options=options),
+    }
+    if for_image:
+        format_options[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=options)
+
+    converter = DocumentConverter(format_options=format_options)
+    if not ocr and not for_image:
         _docling_converter = converter
     return converter
 
 
-def docling_convert(path: Path, ocr: bool = False) -> tuple[str, list[Line]]:
-    converter = get_docling_converter(ocr=ocr)
+def docling_convert(path: Path, ocr: bool = False, for_image: bool = False) -> tuple[str, list[Line]]:
+    converter = get_docling_converter(ocr=ocr, for_image=for_image)
     result = converter.convert(str(path))
     md = result.document.export_to_markdown() or ""
     table_lines = parse_markdown_tables(md)
@@ -643,7 +719,7 @@ def warmup() -> None:
     if not ENABLE_DOCLING:
         return
     try:
-        get_docling_converter(ocr=False)
+        get_docling_converter(ocr=False, for_image=False)
     except Exception as exc:  # noqa: BLE001
         print(f"docling warmup skipped: {exc}")
 
@@ -655,6 +731,8 @@ def health() -> dict[str, Any]:
         "service": "fatura-ai-extract",
         "docling": ENABLE_DOCLING,
         "doclingOcr": ENABLE_DOCLING_OCR,
+        "forceImageOcr": FORCE_IMAGE_OCR,
+        "imageFormats": sorted(ext.lstrip(".") for ext in IMAGE_EXTENSIONS),
     }
 
 
@@ -676,44 +754,96 @@ async def extract(
             pipeline=pipeline,
         )
 
+    ext = sniff_extension(data, name)
+    as_image = is_image_ext(ext)
+
     with tempfile.TemporaryDirectory(prefix="fatura-ai-") as tmp:
-        path = Path(tmp) / "invoice.pdf"
+        path = Path(tmp) / f"invoice{ext if ext != '.bin' else ('.jpg' if as_image else '.pdf')}"
         path.write_bytes(data)
 
-        # 1) UBL
-        ubl = extract_embedded_ubl(data)
-        if ubl and re.search(r"<(?:\w+:)?Invoice[\s>]", ubl, re.I):
-            pipeline.append("ubl")
-            # Minimal UBL handling — defer to text path if complex; still mark method
-            # For now continue with text sources which also see UUID etc.
-
-        # 2) pdftotext heuristics
-        text = ""
-        try:
-            text = pdftotext(path)
-            pipeline.append("pdftotext")
-        except Exception as exc:  # noqa: BLE001
-            pipeline.append(f"pdftotext-error:{exc}")
-
-        invoice = parse_text_invoice(text, name) if text.strip() else Invoice()
-
-        # 3) Docling structure/tables
-        md = ""
-        if ENABLE_DOCLING:
+        if as_image and path.suffix.lower() in {".heic", ".heif"}:
+            jpeg_path = Path(tmp) / "invoice.jpg"
             try:
-                md, table_lines = docling_convert(path, ocr=False)
-                pipeline.append("docling-structure")
+                convert_heic_to_jpeg(path, jpeg_path)
+                path = jpeg_path
+                pipeline.append("heic-jpeg")
+            except Exception as exc:  # noqa: BLE001
+                return ExtractResponse(
+                    status="failed",
+                    method="none",
+                    durationMs=int((time.perf_counter() - started) * 1000),
+                    warnings=[str(exc)],
+                    pipeline=pipeline + [f"heic-error:{exc}"],
+                )
+
+        invoice = Invoice()
+        text = ""
+        md = ""
+
+        if as_image:
+            pipeline.append("image-input")
+            if not ENABLE_DOCLING:
+                return ExtractResponse(
+                    status="failed",
+                    method="none",
+                    durationMs=int((time.perf_counter() - started) * 1000),
+                    warnings=["Fotoğraf okuma için Docling gerekli (ENABLE_DOCLING=1)"],
+                    pipeline=pipeline,
+                )
+            try:
+                use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
+                md, table_lines = docling_convert(path, ocr=use_ocr, for_image=True)
+                pipeline.append("docling-image-ocr" if use_ocr else "docling-image")
                 if table_lines:
                     invoice.lines = table_lines
                     pipeline.append(f"docling-tables:{len(table_lines)}")
-                # Merge metadata from docling markdown too
                 if md.strip():
                     inv_md = parse_text_invoice(md.replace("\t", " "), name)
                     invoice = merge_invoice(invoice, inv_md)
                     if not invoice.lines and inv_md.lines:
                         invoice.lines = inv_md.lines
             except Exception as exc:  # noqa: BLE001
-                pipeline.append(f"docling-error:{exc}")
+                pipeline.append(f"docling-image-error:{exc}")
+                return ExtractResponse(
+                    status="failed",
+                    method="none",
+                    durationMs=int((time.perf_counter() - started) * 1000),
+                    warnings=[f"Fotoğraf okunamadı: {exc}"],
+                    pipeline=pipeline,
+                )
+        else:
+            # 1) UBL
+            ubl = extract_embedded_ubl(data)
+            if ubl and re.search(r"<(?:\w+:)?Invoice[\s>]", ubl, re.I):
+                pipeline.append("ubl")
+                # Minimal UBL handling — defer to text path if complex; still mark method
+                # For now continue with text sources which also see UUID etc.
+
+            # 2) pdftotext heuristics
+            try:
+                text = pdftotext(path)
+                pipeline.append("pdftotext")
+            except Exception as exc:  # noqa: BLE001
+                pipeline.append(f"pdftotext-error:{exc}")
+
+            invoice = parse_text_invoice(text, name) if text.strip() else Invoice()
+
+            # 3) Docling structure/tables
+            if ENABLE_DOCLING:
+                try:
+                    md, table_lines = docling_convert(path, ocr=False, for_image=False)
+                    pipeline.append("docling-structure")
+                    if table_lines:
+                        invoice.lines = table_lines
+                        pipeline.append(f"docling-tables:{len(table_lines)}")
+                    # Merge metadata from docling markdown too
+                    if md.strip():
+                        inv_md = parse_text_invoice(md.replace("\t", " "), name)
+                        invoice = merge_invoice(invoice, inv_md)
+                        if not invoice.lines and inv_md.lines:
+                            invoice.lines = inv_md.lines
+                except Exception as exc:  # noqa: BLE001
+                    pipeline.append(f"docling-error:{exc}")
 
         warnings, validation = validate_invoice(invoice)
 
@@ -730,15 +860,20 @@ async def extract(
                 else:
                     line.unitPrice = round(line.lineTotal / line.quantity, 2)
 
-        # 4) OCR fallback if weak result
-        need_ocr = ENABLE_DOCLING and ENABLE_DOCLING_OCR and (
-            not invoice.lines
-            or validation.confidence < 0.7
-            or any("kalemi" in w for w in warnings)
+        # 4) OCR fallback if weak PDF result (images already OCR'd above)
+        need_ocr = (
+            not as_image
+            and ENABLE_DOCLING
+            and ENABLE_DOCLING_OCR
+            and (
+                not invoice.lines
+                or validation.confidence < 0.7
+                or any("kalemi" in w for w in warnings)
+            )
         )
         if need_ocr:
             try:
-                md2, table_lines2 = docling_convert(path, ocr=True)
+                md2, table_lines2 = docling_convert(path, ocr=True, for_image=False)
                 pipeline.append("docling-ocr")
                 if table_lines2:
                     invoice.lines = table_lines2
@@ -751,7 +886,7 @@ async def extract(
         method = "+".join(
             p
             for p in pipeline
-            if not p.endswith("-error") and not p.startswith("docling-error")
+            if not p.endswith("-error") and not p.startswith("docling-error") and not p.startswith("docling-image-error")
         ) or "none"
         if "ubl" in pipeline:
             method = "ubl+" + method if method != "none" else "ubl"

@@ -78,6 +78,7 @@ WorkingDirectory=$EXTRACT
 Environment=PORT=8106
 Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
+Environment=FORCE_IMAGE_OCR=1
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$EXEC_START
