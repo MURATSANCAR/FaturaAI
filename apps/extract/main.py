@@ -237,9 +237,9 @@ def parse_tr_money(raw: str | None) -> float | None:
 
 
 _MONEY_TOKEN = (
-    r"(?:\d{1,3}(?:[.,\s]\d{3})+[.,]\d{1,4}"  # 12.000,00 / 12,000.00 / 1.453,7
-    r"|\d{1,3}(?:[.\s]\d{3})*[.,]\d{1,4}"
-    r"|\d+[LlIiOo]?[.,]\d{1,4}"
+    r"(?:\d{1,3}(?:[.,\s]\d{3})+[.,]\d{1,8}"  # 12.000,00 / unit 3.749,16667
+    r"|\d{1,3}(?:[.\s]\d{3})*[.,]\d{1,8}"
+    r"|\d+[LlIiOo]?[.,]\d{1,8}"
     r"|\d,\d{2},\d{2}"  # OCR junk: 2,00,00 → 2.000,00
     r"|\d{1,6}\s\d{2})"
 )
@@ -273,9 +273,13 @@ def normalize_ocr_text(text: str) -> str:
     replacements = (
         (r"\bSAYDN\b", "SAYIN"),
         (r"\bSAVIN\b", "SAYIN"),
+        (r"\bSAMIN\b", "SAYIN"),
         (r"\bSAY[İI]N\b", "SAYIN"),
         (r"\bETIN\b", "ETTN"),
         (r"\bETTN\b", "ETTN"),
+        # Glued / truncated ETTN label (ETN… / ETTNe…)
+        (r"\bETT?Ne?\b(?=\s*[:\-]?[0-9A-Fa-f])", "ETTN"),
+        (r"(?i)\bETT?N(?=[0-9A-Fa-fİILOS])", "ETTN"),
         (r"\bFatera\b", "Fatura"),
         (r"\bFatara\b", "Fatura"),
         (r"\bFataca\b", "Fatura"),
@@ -471,6 +475,164 @@ def _append_ocr_try_row(
     )
 
 
+def infer_qty_unit_from_amounts(
+    total: float,
+    amounts: list[float],
+    qty_hint: float | None = None,
+) -> tuple[float, float | None]:
+    """Infer quantity + unit price from line total and candidate amounts (generic)."""
+    cands = [a for a in amounts if a is not None and 0.001 < a < total * 0.98]
+    best: tuple[float, float, float] | None = None  # score, unit, qty
+    for a in cands:
+        ratio = total / a
+        r = round(ratio)
+        if r < 1 or r > 100000:
+            continue
+        if abs(ratio - r) > 0.025:
+            continue
+        score = abs(ratio - r)
+        # Prefer matching explicit "N Adet" hint
+        if qty_hint is not None and abs(r - qty_hint) < 0.01:
+            score -= 0.5
+        # Deprioritize VAT-like rates mistaken as unit price
+        if a in (1.0, 8.0, 10.0, 18.0, 20.0) or (a < 40 and r > 40):
+            score += 0.35
+        # Prefer high-precision GİB unit prices (many decimals → larger magnitude often)
+        if a >= 100:
+            score -= 0.05
+        cand = (score, a, float(r))
+        if best is None or cand[0] < best[0]:
+            best = cand
+    if best is not None:
+        return best[2], best[1]
+    if qty_hint is not None and qty_hint >= 1:
+        return float(qty_hint), round(total / qty_hint, 5)
+    return 1.0, None
+
+
+def parse_photo_amount_lines(text: str) -> list[Line]:
+    """Photo/OCR rows: product name on one line, amounts (± N Adet) on nearby lines."""
+    rows = text.splitlines()
+    out: list[Line] = []
+    skip_name = re.compile(
+        r"(?i)(?:^|\b)(?:ARA\s*TOPLAM|TOPLAM|KDV|Mal\s*Hizmet|Vergi|ÖDEN|ODEN|ETT?N|Notlar?|"
+        r"VKN|TCKN|Tel|Web|E-?Post|SAYIN|Senaryo|Sipari|Miktar|Birim\s*Fiyat|"
+        r"Hesaplanan|Iskonto|Ödenecek)"
+    )
+    for i, ln in enumerate(rows):
+        name = ln.strip()
+        if len(name) < 6 or skip_name.search(name):
+            continue
+        if not re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{3,}", name):
+            continue
+        # Table header soup (column titles glued)
+        if re.search(r"(?i)Miktar.*(?:Birim|Fiyat)|KDV\s*Oran|Mal\s*Hizmet\s*Tutar", name):
+            continue
+        letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", name)
+        if len(letters) < 4:
+            continue
+        window = "\n".join(rows[i : i + 3])
+        # Require either Adet qty or a high-precision unit price in the window
+        qty_m = re.search(r"(?<!\d)(\d{1,4})\s*Ade[t1l]?\b", window, re.I)
+        hi_prec = re.search(r"\d{1,3}(?:\.\d{3})+,\d{3,8}", window)
+        if not qty_m and not hi_prec:
+            continue
+        qty_hint = float(qty_m.group(1)) if qty_m else None
+        money_hits = re.findall(rf"({_MONEY_TOKEN})\s*T?L?\b", window, re.I)
+        money_hits += re.findall(r"(\d{1,3}(?:\.\d{3})+,\d{2,8})", window)
+        amounts: list[float] = []
+        for raw in money_hits:
+            a = parse_tr_money(raw)
+            if a is not None and a > 0:
+                amounts.append(a)
+        if len(amounts) < 2:
+            continue
+        total = max(amounts)
+        if total < 10:
+            continue
+        # Line total should dominate (not a vat-only row)
+        if total < 50 and qty_hint is None:
+            continue
+        qty, unit = infer_qty_unit_from_amounts(total, amounts, qty_hint)
+        if unit is None:
+            continue
+        # Name quality: prefer product tokens over pure SKU dumps
+        if re.match(r"^[\dA-F.\-/\s]{8,}$", name, re.I) and i > 0:
+            prev = rows[i - 1].strip()
+            if (
+                re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{3,}", prev)
+                and not skip_name.search(prev)
+                and not re.search(r"(?i)Miktar|Birim\s*Fiyat", prev)
+            ):
+                name = prev
+        name_q = len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", name))
+        vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", name, re.I))
+        if name_q < 5 or vowels < 1:
+            continue
+        out.append(
+            Line(
+                id=str(len(out) + 1),
+                name=re.sub(r"\s+", " ", name).strip()[:240],
+                quantity=qty,
+                unit="Adet",
+                unitPrice=unit,
+                lineTotal=total,
+            )
+        )
+        if len(out) >= 8:
+            break
+    # Prefer the best name for each identical line total
+    by_total: dict[float, Line] = {}
+    for ln in out:
+        t = float(ln.lineTotal or 0)
+        prev = by_total.get(t)
+        if prev is None:
+            by_total[t] = ln
+            continue
+        def score(x: Line) -> int:
+            n = x.name or ""
+            letters = len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", n))
+            digits = len(re.sub(r"\D", "", n))
+            money_pen = 40 if re.search(rf"{_MONEY_TOKEN}", n) else 0
+            header_pen = 20 if re.search(r"(?i)Miktar|Birim|Oran|Tutar\s*$", n) else 0
+            return letters - digits // 3 - money_pen - header_pen
+
+        if score(ln) > score(prev):
+            by_total[t] = ln
+    dedup = list(by_total.values())
+    for i, ln in enumerate(dedup, start=1):
+        ln.id = str(i)
+    return dedup
+
+
+def normalize_company_legal_ocr(name: str) -> str:
+    """Generic OCR repairs for Turkish legal-entity titles (not brand-specific)."""
+    if not name:
+        return name
+    fixes = (
+        (r"\bANONdM\b", "ANONİM"),
+        (r"\bANONIM\b", "ANONİM"),
+        (r"\bANON[İI]M\b", "ANONİM"),
+        (r"\bS[İI]RKET[İI]\b", "ŞİRKETİ"),
+        (r"\bSIRKETI\b", "ŞİRKETİ"),
+        (r"\bSIRKET\b", "ŞİRKET"),
+        (r"\bTEKNOLOI[tT]?\b", "TEKNOLOJİ"),
+        (r"\bTEKNOLO(?![JİIjı])[İI]\b", "TEKNOLOJİ"),
+        (r"\bTEKNOLOJI\b", "TEKNOLOJİ"),
+        (r"\bTEKNOLOJ[İI]\b", "TEKNOLOJİ"),
+        (r"BILISIM", "BİLİŞİM"),
+        (r"B[İI]?LISIM", "BİLİŞİM"),
+        (r"B[İI]L[İI]S[İI]M", "BİLİŞİM"),
+        (r"\bLTD\.?\s*STI\b", "LTD. ŞTİ."),
+        (r"\bLTD\.?\s*ŞTI\b", "LTD. ŞTİ."),
+        (r"\bA\.?\s*S\.?\b", "A.Ş."),
+    )
+    out = name
+    for pat, repl in fixes:
+        out = re.sub(pat, repl, out, flags=re.I)
+    return re.sub(r"\s+", " ", out).strip()
+
+
 def parse_ocr_line_items(text: str) -> list[Line]:
     """Parse GİB-style flat OCR rows into invoice lines."""
     out: list[Line] = []
@@ -615,64 +777,10 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
-    # Photo OCR: "... HP 146GB ... 6Ade 3.749,16TL … 22.495,00TL"
-    ade_row = re.compile(
-        rf"(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{8,200}}?)\s+"
-        rf"(?P<qty>\d{{1,3}})\s*Ade[t1l]?\s+"
-        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*T?L?\s+"
-        rf".{{0,80}}?"
-        rf"(?P<total>{_MONEY_TOKEN})\s*T?L?\b",
-        re.I,
-    )
-    for i, m in enumerate(ade_row.finditer(text), start=1):
-        name = re.sub(r"\s+", " ", m.group("name")).strip(" -|")
-        # Prefer product fragment after part numbers when present
-        hp = re.search(r"(HP\s+.+)$", name, re.I)
-        if hp and len(hp.group(1)) >= 8:
-            name = hp.group(1).strip()
-        if re.search(r"Toplam|Iskonto|Ödenecek|Vergi\s*Dahil|Mal\s*Hizmet\s*Toplam|ETT?N", name, re.I):
-            continue
-        total = parse_tr_money(m.group("total"))
-        if total is None or total < 1:
-            continue
-        qty = float(m.group("qty").replace(",", "."))
-        out.append(
-            Line(
-                id=str(i),
-                name=name[:240],
-                quantity=qty,
-                unit="Adet",
-                unitPrice=parse_tr_money(m.group("unitPrice")),
-                lineTotal=total,
-            )
-        )
-    if out:
-        return out
-
-    # Photo OCR without glued qty: "HP 146GB…\n… 3.749,… 22.495,00TL"
-    hp_block = re.compile(
-        rf"(?P<name>HP\s+[^\n]{{6,80}})\s*(?:\n[^\n]{{0,160}}?)?"
-        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*T?L?\s+"
-        rf".{{0,80}}?"
-        rf"(?P<total>{_MONEY_TOKEN})\s*TL\b",
-        re.I,
-    )
-    for i, m in enumerate(hp_block.finditer(text), start=1):
-        total = parse_tr_money(m.group("total"))
-        if total is None or total < 10:
-            continue
-        out.append(
-            Line(
-                id=str(i),
-                name=re.sub(r"\s+", " ", m.group("name")).strip()[:240],
-                quantity=1.0,
-                unit="Adet",
-                unitPrice=parse_tr_money(m.group("unitPrice")),
-                lineTotal=total,
-            )
-        )
-    if out:
-        return out
+    # Photo OCR: product name line + amount line (qty via N Ade[t] or total÷unit)
+    photo_lines = parse_photo_amount_lines(text)
+    if photo_lines:
+        return photo_lines
 
     # Numbered GİB row with trailing money tokens (description + amounts)
     # Also collect description-only rows (product text without prices on same line)
@@ -1290,39 +1398,51 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
 
 
 def normalize_ocr_uuid(raw: str) -> str | None:
-    """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, B→8)."""
-    cleaned = raw.strip().upper()
-    # Drop obvious OCR insertions inside hex groups while preserving dashes
-    parts = cleaned.split("-")
-    if len(parts) == 5:
-        fixed_parts = []
-        expected = [8, 4, 4, 4, 12]
-        for part, n in zip(parts, expected):
-            p = (
-                part.replace("O", "0")
-                .replace("İ", "1")
-                .replace("I", "1")
-                .replace("L", "1")
-                .replace("S", "5")
-                .replace("G", "6")
-                .replace("Q", "0")
-                .replace("P", "F")  # common OCR: F→P
-            )
-            p = re.sub(r"[^0-9A-F]", "", p)
-            if len(p) > n:
-                # Prefer keeping leading chars (common: extra digit inserted)
-                p = p[:n]
-            fixed_parts.append(p)
-        cleaned = "-".join(fixed_parts)
-    else:
+    """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, R→F, …)."""
+    cleaned = raw.strip().upper().replace("‑", "-")
+    # Non-hex OCR lookalikes (do not map valid hex letters B/C/D/A/E/F)
+    safe_trans = str.maketrans(
+        {
+            "O": "0",
+            "İ": "1",
+            "I": "1",
+            "L": "1",
+            "S": "5",
+            "G": "6",
+            "Q": "0",
+            "P": "F",
+            "R": "F",
+            "T": "7",
+            "Z": "2",
+            "H": "B",
+            "N": "A",
+            "U": "0",
+            "Y": "7",
+            "W": "M",
+        }
+    )
+    loose = cleaned.translate(safe_trans)
+    hex_all = re.sub(r"[^0-9A-F]", "", loose)
+    if len(hex_all) == 32:
         cleaned = (
-            cleaned.replace("O", "0")
-            .replace("İ", "1")
-            .replace("I", "1")
-            .replace("L", "1")
-            .replace("S", "5")
-            .replace("P", "F")
+            f"{hex_all[0:8]}-{hex_all[8:12]}-{hex_all[12:16]}-"
+            f"{hex_all[16:20]}-{hex_all[20:32]}"
         )
+    else:
+        parts = cleaned.split("-")
+        if len(parts) == 5:
+            fixed_parts = []
+            expected = [8, 4, 4, 4, 12]
+            for part, n in zip(parts, expected):
+                p = part.translate(safe_trans)
+                p = re.sub(r"[^0-9A-F]", "", p)
+                if len(p) > n:
+                    p = p[:n]
+                fixed_parts.append(p)
+            cleaned = "-".join(fixed_parts)
+        else:
+            cleaned = loose
+            cleaned = re.sub(r"[^0-9A-F-]", "", cleaned)
     cleaned = cleaned.lower()
     if re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -1334,13 +1454,6 @@ def normalize_ocr_uuid(raw: str) -> str | None:
 
 def format_uuid_hex(raw: str) -> str | None:
     """Normalize dashed or undashed 32-hex ETTN."""
-    cleaned = re.sub(r"[^0-9A-Fa-f]", "", raw)
-    if len(cleaned) == 32:
-        dashed = (
-            f"{cleaned[0:8]}-{cleaned[8:12]}-{cleaned[12:16]}-"
-            f"{cleaned[16:20]}-{cleaned[20:32]}"
-        )
-        return (normalize_ocr_uuid(dashed) or dashed).lower()
     return normalize_ocr_uuid(raw)
 
 
@@ -1503,34 +1616,52 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
 
 
 def extract_ettn_candidate(text: str) -> str | None:
-    """Find ETTN even when OCR glues label+uuid (ETTN9A83...) or omits dashes."""
-    hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqz"
+    """Find ETTN even when OCR glues/truncates label (ETN…, ETTNe…) or mangles hex."""
+    hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqzRrTtHhNnUuYyWwMm"
+    # Labeled, tolerate length slip per group
     m = re.search(
-        rf"ETTN\s*[:\-]?\s*([{hexish}]{{8}}[-‑]?[{hexish}]{{4}}[-‑]?"
-        rf"[{hexish}]{{4}}[-‑]?[{hexish}]{{4}}[-‑]?[{hexish}]{{12}})",
+        rf"(?i)ETT?Ne?\s*[:\-]?\s*"
+        rf"([{hexish}]{{6,10}}[-‑]?[{hexish}]{{3,5}}[-‑]?"
+        rf"[{hexish}]{{3,5}}[-‑]?[{hexish}]{{3,5}}[-‑]?[{hexish}]{{10,14}})",
         text,
-        re.I,
     )
     if m:
-        return format_uuid_hex(m.group(1).replace("‑", "-"))
-    m = re.search(rf"ETTN\s*[:\-]?\s*([{hexish}]{{32}})", text, re.I)
+        got = format_uuid_hex(m.group(1).replace("‑", "-"))
+        if got:
+            return got
+    # Glued label+uuid: ETNa89b302-...
+    m = re.search(
+        rf"(?i)ETT?Ne?([{hexish}]{{6,10}}[-‑][{hexish}]{{3,5}}[-‑]"
+        rf"[{hexish}]{{3,5}}[-‑][{hexish}]{{3,5}}[-‑][{hexish}]{{10,14}})",
+        text,
+    )
     if m:
-        return format_uuid_hex(m.group(1))
+        got = format_uuid_hex(m.group(1).replace("‑", "-"))
+        if got:
+            return got
     m = re.search(
         r"\b([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\b",
         text,
         re.I,
     )
     if m:
-        return format_uuid_hex(m.group(1))
-    # Unlabeled UUID with OCR letter junk (G/S/O in hex groups)
+        got = format_uuid_hex(m.group(1))
+        if got:
+            return got
     m = re.search(
-        rf"\b([{hexish}]{{8}}[-‑][{hexish}]{{4}}[-‑][{hexish}]{{4}}[-‑]"
-        rf"[{hexish}]{{4}}[-‑][{hexish}]{{12}})\b",
+        rf"\b([{hexish}]{{6,10}}[-‑][{hexish}]{{3,5}}[-‑][{hexish}]{{3,5}}[-‑]"
+        rf"[{hexish}]{{3,5}}[-‑][{hexish}]{{10,14}})\b",
         text,
         re.I,
     )
-    return format_uuid_hex(m.group(1).replace("‑", "-")) if m else None
+    if m:
+        got = format_uuid_hex(m.group(1).replace("‑", "-"))
+        if got:
+            return got
+    m = re.search(rf"(?i)ETT?Ne?\s*[:\-]?\s*([{hexish}]{{30,36}})\b", text)
+    if m:
+        return format_uuid_hex(m.group(1))
+    return None
 
 
 def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
@@ -1921,6 +2052,18 @@ def extract_customer(text: str) -> Party:
                 lines.append(cleaned)
         name_parts: list[str] = []
         addr_parts: list[str] = []
+        # Name may sit on the SAYIN line itself: "SAYIN AHMET YILMAZ"
+        if lines:
+            first = re.sub(r"^\s*SAYIN\s*:?\s*", "", lines[0], flags=re.I).strip()
+            if first and not re.match(r"^(Web|E-?Posta|Tel|Vergi|VKN|TCKN|ETTN)\b", first, re.I):
+                if re.search(
+                    r"\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|Sok\.|No:|daire|sitesi|Apartman|Blok)\b",
+                    first,
+                    re.I,
+                ) or re.search(r"\b\d{5}\b", first):
+                    addr_parts.append(first)
+                else:
+                    name_parts.append(first)
         for ln in lines[1:]:
             if re.match(r"^(Web|E-?Posta|Tel|Vergi|VKN|TCKN|ETTN|S[ıi]ra|Mal|NOTLAR|Not:)", ln, re.I):
                 break
@@ -2541,6 +2684,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 supplier.taxIdScheme = "VKN"
 
     if supplier.name:
+        supplier.name = normalize_company_legal_ocr(supplier.name)
         # OCR: common misspellings of MAGAZACILIK
         supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
         supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
@@ -2644,8 +2788,29 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             or (sn and sn[:12] and sn[:12] in cn)
             or re.search(r"sikoyet|[şs]ikayet|www\.|http", customer.name or "", re.I)
         ):
-            customer.name = "Nihai Tüketici"
+            # Keep a plausible person name from SAYIN even when TCKN present
+            if customer.name and re.search(
+                r"[A-ZÇĞİÖŞÜa-zçğıöşü]{2,}\s+[A-ZÇĞİÖŞÜa-zçğıöşü]{2,}",
+                customer.name,
+            ):
+                pass
+            else:
+                customer.name = "Nihai Tüketici"
     # POS: "MÜŞTERİ: …" when name still missing
+    if not customer.name or customer.name == "Nihai Tüketici":
+        m = re.search(
+            r"SAYIN\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü .'\-]{2,60})",
+            text,
+            re.I,
+        )
+        if m:
+            cand = re.split(
+                r"\s{2,}|Telefon|TC\b|TCKN|E-?Mail|Vergi|Mah\.|Cad\.|Sok\.",
+                m.group(1),
+                maxsplit=1,
+            )[0].strip(" :.-")
+            if len(cand) >= 5 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
+                customer.name = cand[:80]
     if not customer.name or customer.name == "Nihai Tüketici":
         m = re.search(
             r"M[ÜU][ŞS]TER[İIÍ]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
@@ -3204,6 +3369,17 @@ async def extract(
                                 or re.search(r"Senaryo|Fatura\s*No|Sipari[sş]", party.name, re.I)
                             ):
                                 party.name = None
+                        # Keep photo date when Docling OCR year is clearly worse
+                        if invoice.issueDate and inv_md.issueDate and invoice.invoiceNumber:
+                            ym = re.match(r"[A-Z]{2,5}(\d{4})", invoice.invoiceNumber)
+                            if ym:
+                                sy = int(ym.group(1))
+                                try:
+                                    py, dy = int(invoice.issueDate[:4]), int(inv_md.issueDate[:4])
+                                except ValueError:
+                                    py = dy = 0
+                                if py == sy and dy != sy:
+                                    inv_md.issueDate = None
                         invoice = merge_invoice(invoice, inv_md)
                         if not _lines_useful(invoice.lines) and _lines_useful(inv_md.lines):
                             invoice.lines = inv_md.lines
@@ -3275,7 +3451,35 @@ async def extract(
 
         warnings, validation = validate_invoice(invoice)
 
+        # Final GİB-year ↔ issueDate alignment (after merges)
+        if invoice.invoiceNumber and invoice.issueDate:
+            ym = re.match(r"^[A-Z]{2,5}(\d{4})", invoice.invoiceNumber)
+            if ym:
+                series_year = int(ym.group(1))
+                try:
+                    date_year = int(invoice.issueDate[:4])
+                except ValueError:
+                    date_year = 0
+                if 1990 <= series_year <= 2100 and date_year != series_year:
+                    sa, sb = f"{date_year:04d}", f"{series_year:04d}"
+                    diffs = sum(a != b for a, b in zip(sa, sb))
+                    if diffs <= 1 and abs(date_year - series_year) <= 100:
+                        invoice.issueDate = f"{series_year:04d}{invoice.issueDate[4:]}"
+
         for line in invoice.lines:
+            # Recover qty when OCR missed "N Adet" but unit×qty ≈ line total
+            if (
+                line.lineTotal is not None
+                and line.lineTotal >= 10
+                and line.unitPrice
+                and line.unitPrice > 1
+                and (not line.quantity or line.quantity == 1)
+            ):
+                ratio = line.lineTotal / line.unitPrice
+                r = round(ratio)
+                if r >= 2 and abs(ratio - r) <= 0.025:
+                    line.quantity = float(r)
+                    line.unit = line.unit or "Adet"
             if (
                 line.quantity
                 and line.lineTotal is not None

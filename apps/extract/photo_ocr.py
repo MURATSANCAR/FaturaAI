@@ -24,7 +24,7 @@ import numpy as np
 
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1400"))
-PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2000"))
+PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2200"))
 PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "2800"))
 PHOTO_OCR_CLAHE = os.getenv("PHOTO_OCR_CLAHE", "1") == "1"
 # Dual engine only as fallback when latin pass is weak (set 1 to always run both).
@@ -162,7 +162,7 @@ def preprocess_bgr(
     long_side = max(h, w)
     if target_side is None:
         if long_side < 700:
-            target_side = min(PHOTO_OCR_MAX_SIDE, 2400 if strong else 2000)
+            target_side = min(PHOTO_OCR_MAX_SIDE, 2600 if strong else 2400)
         elif strong:
             target_side = min(PHOTO_OCR_MAX_SIDE, max(PHOTO_OCR_TARGET_SIDE, 2200))
         else:
@@ -360,6 +360,13 @@ def _run_engine(engine: Any, img: np.ndarray, label: str, candidates: list) -> N
         pass
 
 
+def _ettn_hex_count(text: str) -> int:
+    m = re.search(r"(?i)ETT?Ne?\s*[:\-]?\s*([^\n]{8,90})", text or "")
+    if not m:
+        return 0
+    return len(re.sub(r"[^0-9A-Fa-f]", "", m.group(1)))
+
+
 def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
     """Return (text, meta). Fast-first: early-exit after a strong single pass."""
     if not PHOTO_OCR_ENABLED:
@@ -377,7 +384,10 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
     candidates: list[tuple[str, str, float, int]] = []
 
     # Screenshots (chat/UI): PP-OCRv6 reads dense GİB layouts better.
-    img = preprocess_bgr(raw, strong=False, deskew=not screenshotish)
+    target = 2400 if screenshotish else None
+    img = preprocess_bgr(
+        raw, strong=False, deskew=not screenshotish, target_side=target
+    )
     early = False
     if screenshotish:
         _, v6 = get_engines(need_v6=True)
@@ -391,6 +401,27 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
             best = max(candidates, key=_rank_key) if candidates else best
             if candidates and _good_enough(best[1]):
                 early = True
+        # ETTN often needs a sharper pass on chat screenshots
+        if early and _ettn_hex_count(best[1]) < 32:
+            prev_best = best
+            img_hi = preprocess_bgr(
+                raw, strong=True, deskew=False, target_side=min(PHOTO_OCR_MAX_SIDE, 2800)
+            )
+            if v6 is not None:
+                _run_engine(v6, img_hi, "ppocrv6-ettn", candidates)
+            _run_engine(latin, img_hi, "latin-ppocrv5-ettn", candidates)
+            cand_best = max(candidates, key=_rank_key)
+            # Don't drop a readable fatura serial just to chase a broken ETTN line
+            has_serial = lambda t: bool(re.search(r"\b[A-Z]{2,5}\d{10,16}\b", t or "", re.I))
+            if _ettn_hex_count(cand_best[1]) > _ettn_hex_count(prev_best[1]) or (
+                has_serial(cand_best[1]) or not has_serial(prev_best[1])
+            ):
+                if has_serial(cand_best[1]) or not has_serial(prev_best[1]):
+                    best = cand_best
+                elif _ettn_hex_count(cand_best[1]) >= 32:
+                    best = cand_best
+            if has_serial(prev_best[1]) and not has_serial(best[1]):
+                best = prev_best
     else:
         _run_engine(latin, img, "latin-ppocrv5", candidates)
         best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
