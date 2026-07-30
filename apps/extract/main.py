@@ -263,8 +263,8 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         rf"(\d+[.,]\d+|\d+)\s+"
         rf"({_MONEY_TOKEN})\s*TRY\s+"
         rf"({_MONEY_TOKEN})\s*TRY\s+"
-        rf"%?\s*([\d.,]+)\s+"
-        rf"({_MONEY_TOKEN})\s*\.?TRY\b",
+        rf"[%\$Ss]?\s*([\d.,]+)\s+"
+        rf"({_MONEY_TOKEN})\s*[-.]?\s*TRY\b",
         re.I | re.M,
     )
     for m in row_re.finditer(text):
@@ -283,16 +283,27 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         unit_price = parse_tr_money(unit_raw)
         discount = parse_tr_money(disc_raw)
         vat_rate = normalize_vat_rate(parse_percent(vat_raw))
+        # OCR $620.00 / 620.00 → 20
+        if vat_rate is not None and vat_rate >= 100:
+            maybe = vat_rate % 100
+            if maybe in (1, 8, 10, 18, 20):
+                vat_rate = float(maybe)
+            elif str(int(vat_rate)).endswith("20"):
+                vat_rate = 20.0
         line_total = parse_tr_money(total_raw)
         name_clean = re.sub(r"\s+", " ", name).strip(" -")
         # Drop leading OCR junk words glued before SKU
         name_clean = re.sub(
-            r"^(?:Aynasa|Asorti\w*(?:\s*//\s*Asorti\w*)*|Hav[il]u\s*3x40\w*)\s+",
+            r"^(?:Aynasa|Asorti\w*(?:\s*//\s*Asorti\w*)*|Hav[il]u\s*3x40\w*:?\s*)",
             "",
             name_clean,
             flags=re.I,
         )
         name_clean = re.sub(r"^(?:Asorti\w*\s*//\s*)+", "", name_clean, flags=re.I).strip(" -")
+        name_clean = re.sub(r"\bIstak\b", "Islak", name_clean, flags=re.I)
+        name_clean = re.sub(r"\bHlaslu\b", "Havlu", name_clean, flags=re.I)
+        name_clean = re.sub(r"\bHaviu\b", "Havlu", name_clean, flags=re.I)
+        name_clean = re.sub(r"3x405\b", "3x40h", name_clean, flags=re.I)
         if not name_clean or line_total is None:
             continue
         out.append(
@@ -593,6 +604,23 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
         return False
     if not inv.lines:
         return False
+    # Reject when line totals are clearly not the invoice (bad thermal OCR names)
+    line_sum = sum(l.lineTotal or 0.0 for l in inv.lines if l.lineTotal is not None)
+    payable = inv.totals.payableAmount or 0.0
+    if line_sum > 0 and payable > 0:
+        ratio = line_sum / payable
+        if ratio < 0.35 or ratio > 2.5:
+            return False
+        # Names that look like OCR noise (almost no vowels / too short words)
+        junk = 0
+        for l in inv.lines:
+            n = (l.name or "").strip()
+            letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", n)
+            vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
+            if len(letters) >= 8 and vowels <= 1:
+                junk += 1
+        if junk >= max(1, len(inv.lines) // 2):
+            return False
     if inv.issueDate and (inv.customer.name or inv.supplier.name):
         return True
     return validation.confidence >= PHOTO_OCR_MIN_CONF
@@ -677,19 +705,19 @@ def clean_retail_product_name(name: str) -> str:
     # Strip glued VAT / SKU / brand suffixes from OCR
     name = re.sub(r"(?:HOMEND|H0WEND|HOWEND).*$", "HOMEND", name, flags=re.I)
     name = re.sub(r"[%xX×]\s*\d{1,2}\s*$", "", name)
-    name = re.sub(r"\d{3,}H?\s*$", "", name)
+    name = re.sub(r"(?<=[A-Za-zÇĞİÖŞÜçğıöşü])\d{3,}H?\b", "", name)
+    name = re.sub(r"\bSUPURGE\w*", "SÜPÜRGE", name, flags=re.I)
     fixes = (
         (r"\bSARJAI\b", "ŞARJLI"),
         (r"\bSARJRI\b", "ŞARJLI"),
         (r"\bSARJLI\b", "ŞARJLI"),
         (r"\bDiK\b", "DİK"),
         (r"\bDIK\b", "DİK"),
-        (r"\bSUPURGE\b", "SÜPÜRGE"),
-        (r"\bSUPURG[EÉ]\b", "SÜPÜRGE"),
         (r"\bCAMASIR\b", "ÇAMAŞIR"),
         (r"\bÇAMASIR\b", "ÇAMAŞIR"),
         (r"\bBILGI\b", "BİLGİ"),
         (r"\bFIS[Iİ]?\b", "FİŞİ"),
+        (r"\bHAGAZACILIK\b", "MAGAZACILIK"),
         (r"HOMENDX\d+$", "HOMEND"),
     )
     for pat, repl in fixes:
@@ -737,7 +765,8 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
         re.I,
     )
     skip = re.compile(
-        r"^(?:ARA\s*TOPLAM|TOPLAM|TOPKDV|KDV|KREDI|AKBANK|Provizyon|Tutar|TARIH|BELGE|ETTN|A101|Mgz|FAT|USKUDAR|boynuz|hgz|Faturan)",
+        r"^(?:ARA\s*TOPLA[MH]|TOPLAM|TOPKDV|KDV|KRED[İI]?|AKBANK|Provizyon|Tutar|TARIH|"
+        r"BELGE|ETTN|A101|Mgz|FAT|USKUDAR|boynuz|hgz|Faturan|KREDL)",
         re.I,
     )
     for i, m in enumerate(a101_re.finditer(text), start=1):
@@ -957,6 +986,10 @@ def extract_supplier(text: str) -> Party:
         ):
             name = f"{lines[0]} {lines[1]}"
         party.name = name[:180]
+    if party.name:
+        party.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
+        party.name = re.sub(r"\bMAČAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
+        party.name = re.sub(r"\s+", " ", party.name).strip()[:180]
     party.taxOffice = (
         first_match(head, r"Vergi\s*Dai(?:resi|resi|r[ae]s[il])\s*:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{3,40})")
         or ""
