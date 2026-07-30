@@ -225,20 +225,26 @@ def _group_lines(boxes: np.ndarray, txts: list[str], scores: list[float]) -> str
     median_h = float(np.median(heights)) if heights else 20.0
     thresh = max(12.0, median_h * 0.55)
 
-    # Column-aware: if X positions form two clear clusters, read left then right
+    # Column-aware only when a clear empty vertical gutter exists (GİB header
+    # left/right). Full-width tables must NOT be split or rows break apart.
     if PHOTO_OCR_COLUMNS and len(items) >= 12:
         xs = np.array([(it[1] + it[3]) / 2 for it in items], dtype=np.float32)
         x_min, x_max = float(xs.min()), float(xs.max())
         span = x_max - x_min
         if span > 200:
             mid = (x_min + x_max) / 2
-            left = [it for it in items if (it[1] + it[3]) / 2 <= mid]
-            right = [it for it in items if (it[1] + it[3]) / 2 > mid]
-            # Require both columns to be substantial and gap between means
-            if len(left) >= 5 and len(right) >= 5:
+            gutter = span * 0.08
+            in_gutter = int(np.sum(np.abs(xs - mid) < gutter))
+            left = [it for it in items if (it[1] + it[3]) / 2 <= mid - gutter]
+            right = [it for it in items if (it[1] + it[3]) / 2 >= mid + gutter]
+            if (
+                len(left) >= 5
+                and len(right) >= 5
+                and in_gutter <= max(2, len(items) * 0.05)
+            ):
                 left_mean = float(np.mean([(it[1] + it[3]) / 2 for it in left]))
                 right_mean = float(np.mean([(it[1] + it[3]) / 2 for it in right]))
-                if right_mean - left_mean > span * 0.22:
+                if right_mean - left_mean > span * 0.28:
                     left_txt = _lines_to_text(_cluster_lines(left, thresh))
                     right_txt = _lines_to_text(_cluster_lines(right, thresh))
                     return f"{left_txt}\n\n{right_txt}".strip()

@@ -267,11 +267,16 @@ def normalize_ocr_text(text: str) -> str:
         (r"\bHesaplanan\s*K\.?\s*D\.?\s*V\.?\b", "Hesaplanan KDV"),
         (r"\bAlica\b", "Alıcı"),
         (r"\bAlici\b", "Alıcı"),
+        (r"\bAlics\b", "Alıcı"),
         (r"\bAL[İI]C[İI]\b", "Alıcı"),
         (r"\bSatici\b", "Satıcı"),
         (r"\bSAT[İI]C[İI]\b", "Satıcı"),
         (r"\beArgiv\b", "e-Arşiv"),
         (r"\be-?Arpiv\b", "e-Arşiv"),
+        (r"HAGAZACILIK", "MAGAZACILIK"),
+        (r"\b[ÖO]DENECEK\s*TUTAR\b", "ÖDENECEK TUTAR"),
+        (r"Örün\s*/?\s*Hizmet\s+Toplam", "Mal Hizmet Toplam"),
+        (r"Vergiler\s+Dahil\s+Toplam\s+Tutar:\s*12,\.000", "Vergiler Dahil Toplam Tutar: 12.000"),
     )
     for pat, repl in replacements:
         text = re.sub(pat, repl, text, flags=re.I)
@@ -441,6 +446,22 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         return out
 
     # Numbered GİB row with trailing money tokens (description + amounts)
+    # Also collect description-only rows (product text without prices on same line)
+    skip_desc = re.compile(
+        r"^(?:ARA|TOPLAM|KDV|Mal\s*Hizmet|Vergi|ÖDEN|ODEN|S[ıi]ra|No\b|ETTN|Notlar|Adet\b)",
+        re.I,
+    )
+    desc_only: dict[str, str] = {}
+    for m in re.finditer(rf"(?m)^(?P<seq>\d{{1,3}})\s+(?P<body>.{{6,200}})$", text):
+        body = m.group("body").strip()
+        if skip_desc.match(body):
+            continue
+        if re.search(rf"{_MONEY_TOKEN}\s*(?:TL|TRY)?", body, re.I):
+            continue
+        if re.match(r"^(?:Adet|kg)\b", body, re.I):
+            continue
+        desc_only[m.group("seq")] = re.sub(r"\s+", " ", body)[:240]
+
     numbered = re.compile(rf"(?m)^(?P<seq>\d{{1,3}})\s+(?P<body>.{{8,220}})$")
     skip_body = re.compile(
         r"^(?:ARA|TOPLAM|KDV|Mal\s*Hizmet|Vergi|ÖDEN|ODEN|S[ıi]ra|No\b|ETTN|Notlar)",
@@ -464,6 +485,8 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         name_end = money_hits[0].start()
         name = body[:name_end].strip(" -|")
         name = re.sub(r"\s+", " ", name)
+        if re.match(r"^(?:Adet|kg|NIU|C62)\b", name, re.I):
+            name = desc_only.get(m.group("seq") or "", "") or f"Kalem {m.group('seq')}"
         # Drop pure header fragments
         if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 3:
             continue
@@ -478,6 +501,8 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         qty_m = re.search(r"(\d+[.,]\d+|\d+)\s*(kg|adet|ad|NIU)\b", body, re.I)
         if qty_m:
             qty = parse_tr_money(qty_m.group(1)) or float(qty_m.group(1).replace(",", "."))
+        elif re.match(r"^Adet\b", body, re.I):
+            qty = 1.0
         out.append(
             Line(
                 id=m.group("seq"),
@@ -492,7 +517,65 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         if len(out) >= 30:
             break
     if out:
+        by_id: dict[str, Line] = {}
+        for ln in out:
+            key = ln.id or str(len(by_id))
+            prev = by_id.get(key)
+            if not prev:
+                by_id[key] = ln
+                continue
+            if len(ln.name or "") > len(prev.name or "") and not re.match(
+                r"^(?:Adet|kg|Kalem)\b", ln.name or "", re.I
+            ):
+                by_id[key] = ln
+        return list(by_id.values())
+
+    if out:
         return out
+
+    # Split GİB OCR: qty rows then separate "Iskonto - %vat vatAmt total" rows
+    qty_rows = list(
+        re.finditer(
+            rf"(?m)^(?P<seq>\d{{1,3}})\s+(?P<qty>\d+[.,]\d+|\d+)\s*"
+            rf"(?P<unit>kg|adet|ad|NIU)?\s*[|\]]?\s*"
+            rf"(?P<unitPrice>{_MONEY_TOKEN})?\s*TL?",
+            text,
+            re.I,
+        )
+    )
+    amt_rows = list(
+        re.finditer(
+            rf"(?i)[İI]skonto\s*-?\s*%?\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+            rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s+"
+            rf"(?P<total>{_MONEY_TOKEN})",
+            text,
+        )
+    )
+    if qty_rows and amt_rows and len(amt_rows) >= max(1, len(qty_rows) - 1):
+        for i, qm in enumerate(qty_rows):
+            if i >= len(amt_rows):
+                break
+            am = amt_rows[i]
+            total = parse_tr_money(am.group("total"))
+            if total is None:
+                continue
+            out.append(
+                Line(
+                    id=qm.group("seq"),
+                    name=f"Kalem {qm.group('seq')}",
+                    quantity=parse_tr_money(qm.group("qty"))
+                    or float(qm.group("qty").replace(",", ".")),
+                    unit=(qm.group("unit") or "Adet"),
+                    unitPrice=parse_tr_money(qm.group("unitPrice"))
+                    if qm.group("unitPrice")
+                    else None,
+                    vatRate=normalize_vat_rate(parse_percent(am.group("vat"))),
+                    vatAmount=parse_tr_money(am.group("vatAmt")),
+                    lineTotal=total,
+                )
+            )
+        if out:
+            return out
 
     # Unnumbered product row: "DESC 1.453,70 1.463,70"
     bare = re.compile(
@@ -965,6 +1048,54 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
     if out:
         return out
 
+    # Single-line / glued: "PRODUCT…%20" then nearby "%20 *3.499,00" or "*3.499,00"
+    glued = re.compile(
+        rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{5,70}}?)[%\s]*"
+        rf"(?P<vat>\d{{1,2}})?\s*$"
+    )
+    star_amt = re.compile(rf"%?\s*(?P<vat>\d{{1,2}})?\s*\*?\s*(?P<total>{_MONEY_TOKEN})")
+    lines_txt = text.splitlines()
+    for i, ln in enumerate(lines_txt):
+        gm = glued.match(ln.strip())
+        if not gm:
+            continue
+        name = clean_retail_product_name(gm.group("name"))
+        if len(name) < 6 or re.search(
+            r"^(?:ARA|TOPLAM|TOPKDV|KDV|TARIH|BELGE|ETTN|Mgz|FAT|KASIYER|http)",
+            name,
+            re.I,
+        ):
+            continue
+        vat = normalize_vat_rate(float(gm.group("vat"))) if gm.group("vat") else None
+        total = None
+        for look in lines_txt[i : i + 4]:
+            sm = star_amt.search(look)
+            if not sm:
+                continue
+            cand = parse_tr_money(sm.group("total"))
+            if cand is not None and cand >= 1:
+                total = cand
+                if sm.group("vat"):
+                    vat = normalize_vat_rate(float(sm.group("vat"))) or vat
+                break
+        if total is None:
+            continue
+        out.append(
+            Line(
+                id=str(len(out) + 1),
+                name=name[:240],
+                quantity=1.0,
+                unit="Adet",
+                unitPrice=total,
+                vatRate=vat or 20.0,
+                lineTotal=total,
+            )
+        )
+        if len(out) >= 8:
+            break
+    if out:
+        return out
+
     retail_line_re = re.compile(
         rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{5,70}}?)"
         rf"(?:[%\s]*[xX]?(?P<vat>\d{{1,2}}))?\s+\*?\s*(?P<total>{_MONEY_TOKEN})\s*$",
@@ -1307,6 +1438,7 @@ def extract_customer(text: str) -> Party:
             alici.group(1),
             maxsplit=1,
         )[0].strip(" :.-[]{}")
+        cand = re.sub(r"^(?:şube|sube)\)?\s*:?\s*", "", cand, flags=re.I).strip(" :.-[]{}()")
         if len(cand) >= 3 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
             party.name = cand[:120]
 
