@@ -50,9 +50,19 @@ function extractSupplier(text: string): InvoiceParty {
     .map((l) => l.trim())
     .filter(Boolean)
     .filter((l) => !/^e-?Ar[sş]iv\s+Fatura$/i.test(l))
-    .filter((l) => !/^Sayfa\s+\d+/i.test(l));
+    .filter((l) => !/^Sayfa\s+\d+/i.test(l))
+    .map((l) => l.replace(/^#+\s*/, "").trim())
+    .filter(Boolean);
 
-  if (lines[0] && !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi])/i.test(lines[0])) {
+  const companyIdx = lines.findIndex(
+    (ln) =>
+      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M|Ş[İI]RKET)/i.test(ln) &&
+      !/^(?:Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kurumsal\s+Ofis|Adres)/i.test(ln) &&
+      !/Mahallesi|Cadde(?:si)?|Bulvar/i.test(ln),
+  );
+  if (companyIdx >= 0) {
+    party.name = lines[companyIdx].slice(0, 180);
+  } else if (lines[0] && !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Kurumsal\s+Ofis)/i.test(lines[0])) {
     let name = lines[0];
     if (
       lines[1] &&
@@ -65,9 +75,14 @@ function extractSupplier(text: string): InvoiceParty {
   }
 
   const addrParts: string[] = [];
-  for (const line of lines.slice(1)) {
+  for (const line of lines.slice(companyIdx >= 0 ? companyIdx + 1 : 1)) {
     if (/^(Tel|Web|E-Posta|Vergi|TCKN|VKN)\b/i.test(line)) break;
-    if (/Kap[ıi]\s*No/i.test(line) || /Türkiye|mah\.|Cad\.|Bul\./i.test(line) || /\/\s*\w+/.test(line)) {
+    if (
+      /^Kurumsal\s+Ofis/i.test(line) ||
+      /Kap[ıi]\s*No/i.test(line) ||
+      /Türkiye|mah\.|Mahallesi|Cad\.|Cadde|Bul\.|Bulvar/i.test(line) ||
+      /\/\s*\w+/.test(line)
+    ) {
       addrParts.push(line.replace(/^Kap[ıi]\s*No:\s*/i, "Kapı No: "));
     }
   }
@@ -182,7 +197,15 @@ function extractCustomer(text: string): InvoiceParty {
 
 /** Row with explicit unit (GİB classic): "1 Nakliye 1 Adet 16.000 TL %0 … %20 3.200 TL" */
 const LINE_WITH_UNIT =
-  /^\s*(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|Saat|Gün|Ay|Yıl|NIU)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+%?([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+.+?%([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?/i;
+  /^\s*(\d+)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|Saat|Gün|Ay|Yıl|NIU)\s+([\d.\s]+(?:,\d{2,})?)\s*TL?\s+%?([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?\s+.+?%([\d.,]+)\s+([\d.\s]+(?:,\d{2})?)\s*TL?/i;
+
+/**
+ * Qty glued to unit + multi-decimal unit price (Exbilisim / marketplace PDFs):
+ * "1     6Adet 3.749,16667TL  %0,00  0,00TL  %20,00  4.499,00TL  22.495,00TL"
+ * Product name usually wraps on surrounding lines.
+ */
+const LINE_GLUED_UNIT =
+  /^\s*(\d+)\s+(.*?)\s*(\d+(?:[.,]\d+)?)\s*(Adet|C62|KGM|MTR|LTR|Saat|Gün|Ay|Yıl|NIU)\s+([\d.\s]+,\d{2,})\s*TL\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*TL\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*TL(?:\s+([\d.\s]+,\d{2})\s*TL)?/i;
 
 /**
  * EDM / e-ticaret layout (no Adet): 
@@ -211,13 +234,54 @@ function isLineContinuation(line: string): boolean {
   const t = line.trim();
   if (!t) return false;
   if (/^\d+\s/.test(t)) return false;
-  if (/^(S[ıi]ra|Mal\s*\/?\s*Hizmet|No\b|NOTLAR|Not:|ETTN|Ödenecek|ÖDENECEK|Vergiler|Hesaplanan|Toplam|NET TOPLAM|Ta[sş][ıi]yan)/i.test(t)) {
+  if (
+    /^(S[ıi]ra|Mal\s*\/?\s*Hizmet|No\b|NOTLAR|Not:|ETTN|Ödenecek|ÖDENECEK|Vergiler|Hesaplanan|Toplam|NET TOPLAM|Ta[sş][ıi]yan|Mal\s*Hizmet\s*Toplam)/i.test(
+      t,
+    )
+  ) {
     return false;
   }
   if (/^[%\d]/.test(t) && /TL|TRY/.test(t)) return false;
   if (MONEY_PAIR_ROW.test(t)) return false;
   if (LINE_TRY.test(t)) return false;
+  if (LINE_GLUED_UNIT.test(t) || LINE_WITH_UNIT.test(t) || LINE_EDM.test(t) || LINE_PRODUCT_CODE.test(t)) {
+    return false;
+  }
   return t.length > 1 && t.length < 160;
+}
+
+function isNewLineItemRow(line: string): boolean {
+  return (
+    LINE_GLUED_UNIT.test(line) ||
+    LINE_WITH_UNIT.test(line) ||
+    LINE_EDM.test(line) ||
+    LINE_PRODUCT_CODE.test(line) ||
+    LINE_TRY.test(line)
+  );
+}
+
+function collectWrappedLineName(
+  rawLines: string[],
+  index: number,
+  inlineName: string,
+): string | null {
+  const parts: string[] = [];
+  if (inlineName.trim()) parts.push(inlineName.replace(/\s+/g, " ").trim());
+
+  for (let j = index - 1; j >= Math.max(0, index - 4); j--) {
+    if (!isLineContinuation(rawLines[j])) break;
+    parts.unshift(rawLines[j].trim());
+  }
+  for (let j = index + 1; j < Math.min(rawLines.length, index + 5); j++) {
+    if (isNewLineItemRow(rawLines[j])) break;
+    if (/Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s+KDV|Vergiler\s+Dahil/i.test(rawLines[j])) {
+      break;
+    }
+    if (!isLineContinuation(rawLines[j])) break;
+    parts.push(rawLines[j].trim());
+  }
+  const name = parts.join(" ").replace(/\s+/g, " ").trim();
+  return name || null;
 }
 
 function extractLines(text: string): InvoiceLine[] {
@@ -226,6 +290,25 @@ function extractLines(text: string): InvoiceLine[] {
 
   for (let i = 0; i < rawLines.length; i++) {
     const row = rawLines[i];
+
+    const glued = row.match(LINE_GLUED_UNIT);
+    if (glued) {
+      lines.push({
+        id: glued[1],
+        name: collectWrappedLineName(rawLines, i, glued[2] ?? ""),
+        quantity: Number.parseFloat(glued[3].replace(",", ".")),
+        unit: glued[4],
+        unitPrice: parseTrMoney(glued[5]),
+        discountRate: parsePercent(glued[6]),
+        discountAmount: parseTrMoney(glued[7]),
+        vatRate: parsePercent(glued[8]),
+        vatAmount: parseTrMoney(glued[9]),
+        withholdingNote: null,
+        lineTotal: glued[10] ? parseTrMoney(glued[10]) : null,
+      });
+      continue;
+    }
+
     const withUnit = row.match(LINE_WITH_UNIT);
     if (withUnit) {
       const withholding = rawLines
@@ -234,7 +317,7 @@ function extractLines(text: string): InvoiceLine[] {
         .match(/KDV\s*TEVK[İI]FAT[^\n]*\(([^)]+)\)\s*=\s*([\d.\s]+(?:,\d{2})?)/i);
       lines.push({
         id: withUnit[1],
-        name: withUnit[2].replace(/\s+/g, " ").trim(),
+        name: collectWrappedLineName(rawLines, i, withUnit[2]),
         quantity: Number.parseFloat(withUnit[3].replace(",", ".")),
         unit: withUnit[4],
         unitPrice: parseTrMoney(withUnit[5]),
@@ -283,16 +366,9 @@ function extractLines(text: string): InvoiceLine[] {
 
     const tryLine = row.match(LINE_TRY);
     if (tryLine) {
-      const nameParts: string[] = [];
-      if (i > 0 && isLineContinuation(rawLines[i - 1])) {
-        nameParts.push(rawLines[i - 1].trim());
-      }
-      if (i + 1 < rawLines.length && isLineContinuation(rawLines[i + 1])) {
-        nameParts.push(rawLines[i + 1].trim());
-      }
       lines.push({
         id: tryLine[1],
-        name: nameParts.join(" ").replace(/\s+/g, " ").trim() || null,
+        name: collectWrappedLineName(rawLines, i, ""),
         quantity: Number.parseFloat(tryLine[2].replace(",", ".")),
         unit: "Adet",
         unitPrice: parseTrMoney(tryLine[3]),
@@ -309,27 +385,11 @@ function extractLines(text: string): InvoiceLine[] {
     const edm = row.match(LINE_EDM);
     if (!edm) continue;
 
-    const nameParts: string[] = [];
-    if (edm[2].trim()) nameParts.push(edm[2].replace(/\s+/g, " ").trim());
-    if (i > 0 && isLineContinuation(rawLines[i - 1])) {
-      nameParts.unshift(rawLines[i - 1].trim());
-    }
-    if (i + 1 < rawLines.length && isLineContinuation(rawLines[i + 1])) {
-      const nextIsNewLine =
-        i + 2 < rawLines.length &&
-        (LINE_EDM.test(rawLines[i + 2]) ||
-          LINE_WITH_UNIT.test(rawLines[i + 2]) ||
-          LINE_PRODUCT_CODE.test(rawLines[i + 2]));
-      if (!nextIsNewLine) {
-        nameParts.push(rawLines[i + 1].trim());
-      }
-    }
-
     const unitPrice = parseTrMoney(edm[4]);
     const lineTotal = edm[7] ? parseTrMoney(edm[7]) : unitPrice;
     lines.push({
       id: edm[1],
-      name: nameParts.join(" ").replace(/\s+/g, " ").trim() || null,
+      name: collectWrappedLineName(rawLines, i, edm[2] ?? ""),
       quantity: Number.parseFloat(edm[3].replace(",", ".")),
       unit: "Adet",
       unitPrice,

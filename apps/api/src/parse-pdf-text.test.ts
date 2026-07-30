@@ -214,3 +214,32 @@ Vergiler Dahil Toplam Tutar 120,00 TL
     assert.equal(ticari.profileId, "TICARIFATURA");
   });
 });
+
+describe("parseGibPdfText — Exbilisim YAU glued-unit layout", () => {
+  const text = readFileSync(join(root, "samples/exbilisim-yau.pdftotext.txt"), "utf8");
+  const invoice = parseGibPdfText(text, "4406815-4d8a4.pdf");
+
+  it("reads meta and parties", () => {
+    assert.equal(invoice.invoiceNumber, "YAU2026000003538");
+    assert.equal(invoice.issueDate, "2026-03-09");
+    assert.match(invoice.supplier.name ?? "", /EXB[İI]L[İI][ŞS][İI]M/i);
+    assert.equal(invoice.supplier.taxId, "8430903426");
+    assert.match(invoice.customer.name ?? "", /BURAG|KE[ŞS][İI][ŞS]O[ĞG]LU/i);
+  });
+
+  it("reads glued-unit line item with wrapped name", () => {
+    assert.equal(invoice.lines.length, 1);
+    assert.match(invoice.lines[0].name ?? "", /HP 146GB|Harddisk/i);
+    assert.equal(invoice.lines[0].quantity, 6);
+    assert.equal(invoice.lines[0].unit, "Adet");
+    assert.ok(nearlyEqual(invoice.lines[0].unitPrice ?? 0, 3749.16667, 0.01));
+    assert.ok(nearlyEqual(invoice.lines[0].vatAmount ?? 0, 4499));
+    assert.ok(nearlyEqual(invoice.lines[0].lineTotal ?? 0, 22495));
+  });
+
+  it("reads totals", () => {
+    assert.ok(nearlyEqual(invoice.totals.payableAmount ?? 0, 26994));
+    assert.ok(nearlyEqual(invoice.totals.vatAmount ?? 0, 4499));
+    assert.deepEqual(validateInvoice(invoice), []);
+  });
+});
