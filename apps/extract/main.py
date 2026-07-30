@@ -671,13 +671,37 @@ def format_uuid_hex(raw: str) -> str | None:
     return normalize_ocr_uuid(raw)
 
 
+def clean_retail_product_name(name: str) -> str:
+    """Light OCR cleanup for Turkish retail product names (no invented brands)."""
+    name = re.sub(r"\s+", " ", name).strip(" -*|")
+    # Common OCR confusions on thermal / phone photos
+    fixes = (
+        (r"\bSARJAI\b", "ŞARJLI"),
+        (r"\bSARJLI\b", "ŞARJLI"),
+        (r"\bDiK\b", "DİK"),
+        (r"\bDIK\b", "DİK"),
+        (r"\bSUPURGE\b", "SÜPÜRGE"),
+        (r"\bSUPURG[EÉ]\b", "SÜPÜRGE"),
+        (r"\bCAMASIR\b", "ÇAMAŞIR"),
+        (r"\bÇAMASIR\b", "ÇAMAŞIR"),
+        (r"\bKIRLI\b", "KIRLI"),
+        (r"\bBILGI\b", "BİLGİ"),
+        (r"\bFIS[Iİ]?\b", "FİŞİ"),
+        (r"HOMENDX\d+$", "HOMEND"),
+    )
+    for pat, repl in fixes:
+        name = re.sub(pat, repl, name, flags=re.I)
+    return name.strip(" -*|")[:240]
+
+
 def parse_retail_pos_lines(text: str) -> list[Line]:
     """Parse market bilgi fişi / POS lines."""
     out: list[Line] = []
+    # qty adet x/× unit \n name \n %vat *total  (VAT+amount may be split across lines)
     block_re = re.compile(
-        rf"(?ms)^(?P<qty>\d+)\s*adet\s*x\s*(?P<unit>{_MONEY_TOKEN})\s*\n"
+        rf"(?ms)^(?P<qty>\d+)\s*adet\s*[x×X]\s*(?P<unit>{_MONEY_TOKEN})\s*\n"
         rf"(?P<name>[^\n]{{3,80}})\s*\n"
-        rf"%?\s*(?P<vat>\d{{1,2}})\s*\*\s*(?P<total>{_MONEY_TOKEN})",
+        rf"%?\s*(?P<vat>\d{{1,2}})\s*(?:\n|\s+)\*?\s*(?P<total>{_MONEY_TOKEN})",
         re.I,
     )
     for i, m in enumerate(block_re.finditer(text), start=1):
@@ -685,13 +709,15 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
         unit = parse_tr_money(m.group("unit"))
         total = parse_tr_money(m.group("total"))
         vat = normalize_vat_rate(float(m.group("vat")))
-        name = re.sub(r"\s+", " ", m.group("name")).strip()
+        name = clean_retail_product_name(m.group("name"))
         if not name or total is None:
+            continue
+        if re.search(r"^(?:ARA\s*TOPLAM|TOPLAM|TOPKDV|KDV)\b", name, re.I):
             continue
         out.append(
             Line(
                 id=str(i),
-                name=name[:240],
+                name=name,
                 quantity=qty,
                 unit="Adet",
                 unitPrice=unit,
@@ -722,7 +748,7 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
             continue
         vat = normalize_vat_rate(float(m.group("vat"))) if m.group("vat") else 20.0
         name = re.sub(r"[%\s]*[xX]?\d{1,2}\s*$", "", name).strip(" -")
-        name = re.sub(r"HOMENDX\d+$", "HOMEND", name, flags=re.I)
+        name = clean_retail_product_name(name)
         if len(name) < 6 or re.fullmatch(r"[xX]?\d{1,3}.*", name):
             continue
         if re.search(r"^(?:X?\d{1,2}|KDV|TOP)", name, re.I):
@@ -730,7 +756,7 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
         out.append(
             Line(
                 id=str(i),
-                name=name[:240],
+                name=name,
                 quantity=1.0,
                 unit="Adet",
                 unitPrice=total,
@@ -1691,7 +1717,8 @@ async def extract(
 
                     photo_text, photo_meta = await asyncio.to_thread(ocr_image, path)
                     pipeline.append(
-                        f"rapidocr-ppocrv6:{photo_meta.get('elapsedMs', 0)}ms:"
+                        f"photo-ocr:{photo_meta.get('engine', '?')}:"
+                        f"{photo_meta.get('elapsedMs', 0)}ms:"
                         f"{photo_meta.get('lineCount', 0)}"
                     )
                     _metrics["photo_ocr"] += 1
