@@ -1449,6 +1449,13 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         or len(supplier.name) < 4
     ):
         supplier.name = first_match(text, r"(A101\s+YEN[İI]\s+H?AGAZACILIK\s+A\.?\s*S\.?)") or supplier.name
+    if supplier.name:
+        supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
+        supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
+        # Drop OCR junk glued around A101 title
+        m = re.search(r"(A101\s+YEN[İI]\s+MAGAZACILIK\s+A\.?\s*S\.?)", supplier.name, re.I)
+        if m:
+            supplier.name = m.group(1)
 
     customer = extract_customer(text)
     if musteri_vkn:
@@ -1493,6 +1500,23 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     )
 
 
+def _party_name_quality(name: str | None) -> int:
+    if not name:
+        return 0
+    n = name.strip()
+    if len(n) < 3 or re.fullmatch(r"[=_\-—.\s]+", n):
+        return 0
+    letters = len(re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]", n))
+    if letters < 4:
+        return 0
+    score = letters
+    if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|MAGAZA|BABYMALL|A101|EVPARK)", n, re.I):
+        score += 20
+    if re.search(r"Senaryo|Fatura\s*Tipi|==", n, re.I):
+        score -= 30
+    return score
+
+
 def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
     data = base.model_dump()
     over = overlay.model_dump()
@@ -1509,23 +1533,45 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
             data[k] = v
     for side in ("supplier", "customer"):
         for k, v in over[side].items():
-            if v and not data[side].get(k):
+            if not v:
+                continue
+            cur = data[side].get(k)
+            if not cur:
+                data[side][k] = v
+                continue
+            if k != "name":
+                continue
+            q_new, q_old = _party_name_quality(str(v)), _party_name_quality(str(cur))
+            if q_new > q_old:
                 data[side][k] = v
             elif (
-                k == "name"
-                and v
-                and data[side].get(k)
-                and len(str(v)) < len(str(data[side][k]))
+                q_new >= max(8, q_old - 5)
+                and len(str(v)) < len(str(cur))
                 and "Senaryo" not in str(v)
                 and "Fatura" not in str(v)
             ):
-                # Prefer cleaner shorter party name from tesseract when base is polluted
+                # Prefer cleaner shorter party name when quality is comparable
                 data[side][k] = v
     for k, v in over["totals"].items():
         if v is not None and data["totals"].get(k) is None:
             data["totals"][k] = v
-    if over["lines"] and (not data["lines"] or len(over["lines"]) >= len(data["lines"])):
-        data["lines"] = over["lines"]
+    if over["lines"]:
+        def _line_sum(lines: list) -> float:
+            return sum((l.get("lineTotal") or 0) for l in lines if isinstance(l, dict))
+
+        pay = data["totals"].get("payableAmount") or over["totals"].get("payableAmount")
+        if not data["lines"]:
+            data["lines"] = over["lines"]
+        else:
+            base_sum = _line_sum(data["lines"])
+            over_sum = _line_sum(over["lines"])
+            base_ok = pay and base_sum and abs(base_sum - pay) / pay < 0.35
+            over_ok = pay and over_sum and abs(over_sum - pay) / pay < 0.35
+            if over_ok and not base_ok:
+                data["lines"] = over["lines"]
+            elif over_ok == base_ok and len(over["lines"]) >= len(data["lines"]):
+                # Prefer names with more letters when counts equal
+                data["lines"] = over["lines"]
     if over["notes"] and not data["notes"]:
         data["notes"] = over["notes"]
     return Invoice.model_validate(data)
