@@ -496,17 +496,15 @@ function firstAmount(text: string, labels: string[]): number | null {
 function extractTotals(text: string): ParsedInvoice["totals"] {
   const netToplam = firstAmount(text, [
     "Mal Hizmet Toplam Tutarı",
-    "Mal/?Hizmet Toplam Tutarı",
+    "Mal\\s*/?\\s*Hizmet Toplam Tutarı",
     "NET TOPLAM",
     "Ara Toplam",
     "Vergiler Hariç Toplam",
     "Vergiler Hariç Tutar",
-    "TaxExclusiveAmount",
   ]);
-  // Explicit matrah rows (sometimes after discount)
+  // Explicit matrah rows (sometimes after discount) — sum multi-rate matrah footnotes
   const matrahLabeled =
-    sumLabeledAmounts(text, "KDV Matrahı") ??
-    labeledAmount(text, "Matrah") ??
+    sumLabeledAmounts(text, "KDV Matrah[ıi]") ??
     labeledAmount(text, "TaxExclusiveAmount");
 
   const discountTotal = firstAmount(text, [

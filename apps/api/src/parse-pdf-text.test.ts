@@ -164,6 +164,9 @@ describe("parseGibPdfText — Babymall TRY samples", () => {
     const text = readFileSync(join(root, "samples/babymall-3.pdftotext.txt"), "utf8");
     const inv = parseGibPdfText(text, "3.pdf");
     assert.equal(inv.invoiceNumber, "BBE2026000016055");
+    assert.equal(inv.documentType, "earsiv");
+    assert.equal(inv.profileId, "EARSIVFATURA");
+    assert.equal(inv.invoiceTypeCode, "SATIS");
     assert.equal(inv.lines.length, 3);
     assert.ok(nearlyEqual(inv.totals.discountTotal ?? 0, 784.58));
     assert.ok(nearlyEqual(inv.totals.lineExtensionAmount ?? 0, 1693.27));
@@ -172,5 +175,42 @@ describe("parseGibPdfText — Babymall TRY samples", () => {
     assert.ok(nearlyEqual(inv.totals.taxInclusiveAmount ?? 0, 2008.31));
     assert.ok(nearlyEqual(inv.totals.payableAmount ?? 0, 2008.31));
     assert.deepEqual(validateInvoice(inv), []);
+  });
+
+  it("reconciles undercounted single KDV via matrah/ti arithmetic", () => {
+    const text = readFileSync(join(root, "samples/babymall-3.pdftotext.txt"), "utf8");
+    // Drop %10 row — parser should still heal via reconcileTotals
+    const mangled = text.replace(/KDV\s*\(%10\.00\)\s+[\d.,]+\s*TRY/i, "");
+    const inv = parseGibPdfText(mangled, "3.pdf");
+    assert.ok(nearlyEqual(inv.totals.vatAmount ?? 0, 315.04));
+    assert.deepEqual(validateInvoice(inv), []);
+  });
+});
+
+describe("document type / profile detection", () => {
+  it("maps TEMELFATURA / TICARIFATURA to efatura", () => {
+    const base = `
+e-Fatura
+Senaryo: TEMELFATURA
+Fatura Tipi: SATIŞ
+Fatura No: ABC2026000000001
+Fatura Tarihi: 01-01-2026
+ETTN: 11111111-1111-1111-1111-111111111111
+Mal Hizmet Toplam Tutarı 100,00 TL
+Hesaplanan KDV(%20) 20,00 TL
+Vergiler Dahil Toplam Tutar 120,00 TL
+Ödenecek Tutar 120,00 TL
+`;
+    const temel = parseGibPdfText(base, "x.pdf");
+    assert.equal(temel.documentType, "efatura");
+    assert.equal(temel.profileId, "TEMELFATURA");
+    assert.equal(temel.invoiceTypeCode, "SATIS");
+
+    const ticari = parseGibPdfText(
+      base.replace("TEMELFATURA", "TICARIFATURA"),
+      "x.pdf",
+    );
+    assert.equal(ticari.documentType, "efatura");
+    assert.equal(ticari.profileId, "TICARIFATURA");
   });
 });

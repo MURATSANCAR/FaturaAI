@@ -706,7 +706,31 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         .replace("&amp;", "&")
     )
     doc_type: Literal["earsiv", "efatura", "ubl", "unknown"] = "unknown"
-    if re.search(r"e-?Ar[sş]iv(?:\s+Fatura)?|EARSIVFATURA|e-?Ar[sş]iv\s+izni", text, re.I):
+    profile = right_field(text, "Senaryo") or first_match(text, r"ProfileID\s*:?\s*([A-Z0-9_]+)")
+    if profile:
+        profile = re.sub(r"[^A-Z0-9_]", "", profile.upper().replace("İ", "I").replace("İ", "I"))
+    inv_type = right_field(text, "Fatura Tipi")
+    if inv_type:
+        inv_type = (
+            inv_type.upper()
+            .replace("İ", "I")
+            .replace("Ş", "S")
+            .replace("Ğ", "G")
+            .replace("Ü", "U")
+            .replace("Ö", "O")
+            .replace("Ç", "C")
+        )
+        inv_type = re.sub(r"[^A-Z0-9_]", "", inv_type)
+        if inv_type in {"SATIS", "SATIŞ"}:
+            inv_type = "SATIS"
+
+    if profile and "EARSIV" in profile:
+        doc_type = "earsiv"
+    elif profile and re.search(
+        r"TEMEL|TICARI|IHRACAT|YOLCU|KAMU|ENERJI|ILAC|HKS", profile
+    ):
+        doc_type = "efatura"
+    elif re.search(r"e-?Ar[sş]iv(?:\s+Fatura)?|EARSIVFATURA|e-?Ar[sş]iv\s+izni", text, re.I):
         doc_type = "earsiv"
     elif re.search(
         r"e-?Fatura|EFATURA|TICARIFATURA|TEMELFATURA|IHRACATFATURA|KAMUFATURA",
@@ -751,13 +775,51 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     if uuid:
         uuid = normalize_ocr_uuid(uuid)
 
-    net = labeled_amount(text, "Mal Hizmet Toplam Tutarı") or labeled_amount(text, "NET TOPLAM")
-    discount = labeled_amount(text, "Toplam [İI]skonto") or labeled_amount(text, "TOPLAM [İI]SKONTO")
+    net = (
+        labeled_amount(text, "Mal Hizmet Toplam Tutarı")
+        or labeled_amount(text, "NET TOPLAM")
+        or labeled_amount(text, "Ara Toplam")
+        or labeled_amount(text, "Vergiler Hariç Toplam")
+    )
+    discount = (
+        labeled_amount(text, "Toplam [İI]skonto")
+        or labeled_amount(text, "TOPLAM [İI]SKONTO")
+        or labeled_amount(text, "İskonto Toplamı")
+    )
+    matrah = sum_labeled_amounts(text, r"KDV Matrah[ıi]")
     line_ext = (
-        round(net - discount, 2) if net is not None and discount and discount > 0 else net
+        matrah
+        if matrah is not None
+        else (round(net - discount, 2) if net is not None and discount and discount > 0 else net)
     )
 
-    payable = labeled_amount(text, "Ödenecek Tutar") or labeled_amount(text, "ÖDENECEK TUTAR")
+    payable = (
+        labeled_amount(text, "Ödenecek Tutar")
+        or labeled_amount(text, "ÖDENECEK TUTAR")
+        or labeled_amount(text, "Odenecek Tutar")
+    )
+    tax_inclusive = labeled_amount(text, "Vergiler Dahil Toplam Tutar") or labeled_amount(
+        text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR"
+    )
+    vat = extract_vat_amount(text)
+    withholding = extract_withholding_vat_amount(text)
+
+    # Reconcile: heal missed multi-rate VAT
+    if line_ext is not None and tax_inclusive is not None and tax_inclusive >= line_ext:
+        implied = round(tax_inclusive - line_ext, 2)
+        if vat is None or abs((line_ext + vat) - tax_inclusive) > 0.05:
+            vat = implied
+    if payable is None and tax_inclusive is not None:
+        payable = (
+            round(tax_inclusive - withholding, 2) if withholding is not None else tax_inclusive
+        )
+    if (
+        tax_inclusive is not None
+        and payable is not None
+        and withholding is None
+        and tax_inclusive > payable + 0.05
+    ):
+        withholding = round(tax_inclusive - payable, 2)
 
     iban = first_match(text, r"I?İ?BAN\s*:\s*(TR[\d\s]+)")
     if iban:
@@ -766,9 +828,9 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 
     return Invoice(
         documentType=doc_type,
-        profileId=right_field(text, "Senaryo"),
+        profileId=profile,
         customizationId=right_field(text, "Özelleştirme No"),
-        invoiceTypeCode=right_field(text, "Fatura Tipi"),
+        invoiceTypeCode=inv_type,
         invoiceNumber=inv_no,
         uuid=uuid,
         issueDate=issue_date,
@@ -779,10 +841,9 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         totals=Totals(
             lineExtensionAmount=line_ext,
             discountTotal=discount,
-            withholdingVatAmount=extract_withholding_vat_amount(text),
-            vatAmount=extract_vat_amount(text),
-            taxInclusiveAmount=labeled_amount(text, "Vergiler Dahil Toplam Tutar")
-            or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR"),
+            withholdingVatAmount=withholding,
+            vatAmount=vat,
+            taxInclusiveAmount=tax_inclusive,
             payableAmount=payable,
             currency="TRY",
         ),

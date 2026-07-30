@@ -1,4 +1,5 @@
 import type { ParsedInvoice } from "../types.js";
+import { reconcileTotals } from "./parse-pdf-text.js";
 
 function tag(name: string): string {
   return `(?:\\w+:)?${name}`;
@@ -54,6 +55,23 @@ function money(xml: string, name: string, scope?: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function sumMoneyAll(xml: string, blockName: string, amountName: string): number | null {
+  const re = new RegExp(`<${tag(blockName)}[\\s>]`, "gi");
+  let sum = 0;
+  let found = false;
+  for (const m of xml.matchAll(re)) {
+    if (m.index == null) continue;
+    const b = block(xml.slice(m.index), blockName);
+    if (!b) continue;
+    const amt = money(b, amountName);
+    if (amt != null) {
+      sum += amt;
+      found = true;
+    }
+  }
+  return found ? Number(sum.toFixed(2)) : null;
+}
+
 function partyTaxId(partyXml: string): { taxId: string | null; scheme: "VKN" | "TCKN" | null } {
   const m = partyXml.match(
     new RegExp(
@@ -74,6 +92,42 @@ function partyName(partyXml: string): string | null {
   return (pn ? first(pn, "Name") : null)?.slice(0, 160) ?? null;
 }
 
+function partyTaxOffice(partyXml: string): string | null {
+  const pts = block(partyXml, "PartyTaxScheme");
+  if (!pts) return null;
+  const scheme = block(pts, "TaxScheme");
+  return (scheme ? first(scheme, "Name") : first(pts, "Name"))?.slice(0, 120) ?? null;
+}
+
+function asciiUpper(s: string): string {
+  return s
+    .replace(/İ/g, "I")
+    .replace(/ı/g, "I")
+    .replace(/Ş/g, "S")
+    .replace(/ş/g, "S")
+    .replace(/Ğ/g, "G")
+    .replace(/ğ/g, "G")
+    .replace(/Ü/g, "U")
+    .replace(/ü/g, "U")
+    .replace(/Ö/g, "O")
+    .replace(/ö/g, "O")
+    .replace(/Ç/g, "C")
+    .replace(/ç/g, "C")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]/g, "");
+}
+
+function documentKind(profileId: string | null): ParsedInvoice["documentType"] {
+  const p = (profileId ?? "").toUpperCase();
+  if (p.includes("EARSIV")) return "earsiv";
+  if (
+    /TEMEL|TICARI|IHRACAT|YOLCU|KAMU|ENERJI|ILAC|HKS/.test(p)
+  ) {
+    return "efatura";
+  }
+  return profileId ? "ubl" : "unknown";
+}
+
 export function isUblInvoiceXml(text: string): boolean {
   const t = text.trim();
   return /<(?:\w+:)?Invoice[\s>]/i.test(t) && /(?:CustomizationID|ProfileID|AccountingSupplierParty)/i.test(t);
@@ -81,12 +135,9 @@ export function isUblInvoiceXml(text: string): boolean {
 
 export function parseUblInvoice(xml: string): ParsedInvoice | null {
   if (!isUblInvoiceXml(xml)) return null;
-  const profileId = first(xml, "ProfileID");
-  const kind = (profileId ?? "").toUpperCase().includes("EARSIV")
-    ? "earsiv"
-    : /TICARI|TEMEL|IHRACAT|KAMU/i.test(profileId ?? "")
-      ? "efatura"
-      : "ubl";
+  const profileIdRaw = first(xml, "ProfileID");
+  const profileId = profileIdRaw ? asciiUpper(profileIdRaw) : null;
+  const kind = documentKind(profileId);
 
   const currency = first(xml, "DocumentCurrencyCode") ?? "TRY";
   const supplierBlock = block(xml, "AccountingSupplierParty");
@@ -105,12 +156,13 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
     if (!b) continue;
     const item = block(b, "Item");
     const qtyRaw = first(b, "InvoicedQuantity");
+    const price = block(b, "Price");
     lines.push({
       id: first(b, "ID"),
       name: item ? first(item, "Name") : first(b, "Name"),
       quantity: qtyRaw ? Number.parseFloat(qtyRaw.replace(",", ".")) : null,
       unit: null,
-      unitPrice: money(b, "PriceAmount") ?? money(b, "Price"),
+      unitPrice: price ? money(price, "PriceAmount") : money(b, "PriceAmount") ?? money(b, "Price"),
       discountRate: null,
       discountAmount: null,
       vatRate: null,
@@ -127,12 +179,30 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
     if (n) notes.push(n.slice(0, 500));
   }
 
-  return {
+  // TaxTotal may appear multiple times (VAT + other); prefer first document-level TaxAmount
+  // WithholdingTaxTotal is separate in UBL-TR
+  const vatAmount =
+    sumMoneyAll(xml, "TaxTotal", "TaxAmount") ??
+    (() => {
+      const tax = block(xml, "TaxTotal");
+      return tax ? money(tax, "TaxAmount") : null;
+    })();
+  // If multiple TaxTotals include withholding wrongly, withholding is usually WithholdingTaxTotal
+  const withholdingVatAmount = sumMoneyAll(xml, "WithholdingTaxTotal", "TaxAmount");
+
+  // Invoice ID is the first cbc:ID under Invoice — avoid line IDs by scoping head
+  const head = xml.slice(0, 20_000);
+  const invoiceNumber = first(head, "ID");
+
+  const invoiceTypeRaw = first(xml, "InvoiceTypeCode");
+  const invoiceTypeCode = invoiceTypeRaw ? asciiUpper(invoiceTypeRaw) : null;
+
+  const invoice: ParsedInvoice = {
     documentType: kind,
     profileId,
     customizationId: first(xml, "CustomizationID"),
-    invoiceTypeCode: first(xml, "InvoiceTypeCode"),
-    invoiceNumber: first(xml.slice(0, 12000), "ID"),
+    invoiceTypeCode,
+    invoiceNumber,
     uuid: first(xml, "UUID")?.toLowerCase() ?? null,
     issueDate: first(xml, "IssueDate"),
     issueTime: first(xml, "IssueTime"),
@@ -140,7 +210,7 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
       name: partyName(supplierParty),
       taxId: sTax.taxId,
       taxIdScheme: sTax.scheme,
-      taxOffice: first(supplierParty, "TaxScheme") ? first(block(supplierParty, "PartyTaxScheme") ?? "", "Name") : null,
+      taxOffice: partyTaxOffice(supplierParty),
       address: first(supplierParty, "StreetName"),
       phone: first(supplierParty, "Telephone"),
       email: first(supplierParty, "ElectronicMail"),
@@ -150,7 +220,7 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
       name: partyName(customerParty),
       taxId: cTax.taxId,
       taxIdScheme: cTax.scheme,
-      taxOffice: null,
+      taxOffice: partyTaxOffice(customerParty),
       address: first(customerParty, "StreetName"),
       phone: first(customerParty, "Telephone"),
       email: first(customerParty, "ElectronicMail"),
@@ -158,13 +228,12 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
     },
     lines,
     totals: {
-      lineExtensionAmount: monetary ? money(monetary, "LineExtensionAmount") : null,
+      lineExtensionAmount: monetary
+        ? money(monetary, "LineExtensionAmount") ?? money(monetary, "TaxExclusiveAmount")
+        : null,
       discountTotal: monetary ? money(monetary, "AllowanceTotalAmount") : null,
-      vatAmount: (() => {
-        const tax = block(xml, "TaxTotal");
-        return tax ? money(tax, "TaxAmount") : null;
-      })(),
-      withholdingVatAmount: null,
+      vatAmount,
+      withholdingVatAmount,
       taxInclusiveAmount: monetary ? money(monetary, "TaxInclusiveAmount") : null,
       payableAmount: monetary ? money(monetary, "PayableAmount") : null,
       currency,
@@ -174,4 +243,21 @@ export function parseUblInvoice(xml: string): ParsedInvoice | null {
     bankName: null,
     bankBranch: null,
   };
+
+  // Caution: summing ALL TaxTotal can double-count if line TaxTotals exist in XML.
+  // Prefer document-level: if lineExtension + first TaxTotal works, keep; reconcile heals.
+  if (invoice.totals.vatAmount != null && invoice.totals.lineExtensionAmount != null) {
+    const ti = invoice.totals.taxInclusiveAmount;
+    if (
+      ti != null &&
+      Math.abs(invoice.totals.lineExtensionAmount + invoice.totals.vatAmount - ti) > 1
+    ) {
+      // Likely double-counted TaxTotals — fall back to first TaxTotal only
+      const tax = block(xml, "TaxTotal");
+      invoice.totals.vatAmount = tax ? money(tax, "TaxAmount") : invoice.totals.vatAmount;
+    }
+  }
+
+  reconcileTotals(invoice);
+  return invoice;
 }
