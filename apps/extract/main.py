@@ -2375,21 +2375,39 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 maxsplit=1,
                 flags=re.I,
             )[0].strip()[:180]
-        # Drop OCR junk prefixes (short codes) when a better legal-form title exists later
+        # Drop OCR junk prefixes (short codes) when a better legal-form title exists later.
+        # Keep "THE … ANONİM ŞİRKETİ" — not POS junk like "6A MAGAZA…".
         if (
             len(supplier.name) < 4
             or "mgzkodu" in supplier.name.lower()
             or re.match(r"^[a-z]{2,4}\d", supplier.name, re.I)
-            or re.match(r"^\d*[A-Z]{1,3}\s+", supplier.name)  # leading POS junk like "6A "
+            or (
+                re.match(r"^\d*[A-Z]{1,3}\s+", supplier.name)
+                and not re.search(
+                    r"ANON[İI]M|Ş[İI]RKET|TEKNOLOJ|T[İI]CARET|SANAY|MA[ĞG]AZA",
+                    supplier.name,
+                    re.I,
+                )
+            )
         ):
+            # Use A.\s*Ş (dot required) so case-insensitive "aş" in "Taşıyıcı" cannot match.
             better = first_match(
                 text,
                 r"((?:[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&-]{4,60}?)"
-                r"(?:MA[ĞG]AZACILIK|T[İI]CARET|SANAY[İI]).{0,40}?(?:A\.?\s*Ş\.?|LTD\.?\s*ŞT[İI]))",
+                r"(?:MA[ĞG]AZACILIK|T[İI]CARET|SANAY[İI]).{0,40}?"
+                r"(?:A\.\s*Ş\.?|LTD\.?\s*ŞT[İI]))",
             )
-            if better:
+            if better and not re.search(
+                r"(?:Arac[ıi]|Ta[şs][ıi]y[ıi]c[ıi])\s+Firma",
+                better,
+                re.I,
+            ):
                 supplier.name = re.sub(r"\s+", " ", better).strip()[:180]
-                supplier.name = re.sub(r"^\d*[A-Z]{0,3}\s+", "", supplier.name).strip()[:180]
+                supplier.name = re.sub(
+                    r"^(?:[a-z]{1,3}\d*|\d{1,3}[A-Za-z]{0,2})\s+",
+                    "",
+                    supplier.name,
+                ).strip()[:180]
 
     customer = extract_customer(text)
     if musteri_vkn:
@@ -2458,6 +2476,11 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 if _party_name_quality(ln.strip()) >= 20
                 and not _is_registry_or_chrome_line(ln)
                 and not _looks_like_address_party_line(ln.strip())
+                and not re.search(
+                    r"(?:Arac[ıi]|Ta[şs][ıi]y[ıi]c[ıi])\s+Firma|^Not\s*:",
+                    ln,
+                    re.I,
+                )
             ),
             None,
         )
