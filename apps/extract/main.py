@@ -1456,6 +1456,14 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         m = re.search(r"(A101\s+YEN[İI]\s+MAGAZACILIK\s+A\.?\s*S\.?)", supplier.name, re.I)
         if m:
             supplier.name = m.group(1)
+        # Babymall: drop address glued onto company title
+        if re.search(r"BABYMALL", supplier.name, re.I):
+            supplier.name = re.split(
+                r"\s+(?:YES[İI]?LOVA|YBSILOVA|CAD\.|ETIMES|MAH\.|PROF)",
+                supplier.name,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip()[:180]
 
     customer = extract_customer(text)
     if musteri_vkn:
@@ -1463,12 +1471,36 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         customer.taxIdScheme = "VKN" if len(musteri_vkn) == 10 else "TCKN"
         if not customer.name or "EVPARK" in (customer.name or "").upper() or "sikoyet" in (customer.name or "").lower():
             customer.name = "Nihai Tüketici"
+    # Thermal/print: "MUSTERİ: MURAT SANCAR" on same line as address
+    if not customer.name or customer.name == "Nihai Tüketici":
+        m = re.search(
+            r"M[ÜU][ŞS]TER[İI]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
+            text,
+            re.I,
+        )
+        if m:
+            cand = re.split(r"\s{2,}|Telefon|TC\b|E-?Mail|Vergi", m.group(1), maxsplit=1)[0].strip(" :.-")
+            if len(cand) >= 5 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
+                customer.name = cand[:80]
     if not customer.name:
         near_card = first_match(text, r"(?m)^([A-ZÇĞİÖŞÜ ]{5,40})\s*\nAID:")
         if near_card and not re.search(r"MASTER|KART|CHIP|ONAY", near_card, re.I):
             customer.name = near_card.strip()[:120]
         else:
             customer.name = "Nihai Tüketici"
+
+    # Drop thermal OCR junk lines when totals clearly don't match payable
+    if ocr_lines and payable:
+        line_sum = sum(l.lineTotal or 0.0 for l in ocr_lines if l.lineTotal is not None)
+        junk = 0
+        for l in ocr_lines:
+            letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", l.name or "")
+            vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
+            if len(letters) >= 8 and vowels <= 2 and not re.search(r"BM-|HOMEND|BABYMALL|A101", l.name or "", re.I):
+                junk += 1
+        if line_sum > 0 and (line_sum / payable) < 0.4 and junk >= max(1, len(ocr_lines) // 2):
+            ocr_lines = []
+            lines_sum = None
 
     return Invoice(
         documentType=doc_type,
