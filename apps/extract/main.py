@@ -186,7 +186,15 @@ class ExtractResponse(BaseModel):
 def parse_tr_money(raw: str | None) -> float | None:
     if not raw:
         return None
-    s = re.sub(r"(?i)TL|TRY|₺", "", raw).replace(" ", "").strip()
+    s = re.sub(r"(?i)TL|TRY|₺", "", raw).strip()
+    s = s.replace("\u00a0", " ")
+    # OCR often uses space as decimal: "359 96" / "133 33"
+    if re.fullmatch(r"\d{1,6}\s+\d{2}", s):
+        s = s.replace(" ", ",")
+    # thousands with space: "2 008,31"
+    if re.search(r"\d\s+\d{3}[,.]", s):
+        s = s.replace(" ", "")
+    s = s.replace(" ", "").strip()
     if not s:
         return None
     if "," in s and "." in s:
@@ -200,6 +208,121 @@ def parse_tr_money(raw: str | None) -> float | None:
         return n if n == n else None
     except ValueError:
         return None
+
+
+_MONEY_TOKEN = r"(?:\d{1,3}(?:[.\s]\d{3})*[.,]\d{2,4}|\d+[.,]\d{2,4}|\d{1,6}\s\d{2})"
+
+
+def labeled_amount(text: str, label: str) -> float | None:
+    # Plain layout + OCR (comma/dot/space decimals) + optional TRY
+    re_ = re.compile(
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?({_MONEY_TOKEN})\s*(?:TL|TRY)?",
+        re.I,
+    )
+    matches = list(re_.finditer(text))
+    if matches:
+        return parse_tr_money(matches[-1].group(1))
+    re_nl = re.compile(
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*\|?[^\n]{{0,40}}?\n+\s*\|?\s*({_MONEY_TOKEN})",
+        re.I,
+    )
+    matches = list(re_nl.finditer(text))
+    if matches:
+        return parse_tr_money(matches[-1].group(1))
+    return None
+
+
+def normalize_vat_rate(vat_rate: float | None) -> float | None:
+    """Map OCR-mangled rates (9620.00, 620.00, 96.2) to GİB standards."""
+    if vat_rate is None:
+        return None
+    standard = (0.0, 1.0, 8.0, 10.0, 18.0, 20.0)
+    if vat_rate in standard:
+        return vat_rate
+    for div in (100.0, 10.0):
+        cand = round(vat_rate / div, 2)
+        if cand in standard:
+            return cand
+    digits = re.sub(r"[^\d]", "", f"{vat_rate:.2f}")
+    for token, val in (("20", 20.0), ("10", 10.0), ("18", 18.0), ("08", 8.0), ("01", 1.0)):
+        if token in digits:
+            return val
+    return vat_rate if vat_rate <= 40 else None
+
+
+def parse_ocr_line_items(text: str) -> list[Line]:
+    """Parse GİB-style flat OCR rows into invoice lines."""
+    out: list[Line] = []
+    # qty unitPrice TRY discount TRY %vat lineTotal TRY
+    row_re = re.compile(
+        rf"^(\d{{1,3}})\s+(.+?)\s+"
+        rf"(\d+[.,]\d+|\d+)\s+"
+        rf"({_MONEY_TOKEN})\s*TRY\s+"
+        rf"({_MONEY_TOKEN})\s*TRY\s+"
+        rf"%?\s*([\d.,]+)\s+"
+        rf"({_MONEY_TOKEN})\s*\.?TRY\b",
+        re.I | re.M,
+    )
+    for m in row_re.finditer(text):
+        seq, name, qty_raw, unit_raw, disc_raw, vat_raw, total_raw = m.groups()
+        qty = parse_tr_money(qty_raw.replace(",", ".")) if "," in qty_raw or "." in qty_raw else None
+        if qty is None:
+            try:
+                qty = float(qty_raw.replace(",", "."))
+            except ValueError:
+                qty = None
+        # OCR often turns 1,0 into 10
+        if qty is not None and qty >= 10 and qty == int(qty) and int(qty) % 10 == 0:
+            maybe = qty / 10.0
+            if 0 < maybe <= 9:
+                qty = maybe
+        unit_price = parse_tr_money(unit_raw)
+        discount = parse_tr_money(disc_raw)
+        vat_rate = normalize_vat_rate(parse_percent(vat_raw))
+        line_total = parse_tr_money(total_raw)
+        name_clean = re.sub(r"\s+", " ", name).strip(" -")
+        # Drop leading OCR junk words glued before SKU
+        name_clean = re.sub(
+            r"^(?:Aynasa|Asorti\w*(?:\s*//\s*Asorti\w*)*|Hav[il]u\s*3x40\w*)\s+",
+            "",
+            name_clean,
+            flags=re.I,
+        )
+        name_clean = re.sub(r"^(?:Asorti\w*\s*//\s*)+", "", name_clean, flags=re.I).strip(" -")
+        if not name_clean or line_total is None:
+            continue
+        out.append(
+            Line(
+                id=seq,
+                name=name_clean[:240],
+                quantity=qty,
+                unit="Adet",
+                unitPrice=unit_price,
+                discountAmount=discount,
+                vatRate=vat_rate,
+                lineTotal=line_total,
+            )
+        )
+    return out
+
+
+def normalize_invoice_type(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    t = (
+        raw.upper()
+        .replace("İ", "I")
+        .replace("Ş", "S")
+        .replace("Ğ", "G")
+        .replace("Ü", "U")
+        .replace("Ö", "O")
+        .replace("Ç", "C")
+    )
+    t = re.sub(r"[^A-Z0-9_]", "", t)
+    # OCR: SATTS / SATI5 → SATIS
+    if t in {"SATTS", "SATI5", "SAT1S", "SATIS"}:
+        return "SATIS"
+    return t or None
 
 
 def parse_percent(raw: str | None) -> float | None:
@@ -216,6 +339,28 @@ def parse_percent(raw: str | None) -> float | None:
 
 def nearly_equal(a: float, b: float, eps: float = 0.05) -> bool:
     return abs(a - b) <= eps
+
+
+def status_from(warnings: list[str], validation: Validation) -> Literal["ok", "partial", "failed"]:
+    # Soft warnings that shouldn't block ok after reconcile
+    soft = [
+        w
+        for w in warnings
+        if re.search(r"uyuşmuyor|0\.0[12]|kuruş", w, re.I)
+    ]
+    hard = [w for w in warnings if w not in soft]
+    critical = [
+        w
+        for w in hard
+        if re.search(r"Fatura numarası|Ödenecek tutar|Satıcı|Alıcı|kalemi|ETTN|tarihi", w)
+    ]
+    if not hard and validation.confidence >= 0.8:
+        return "ok"
+    if critical:
+        return "partial"
+    if validation.confidence < 0.5:
+        return "partial"
+    return "ok" if validation.confidence >= 0.75 else "partial"
 
 
 def sniff_extension(data: bytes, filename: str) -> str:
@@ -336,28 +481,9 @@ def first_match(text: str, pattern: str, flags: int = re.I) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def labeled_amount(text: str, label: str) -> float | None:
-    # Plain layout + OCR markdown tables (| Label | 1.234,56 TL |)
-    re_ = re.compile(
-        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?([\d.\s]+,\d{{2,}})\s*(?:TL|TRY)?",
-        re.I,
-    )
-    matches = list(re_.finditer(text))
-    if matches:
-        return parse_tr_money(matches[-1].group(1))
-    re_nl = re.compile(
-        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*\|?[^\n]{{0,40}}?\n+\s*\|?\s*([\d.\s]+,\d{{2,}})",
-        re.I,
-    )
-    matches = list(re_nl.finditer(text))
-    if matches:
-        return parse_tr_money(matches[-1].group(1))
-    return None
-
-
 def sum_labeled_amounts(text: str, label: str) -> float | None:
     re_ = re.compile(
-        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?([\d.\s]+,\d{{2,}})\s*(?:TL|TRY)?",
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?({_MONEY_TOKEN})\s*(?:TL|TRY)?",
         re.I,
     )
     amounts = [parse_tr_money(m.group(1)) for m in re_.finditer(text)]
@@ -370,10 +496,20 @@ def sum_labeled_amounts(text: str, label: str) -> float | None:
 
 
 def extract_vat_amount(text: str) -> float | None:
-    """Sum multi-rate KDV rows: KDV (%10) + KDV (%20)."""
+    """Sum multi-rate KDV rows: KDV (%10) + KDV (%20). Prefer footnotes when present."""
+    footnote_re = re.compile(
+        rf"Kdv\s*Tutar[ıia]?\s*:?\s*({_MONEY_TOKEN})",
+        re.I,
+    )
+    footnotes = [parse_tr_money(m.group(1)) for m in footnote_re.finditer(text)]
+    footnotes = [a for a in footnotes if a is not None and a > 0]
+    if footnotes:
+        unique = sorted({round(a, 2) for a in footnotes})
+        return round(sum(unique), 2)
+
     rate_re = re.compile(
-        r"(?:Hesaplanan\s+)?KDV(?!\s*(?:TEVK|Tevkifat|Matrah[ıi]?))"
-        r"(?:\s*\(\s*%?\s*[\d.,]+\s*%?\s*\))\s*:?\s*([\d.\s]+,\d{2,})",
+        rf"(?:Hesaplanan\s+)?[KX]DV(?!\s*(?:TEVK|Tevkifat|Matrah[ıi]?))"
+        rf"(?:\s*\(\s*%?\s*[\d.,]+\s*%?\s*\))\s*:?\s*({_MONEY_TOKEN})",
         re.I,
     )
     rate_amounts = [parse_tr_money(m.group(1)) for m in rate_re.finditer(text)]
@@ -381,15 +517,8 @@ def extract_vat_amount(text: str) -> float | None:
     if rate_amounts:
         return round(sum(rate_amounts), 2)
 
-    footnote_re = re.compile(r"Kdv\s*Tutar[ıi]\s*:?\s*([\d.\s]+,\d{2,})", re.I)
-    footnotes = [parse_tr_money(m.group(1)) for m in footnote_re.finditer(text)]
-    footnotes = [a for a in footnotes if a is not None and a > 0]
-    if footnotes:
-        unique = sorted({round(a, 2) for a in footnotes})
-        return round(sum(unique), 2)
-
     return labeled_amount(text, r"Hesaplanan KDV(?!\s*Tevkifat)") or labeled_amount(
-        text, r"KDV(?!\s*(?:TEVK|Tevkifat|Matrah))"
+        text, r"[KX]DV(?!\s*(?:TEVK|Tevkifat|Matrah))"
     )
 
 
@@ -402,13 +531,13 @@ def extract_withholding_vat_amount(text: str) -> float | None:
 
 def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
     """Enough fields from photo OCR to skip heavy Docling."""
-    if inv.invoiceNumber and inv.totals.payableAmount is not None:
+    if not inv.invoiceNumber or inv.totals.payableAmount is None:
+        return False
+    if not inv.lines:
+        return False
+    if inv.issueDate and (inv.customer.name or inv.supplier.name):
         return True
-    if inv.invoiceNumber and inv.issueDate and (inv.customer.name or inv.supplier.name):
-        return True
-    if validation.confidence >= PHOTO_OCR_MIN_CONF and inv.invoiceNumber:
-        return True
-    return False
+    return validation.confidence >= PHOTO_OCR_MIN_CONF
 
 
 def normalize_ocr_uuid(raw: str) -> str | None:
@@ -525,22 +654,24 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
 
 
 def extract_payable_from_ocr(text: str) -> float | None:
-    """Prefer bank/payment lines over mangled 'Genel Toplam' OCR."""
+    """Prefer bank/payment lines and OCR-tolerant 'ödenecek/vergi dahil' labels."""
     bank = re.search(
-        r"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
-        r"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{0,48}?"
-        r"(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2})\s*TRY",
+        rf"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
+        rf"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{{0,48}}?"
+        rf"({_MONEY_TOKEN})\s*TRY",
         text,
         re.I,
     )
     if bank:
-        return parse_tr_money(bank.group(1))
+        amt = parse_tr_money(bank.group(1))
+        if amt is not None:
+            return amt
     for label in (
-        "Ödenecek Tutar",
-        "ÖDENECEK TUTAR",
-        "Odenecek Tutar",
-        "Genel Toplam",
-        "Vergiler Dahil Toplam Tutar",
+        r"[ÖO]DENECEK\s+TUTAR",
+        r"Ödenecek\s+Tutar",
+        r"VERG[İIEÉ]\s+DAH[İI]L\s+TOPLAM\s+TUTAR",
+        r"Vergiler\s+Dahil\s+Toplam\s+Tutar",
+        r"Genel\s+Toplam",
     ):
         amt = labeled_amount(text, label)
         if amt is not None:
@@ -859,19 +990,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     if profile:
         profile = re.sub(r"[^A-Z0-9_]", "", profile.upper().replace("İ", "I").replace("İ", "I"))
     inv_type = right_field(text, "Fatura Tipi")
-    if inv_type:
-        inv_type = (
-            inv_type.upper()
-            .replace("İ", "I")
-            .replace("Ş", "S")
-            .replace("Ğ", "G")
-            .replace("Ü", "U")
-            .replace("Ö", "O")
-            .replace("Ç", "C")
-        )
-        inv_type = re.sub(r"[^A-Z0-9_]", "", inv_type)
-        if inv_type in {"SATIS", "SATIŞ"}:
-            inv_type = "SATIS"
+    inv_type = normalize_invoice_type(inv_type)
 
     if profile and "EARSIV" in profile:
         doc_type = "earsiv"
@@ -900,8 +1019,10 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             inv_no = None
 
     issue_date, issue_time = prefer_invoice_issue_date(text)
-    for label in ("Fatura Saati", "Düzenleme Zamanı", "Oluşma Zamanı"):
-        raw = right_field(text, label)
+    for label in ("Fatura Saati", "Düzenleme Zamanı", "Düzenleme Zamans", "Oluşma Zamanı"):
+        raw = right_field(text, label) or first_match(
+            text, rf"{label}\s*:?\s*(\d{{1,2}}:\d{{2}}:\d{{2}})"
+        )
         if raw and not issue_time:
             tm = re.search(r"(\d{1,2}:\d{2}:\d{2})", raw)
             if tm:
@@ -925,45 +1046,71 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     discount = (
         labeled_amount(text, "Toplam [İI]skonto")
         or labeled_amount(text, "TOPLAM [İI]SKONTO")
+        or labeled_amount(text, r"TOPLAM\s+ISKONTO")
         or labeled_amount(text, "İskonto Toplamı")
     )
-    matrah = sum_labeled_amounts(text, r"KDV Matrah[ıi]")
+    matrah = (
+        sum_labeled_amounts(text, r"KDV Matrah[ıie]")
+        or sum_labeled_amounts(text, r"Kdv Matrah\w*")
+    )
+    ocr_lines = parse_ocr_line_items(text)
+    lines_sum = None
+    if ocr_lines:
+        totals_present = [l.lineTotal for l in ocr_lines if l.lineTotal is not None]
+        if totals_present:
+            lines_sum = round(sum(totals_present), 2)
+    # Prefer line-item sum (true matrah) over partial OCR matrah footnotes
     line_ext = (
-        matrah
+        lines_sum
+        if lines_sum is not None
+        else matrah
         if matrah is not None
         else (round(net - discount, 2) if net is not None and discount and discount > 0 else net)
     )
 
     payable = extract_payable_from_ocr(text)
     tax_inclusive = (
-        labeled_amount(text, "Vergiler Dahil Toplam Tutar")
-        or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR")
+        labeled_amount(text, r"VERG[İIEÉ]\s+DAH[İI]L\s+TOPLAM\s+TUTAR")
+        or labeled_amount(text, "Vergiler Dahil Toplam Tutar")
+        or labeled_amount(text, r"VERGI\s+DAHIL\s+TOPLAM\s+TUTAR")
         or labeled_amount(text, "Genel Toplam")
         or payable
     )
-    # If OCR "Genel Toplam" is clearly wrong vs bank payment, prefer payment
+    # Prefer tax-inclusive / ödenecek over bank 0.01 rounding when both exist
+    odenecek = labeled_amount(text, r"[ÖO]DENECEK\s+TUTAR")
+    vergi_dahil = labeled_amount(text, r"VERG[İIEÉ]\s+DAH[İI]L\s+TOPLAM\s+TUTAR") or labeled_amount(
+        text, r"VERGI\s+DAHIL\s+TOPLAM\s+TUTAR"
+    )
+    if odenecek is not None:
+        payable = odenecek
+    if vergi_dahil is not None:
+        tax_inclusive = vergi_dahil
+    if payable is None and tax_inclusive is not None:
+        payable = tax_inclusive
+    if tax_inclusive is None and payable is not None:
+        tax_inclusive = payable
+
     bank_pay = None
     bank_m = re.search(
-        r"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
-        r"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{0,48}?"
-        r"(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2})\s*TRY",
+        rf"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
+        rf"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{{0,48}}?"
+        rf"({_MONEY_TOKEN})\s*TRY",
         text,
         re.I,
     )
     if bank_m:
         bank_pay = parse_tr_money(bank_m.group(1))
-    if bank_pay is not None and (
-        payable is None or abs(payable - bank_pay) > 1.0 and bank_pay > payable
-    ):
+    # Only use bank if ödenecek missing
+    if payable is None and bank_pay is not None:
         payable = bank_pay
-        tax_inclusive = bank_pay
+        tax_inclusive = tax_inclusive or bank_pay
     vat = extract_vat_amount(text)
     withholding = extract_withholding_vat_amount(text)
 
-    # Reconcile: heal missed multi-rate VAT
+    # Reconcile: heal missed multi-rate VAT from lines/totals
     if line_ext is not None and tax_inclusive is not None and tax_inclusive >= line_ext:
         implied = round(tax_inclusive - line_ext, 2)
-        if vat is None or abs((line_ext + vat) - tax_inclusive) > 0.05:
+        if vat is None or abs((line_ext + (vat or 0)) - tax_inclusive) > 0.05:
             vat = implied
     if payable is None and tax_inclusive is not None:
         payable = (
@@ -977,15 +1124,31 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     ):
         withholding = round(tax_inclusive - payable, 2)
 
+    # Soft 0.01 reconcile: prefer taxInclusive as payable when off by 1 kuruş vs bank
+    if (
+        tax_inclusive is not None
+        and payable is not None
+        and abs(tax_inclusive - payable) <= 0.02
+    ):
+        payable = tax_inclusive
+
     iban = first_match(text, r"I?İ?BAN\s*:\s*(TR[\d\s]+)")
     if iban:
         iban = re.sub(r"\s+", "", iban).upper()
     bank = first_match(text, r"([A-ZÇĞİÖŞÜa-zçğıöşü ]+BANKASI)\s*/\s*I?İ?BAN")
 
+    # Profile from OCR without colon
+    if not profile:
+        profile = first_match(text, r"Senaryo\s*:?\s*([A-Z0-9_]+)")
+        if profile:
+            profile = re.sub(r"[^A-Z0-9_]", "", profile.upper())
+
     return Invoice(
         documentType=doc_type,
         profileId=profile,
-        customizationId=right_field(text, "Özelleştirme No"),
+        customizationId=right_field(text, "Özelleştirme No")
+        or right_field(text, "Ozellestirme No")
+        or first_match(text, r"Özelleştirme\s*No\s*:?\s*(TR[\d.]+)"),
         invoiceTypeCode=inv_type,
         invoiceNumber=inv_no,
         uuid=uuid,
@@ -993,7 +1156,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         issueTime=issue_time,
         supplier=extract_supplier(text),
         customer=extract_customer(text),
-        lines=[],
+        lines=ocr_lines,
         totals=Totals(
             lineExtensionAmount=line_ext,
             discountTotal=discount,
@@ -1172,17 +1335,6 @@ def docling_convert(path: Path, ocr: bool = False, for_image: bool = False) -> t
     md = result.document.export_to_markdown() or ""
     table_lines = parse_markdown_tables(md)
     return md, table_lines
-
-
-def status_from(warnings: list[str], validation: Validation) -> Literal["ok", "partial", "failed"]:
-    critical = [w for w in warnings if re.search(r"Fatura numarası|Ödenecek tutar|Satıcı|Alıcı|kalemi", w)]
-    if not warnings and validation.confidence >= 0.85:
-        return "ok"
-    if critical:
-        return "partial"
-    if validation.confidence < 0.5:
-        return "partial"
-    return "ok" if validation.confidence >= 0.75 else "partial"
 
 
 @app.on_event("startup")
