@@ -2,7 +2,7 @@ import { parsePercent, parseTrMoney } from "./money.js";
 import type { InvoiceLine, InvoiceParty, ParsedInvoice } from "../types.js";
 
 function rightField(text: string, label: string): string | null {
-  // "Fatura No: X" or Babymall-style "Fatura No             X" (colon optional)
+  // "Fatura No: X" or "Fatura No             X" (colon optional)
   const re = new RegExp(`${label}\\s*:?\\s*([^\\n]+)`, "i");
   const m = text.match(re);
   if (!m) return null;
@@ -97,9 +97,10 @@ function extractSupplier(text: string): InvoiceParty {
 
 function looksLikeAddressLine(line: string): boolean {
   return (
-    /^(Konut|Kap[ıi]|Ye[sş]il|\/\s*Türkiye)/i.test(line) ||
-    /\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|No:|daire|sitesi)\b/i.test(line) ||
-    /\b(Ankara|İstanbul|Istanbul|İzmir|Izmir|Karabük|Etimesgut|Çorum|Corum)\b/i.test(line)
+    /^(Konut|Kap[ıi]|\/\s*Türkiye)/i.test(line) ||
+    /\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|Sok\.|No:|daire|sitesi|Apartman|Blok)\b/i.test(line) ||
+    /\b\d{5}\b/.test(line) ||
+    /\/\s*[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}/.test(line)
   );
 }
 
@@ -141,7 +142,7 @@ function extractCustomer(text: string): InvoiceParty {
     }
   }
   party.name = nameParts.join(" ").replace(/\s+/g, " ").trim() || null;
-  // "SEVECEN MARKET SEVECEN MARKET" → tek kez
+  // Duplicate name on same line: "FOO FOO" → "FOO"
   if (party.name) {
     const halves = party.name.split(/\s+/);
     const mid = Math.floor(halves.length / 2);
@@ -191,14 +192,14 @@ const LINE_EDM =
   /^\s*(\d+)\s+(.*?)\s+(\d+(?:[.,]\d+)?)\s+([\d.\s]+,\d{2}|\d+)\s*TL\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*TL(?:\s+([\d.\s]+,\d{2})\s*TL)?\s*$/i;
 
 /**
- * Moda Jant / ürün kodlu layout — fiyatlar üst satırda olabilir:
- * "1  468621  205/55 R17 …  4 Adet  %18,00  808,47"
+ * Product-code layout — prices may sit on the previous row:
+ * "1  468621  DESCRIPTION  4 Adet  %18,00  808,47"
  */
 const LINE_PRODUCT_CODE =
   /^\s*(\d+)\s+(\d{4,})\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(Adet|C62|KGM|MTR|LTR|NIU)\s+%([\d.,]+)\s+([\d.\s]+,\d{2})\s*$/i;
 
 /**
- * Babymall / TRY layout:
+ * TRY currency line layout:
  * "1    1,0   108,3300 TRY   33,33 TRY   %20.00   74,99 TRY"
  */
 const LINE_TRY =
@@ -668,8 +669,9 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
         ? `${saati.trim()}:00`
         : saati.trim()
       : null) ??
-    (olusma?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null) ??
-    (duzenlemeZamani?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ?? null);
+    olusma?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ??
+    duzenlemeZamani?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ??
+    null;
 
   const uuid = firstMatch(
     normalized,

@@ -700,10 +700,8 @@ def format_uuid_hex(raw: str) -> str | None:
 
 
 def clean_retail_product_name(name: str) -> str:
-    """Light OCR cleanup for Turkish retail product names (no invented brands)."""
+    """Light OCR cleanup for Turkish retail product names (generic typo fixes only)."""
     name = re.sub(r"\s+", " ", name).strip(" -*|")
-    # Strip glued VAT / SKU / brand suffixes from OCR
-    name = re.sub(r"(?:HOMEND|H0WEND|HOWEND).*$", "HOMEND", name, flags=re.I)
     name = re.sub(r"[%xX×]\s*\d{1,2}\s*$", "", name)
     name = re.sub(r"(?<=[A-Za-zÇĞİÖŞÜçğıöşü])\d{3,}H?\b", "", name)
     name = re.sub(r"\bSUPURGE\w*", "SÜPÜRGE", name, flags=re.I)
@@ -718,7 +716,6 @@ def clean_retail_product_name(name: str) -> str:
         (r"\bBILGI\b", "BİLGİ"),
         (r"\bFIS[Iİ]?\b", "FİŞİ"),
         (r"\bHAGAZACILIK\b", "MAGAZACILIK"),
-        (r"HOMENDX\d+$", "HOMEND"),
     )
     for pat, repl in fixes:
         name = re.sub(pat, repl, name, flags=re.I)
@@ -759,17 +756,17 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
     if out:
         return out
 
-    a101_re = re.compile(
+    retail_line_re = re.compile(
         rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{5,70}}?)"
         rf"(?:[%\s]*[xX]?(?P<vat>\d{{1,2}}))?\s+\*?\s*(?P<total>{_MONEY_TOKEN})\s*$",
         re.I,
     )
     skip = re.compile(
-        r"^(?:ARA\s*TOPLA[MH]|TOPLAM|TOPKDV|KDV|KRED[İI]?|AKBANK|Provizyon|Tutar|TARIH|"
-        r"BELGE|ETTN|A101|Mgz|FAT|USKUDAR|boynuz|hgz|Faturan|KREDL)",
+        r"^(?:ARA\s*TOPLA[MH]|TOPLAM|TOPKDV|KDV|KRED[İI]?|BANKA|Provizyon|Tutar|TARIH|"
+        r"BELGE|ETTN|Mgz|FAT|Faturan|KREDL|KASIYER|TERMINAL)",
         re.I,
     )
-    for i, m in enumerate(a101_re.finditer(text), start=1):
+    for i, m in enumerate(retail_line_re.finditer(text), start=1):
         name = m.group("name").strip()
         if skip.search(name):
             continue
@@ -965,13 +962,16 @@ def extract_supplier(text: str) -> Party:
         and not re.match(r"^(?:SUBE|ŞUBE)\s*:", ln.strip(), re.I)
         and not re.match(r"^M[ÜU][ŞS]TER", ln.strip(), re.I)
     ]
-    # Prefer a line that looks like a company title
+    # Prefer a line that looks like a company title (legal form / retail trade words)
     company = next(
         (
             ln
             for ln in lines
-            if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|T[İI]CARET|ANON[İI]M)", ln, re.I)
-            or re.search(r"BABYMALL|ÖZELCAN|MA[ĞG]AZA", ln, re.I)
+            if re.search(
+                r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|T[İI]CARET|ANON[İI]M|MA[ĞG]AZA)",
+                ln,
+                re.I,
+            )
         ),
         None,
     )
@@ -1019,7 +1019,7 @@ def extract_supplier(text: str) -> Party:
 
 def extract_customer(text: str) -> Party:
     party = empty_party()
-    # Thermal / POS prints often use "MÜŞTERİ: NAME"
+    # POS / fiş: "MÜŞTERİ: …" etiketi
     musteri = re.search(
         r"M[ÜU][ŞS]TER[İIÍ]\s*:\s*([A-ZÇĞİÖŞÜa-zçğıöşü .'\-]{3,80})",
         text,
@@ -1056,9 +1056,11 @@ def extract_customer(text: str) -> Party:
         if re.match(r"^(Web|E-?Posta|Tel|Vergi|VKN|TCKN|ETTN|S[ıi]ra|Mal|NOTLAR|Not:)", ln, re.I):
             break
         if re.search(
-            r"\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|No:|daire|sitesi|Ankara|İstanbul|Etimesgut|MAMAK)\b",
+            r"\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|Sok\.|No:|daire|sitesi|Apartman|Blok)\b",
             ln,
             re.I,
+        ) or re.search(r"\b\d{5}\b", ln) or re.search(
+            r"/\s*[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}", ln
         ):
             addr_parts.append(ln)
             continue
@@ -1423,55 +1425,60 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             profile = re.sub(r"[^A-Z0-9_]", "", profile.upper())
 
     supplier = extract_supplier(text)
-    # Retail supplier VKN: "Uşak VD 3830788224" / "USKUDAR/9480423762" (not Müşteri VKN)
+    # Retail: "… VD 1234567890" or "İLÇE/1234567890" — not "Müşteri VKN"
     musteri_vkn = first_match(text, r"M[uüu][sşs]teri\s+VKN\s*:?\s*(\d{10,11})")
     vd_vkn = first_match(text, r"(?:^|\n)[^\n]*\bVD\s*(\d{10})\b")
-    uskudar_vkn = first_match(text, r"USKUDAR\s*/\s*(\d{10})")
-    a101_vkn = first_match(text, r"A101[^\n]{0,40}?(\d{10})")
-    supplier_vkn = vd_vkn or uskudar_vkn or a101_vkn
+    district_vkn = first_match(
+        text,
+        r"(?:^|\n)\s*[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}(?:\s*/\s*|\s+)(\d{10})\b",
+    )
+    supplier_vkn = vd_vkn or district_vkn
     if supplier_vkn and supplier_vkn != (musteri_vkn or "")[:10]:
         supplier.taxId = supplier_vkn
         supplier.taxIdScheme = "VKN"
     elif not supplier.taxId and supplier_vkn:
         supplier.taxId = supplier_vkn
         supplier.taxIdScheme = "VKN"
-    # Prefer clean company titles
-    for cand in (
-        first_match(text, r"(A101\s+YEN[İI]\s+H?AGAZACILIK\s+A\.?\s*S\.?)"),
-        first_match(text, r"(EVPARK\s+MAGAZACILIK)"),
-    ):
-        if cand:
-            supplier.name = re.sub(r"\s+", " ", cand).strip()[:180]
-            break
-    if supplier.name and (
-        supplier.name.lower().startswith("hgz")
-        or "mgzkodu" in supplier.name.lower()
-        or len(supplier.name) < 4
-    ):
-        supplier.name = first_match(text, r"(A101\s+YEN[İI]\s+H?AGAZACILIK\s+A\.?\s*S\.?)") or supplier.name
+
     if supplier.name:
+        # OCR: common misspellings of MAGAZACILIK
         supplier.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
         supplier.name = re.sub(r"\bMA[ČĆ]AZACILIK\b", "MAGAZACILIK", supplier.name, flags=re.I)
-        # Drop OCR junk glued around A101 title
-        m = re.search(r"(A101\s+YEN[İI]\s+MAGAZACILIK\s+A\.?\s*S\.?)", supplier.name, re.I)
-        if m:
-            supplier.name = m.group(1)
-        # Babymall: drop address glued onto company title
-        if re.search(r"BABYMALL", supplier.name, re.I):
-            supplier.name = re.split(
-                r"\s+(?:YES[İI]?LOVA|YBSILOVA|CAD\.|ETIMES|MAH\.|PROF)",
-                supplier.name,
-                maxsplit=1,
-                flags=re.I,
-            )[0].strip()[:180]
+        # Drop address tokens glued onto company title (any issuer)
+        supplier.name = re.split(
+            r"\s+(?:MAH\.|CAD\.|SK\.|SOK\.|BULVAR|NO:|Kap[ıi]\s*No|PROF\.)",
+            supplier.name,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()[:180]
+        # Drop OCR junk prefixes (short codes) when a better MAGAZACILIK/A.Ş title exists later
+        if (
+            len(supplier.name) < 4
+            or "mgzkodu" in supplier.name.lower()
+            or re.match(r"^[a-z]{2,4}\d", supplier.name, re.I)
+        ):
+            better = first_match(
+                text,
+                r"((?:[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&-]{4,60}?)"
+                r"(?:MA[ĞG]AZACILIK|T[İI]CARET|SANAY[İI]).{0,40}?(?:A\.?\s*Ş\.?|LTD\.?\s*ŞT[İI]))",
+            )
+            if better:
+                supplier.name = re.sub(r"\s+", " ", better).strip()[:180]
 
     customer = extract_customer(text)
     if musteri_vkn:
         customer.taxId = musteri_vkn
         customer.taxIdScheme = "VKN" if len(musteri_vkn) == 10 else "TCKN"
-        if not customer.name or "EVPARK" in (customer.name or "").upper() or "sikoyet" in (customer.name or "").lower():
+        # Customer name wrongly filled with supplier / OCR junk
+        cn = (customer.name or "").upper()
+        sn = (supplier.name or "").upper()
+        if (
+            not customer.name
+            or (sn and sn[:12] and sn[:12] in cn)
+            or re.search(r"sikoyet|[şs]ikayet|www\.|http", customer.name or "", re.I)
+        ):
             customer.name = "Nihai Tüketici"
-    # Thermal/print: "MUSTERİ: MURAT SANCAR" on same line as address
+    # POS: "MÜŞTERİ: …" when name still missing
     if not customer.name or customer.name == "Nihai Tüketici":
         m = re.search(
             r"M[ÜU][ŞS]TER[İIÍ]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
@@ -1479,7 +1486,11 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             re.I,
         )
         if m:
-            cand = re.split(r"\s{2,}|Telefon|TC\b|E-?Mail|Vergi", m.group(1), maxsplit=1)[0].strip(" :.-")
+            cand = re.split(
+                r"\s{2,}|Telefon|TC\b|E-?Mail|Vergi|Mah\.|Cad\.",
+                m.group(1),
+                maxsplit=1,
+            )[0].strip(" :.-")
             if len(cand) >= 5 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
                 customer.name = cand[:80]
     if not customer.name:
@@ -1489,7 +1500,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         else:
             customer.name = "Nihai Tüketici"
 
-    # Drop thermal OCR junk lines when totals clearly don't match payable
+    # Drop OCR junk lines when totals clearly don't match payable
     if ocr_lines and payable:
         line_sum = sum(l.lineTotal or 0.0 for l in ocr_lines if l.lineTotal is not None)
         if line_sum > 0 and (line_sum / payable) < 0.45:
@@ -1536,7 +1547,7 @@ def _party_name_quality(name: str | None) -> int:
     if letters < 4:
         return 0
     score = letters
-    if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|MAGAZA|BABYMALL|A101|EVPARK)", n, re.I):
+    if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|MA[ĞG]AZA)", n, re.I):
         score += 20
     if re.search(r"Senaryo|Fatura\s*Tipi|==|^[#]+", n, re.I):
         score -= 30
@@ -1581,6 +1592,7 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
                 and "Senaryo" not in str(v)
                 and "Fatura" not in str(v)
                 and not re.search(r"^[#=\-]", str(v))
+                and not re.search(r"\b[a-z]{3,}\b", str(v))  # avoid OCR-lowercase junk replacing clean names
             ):
                 # Prefer cleaner shorter party name when quality is comparable
                 data[side][k] = v
