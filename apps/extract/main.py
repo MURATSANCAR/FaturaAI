@@ -276,8 +276,8 @@ def normalize_ocr_text(text: str) -> str:
         (r"\bTanible\b", "Tarihi"),
         (r"\bTartht\b", "Tarihi"),
         (r"\b[ÖO]DENECEKTUTAR\b", "ÖDENECEK TUTAR"),
-        (r"\bOdenecek\s*Tutar\b", "ÖDENECEK TUTAR"),
-        (r"\bOdenecek\s*Tuter\b", "ÖDENECEK TUTAR"),
+        (r"\b[ÖO]denecek\s*Tutar\b", "ÖDENECEK TUTAR"),
+        (r"\b[ÖO]denecek\s*Tuter\b", "ÖDENECEK TUTAR"),
         (r"\benecel\s*Tutar\b", "ÖDENECEK TUTAR"),
         (r"\bVergies?\s*Dald\s*Teglam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
         (r"\bVergiler\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
@@ -293,6 +293,8 @@ def normalize_ocr_text(text: str) -> str:
         (r"\beArgiv\b", "e-Arşiv"),
         (r"\be-?Arpiv\b", "e-Arşiv"),
         (r"\be-?Arglv\b", "e-Arşiv"),
+        (r"\bTEARET\b", "TICARET"),
+        (r"T[İI]CARET\s*A\.?\s*S\.?", "TICARET A.S."),
         (r"HAGAZACILIK", "MAGAZACILIK"),
         (r"MA[ČĆC]AZACILIK", "MAGAZACILIK"),
         (r"DA[ČĆC]IT[İI]M", "DAGITIM"),
@@ -2129,6 +2131,10 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             or first_match_money(text, rf"TOPKDV\s*\*\s*({_MONEY_TOKEN})")
             or first_match_money(text, rf"(?m)^KDV\s*\*\s*({_MONEY_TOKEN})")
         )
+    # Reject product-code fragments mistaken for KDV (e.g. 1.1502)
+    base_chk = payable or tax_inclusive
+    if vat is not None and base_chk and vat < 10 and base_chk > 100:
+        vat = None
     # Tax-inclusive retail: KDV amount sits between iskonto and vergi dahil without a label
     if (vat is None or vat == 0) and (payable or tax_inclusive):
         base = payable or tax_inclusive or 0
@@ -2149,7 +2155,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 best = min(cands, key=lambda a: abs(a - target))
                 if abs(best - target) <= max(2.0, base * 0.02):
                     vat = best
-        if (vat is None or vat == 0) and re.search(r"%\s*20", text) and base > 0:
+        if (vat is None or vat == 0) and re.search(r"%\s*20|KDV\s*%?\s*20", text) and base > 0:
             # Last resort for KDV-dahil totals
             vat = round(base * 20 / 120, 2)
     if vat is None and ocr_lines:
