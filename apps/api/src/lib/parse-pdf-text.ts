@@ -361,6 +361,59 @@ function labeledAmount(text: string, label: string): number | null {
   return parseTrMoney(matches[matches.length - 1][1]);
 }
 
+/** Sum repeating amount rows (multi-rate KDV / tevkifat etc.). */
+function sumLabeledAmounts(text: string, label: string): number | null {
+  const re = new RegExp(
+    `${label}(?:\\s*\\([^)]*\\))?\\s*:?\\s*([\\d.\\s]+,\\d{2,})\\s*(?:TL|TRY)?`,
+    "gi",
+  );
+  const amounts = [...text.matchAll(re)]
+    .map((m) => parseTrMoney(m[1]))
+    .filter((n): n is number => n != null && n > 0);
+  if (amounts.length === 0) return null;
+  if (amounts.length === 1) return amounts[0];
+  return Number(amounts.reduce((a, b) => a + b, 0).toFixed(2));
+}
+
+/**
+ * Multi-rate VAT: "KDV (%10.00) 23,62" + "KDV (%20.00) 291,42".
+ * Also footnotes "Kdv Tutarı:23,62" when rate lines missing.
+ * Does not include KDV Matrahı / Tevkifat.
+ */
+function extractVatAmount(text: string): number | null {
+  const rateLineRe =
+    /(?:Hesaplanan\s+)?KDV(?!\s*(?:TEVK|Tevkifat|Matrah[ıi]?))(?:\s*\(\s*%?\s*[\d.,]+\s*%?\s*\))\s*:?\s*([\d.\s]+,\d{2,})/gi;
+  const rateAmounts = [...text.matchAll(rateLineRe)]
+    .map((m) => parseTrMoney(m[1]))
+    .filter((n): n is number => n != null && n > 0);
+  if (rateAmounts.length > 0) {
+    return Number(rateAmounts.reduce((a, b) => a + b, 0).toFixed(2));
+  }
+
+  // Footnotes: "%10 Kdv Matrahı:... Kdv Tutarı:23,62 TRY"
+  const footnoteRe = /Kdv\s*Tutar[ıi]\s*:?\s*([\d.\s]+,\d{2,})/gi;
+  const footnotes = [...text.matchAll(footnoteRe)]
+    .map((m) => parseTrMoney(m[1]))
+    .filter((n): n is number => n != null && n > 0);
+  if (footnotes.length > 0) {
+    // Dedupe identical pairs that repeat (totals + note)
+    const unique = [...new Set(footnotes.map((n) => n.toFixed(2)))].map(Number);
+    return Number(unique.reduce((a, b) => a + b, 0).toFixed(2));
+  }
+
+  return (
+    labeledAmount(text, "Hesaplanan KDV(?!\\s*Tevkifat)") ??
+    labeledAmount(text, "KDV(?!\\s*(?:TEVK|Tevkifat|Matrah))")
+  );
+}
+
+/** Multi-rate withholding: sum all "Hesaplanan KDV Tevkifat (...)" rows. */
+function extractWithholdingVatAmount(text: string): number | null {
+  const summed = sumLabeledAmounts(text, "Hesaplanan KDV Tevkifat");
+  if (summed != null) return summed;
+  return labeledAmount(text, "KDV Tevkifat");
+}
+
 export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const normalized = text.replace(/\u000c/g, "\n");
 
@@ -473,10 +526,8 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     totals: {
       lineExtensionAmount,
       discountTotal,
-      withholdingVatAmount: labeledAmount(normalized, "Hesaplanan KDV Tevkifat"),
-      vatAmount:
-        labeledAmount(normalized, "Hesaplanan KDV(?!\\s*Tevkifat)") ??
-        labeledAmount(normalized, "KDV"),
+      withholdingVatAmount: extractWithholdingVatAmount(normalized),
+      vatAmount: extractVatAmount(normalized),
       taxInclusiveAmount:
         labeledAmount(normalized, "Vergiler Dahil Toplam Tutar") ??
         labeledAmount(normalized, "VERG[İI] DAH[İI]L TOPLAM TUTAR"),

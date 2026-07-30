@@ -1,0 +1,59 @@
+                                                                                                                                  Sayfa 1 / 1
+ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC
+VE SAN.AŞ.
+
+YEŞİLOVA MAH.PROF.DR.NECMETTİN ERBAKAN CAD.B
+BLOK NO:22 BA
+ ETİMESGUT ANKARA
+Tel:
+Fax:
+Vergi Dairesi: ETİMESGUT
+VKN: 6860425412
+TICARETSICILNO:                                                 e-Arşiv Fatura
+MERSISNO:
+Mersis No:
+
+SAYIN
+MURAT SANCAR
+
+ETİMESGUT/ANKARA
+Tel: 5395997107 Fax:                                                                                Özelleştirme No       TR1.2
+Vergi Dairesi: TC                                                                                   Senaryo               EARSIVFATURA
+VKN/TCKN: 11111111111                                                                               Fatura Tipi           SATIS
+                                                                                                    Fatura No             BBE2026000016055
+                                                                                                    Fatura Tarihi         01-07-2026
+                                                                                                    Düzenleme Tarihi      01-07-2026
+                                                                                                    Düzenleme Zamanı      13:09:47
+
+ETTN: 9A83A51C-3066-4A20-A5DA-61F12134D0F7
+
+Sıra                                                                                                                Vergi    Mal Hizmet
+     Mal/Hizmet Tanımı                                                 Miktar Birim Fiyat       İskonto Tutarı
+No                                                                                                                  Oranları Tutarı
+      GZN-3942 - 8683735960270 - Gezenbebe Araba İçi Bebek
+1                                                                          1,0 2.241,6700 TRY          784,58 TRY    %20.00     1.457,08 TRY
+     Aynası
+      KDB-54334-AST - 7952583054334 - Kidboo Müslin Örtü
+2                                                                          1,0   118,0900 TRY            0,00 TRY    %10.00      118,09 TRY
+     Asortili // Asortili // Asortili
+      KDB-54334-AST - 7952583054334 - Kidboo Müslin Örtü
+3                                                                          1,0   118,0900 TRY            0,00 TRY    %10.00      118,09 TRY
+     Asortili // Asortili // Asortili
+
+Taşıyan Bilgileri
+                                                                                     NET TOPLAM                                2.477,85 TRY
+                                                                                     TOPLAM İSKONTO                              784,58 TRY
+                                                                                     KDV (%10.00)                                 23,62 TRY
+                                                                                     KDV (%20.00)                                291,42 TRY
+                                                                                     VERGİ DAHİL TOPLAM TUTAR                  2.008,31 TRY
+                                                                                     ÖDENECEK TUTAR                            2.008,31 TRY
+Ödeme Şekli:
+
+YALNIZ : İKİBİNSEKİZ TRYOTUZBİR KURUS
+%10 Kdv Matrahı:236,18 TRY Kdv Tutarı:23,62 TRY
+%20 Kdv Matrahı:1.457,08 TRY Kdv Tutarı:291,42 TRY
+Stok Belge ID:2566958
+Alınan Ödemeler:
+Kuveyt Türk (TEK) - 2.008,30 TRY
+E-Arşiv izni kapsamında eletronik ortamda iletilmiştir. İrsaliye yerine geçer.
+

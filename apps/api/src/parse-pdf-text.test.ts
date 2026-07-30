@@ -159,4 +159,18 @@ describe("parseGibPdfText — Babymall TRY samples", () => {
     assert.ok(nearlyEqual(inv.totals.payableAmount ?? 0, 59.9));
     assert.deepEqual(validateInvoice(inv), []);
   });
+
+  it("reads 3.pdf multi-rate KDV (%10 + %20)", () => {
+    const text = readFileSync(join(root, "samples/babymall-3.pdftotext.txt"), "utf8");
+    const inv = parseGibPdfText(text, "3.pdf");
+    assert.equal(inv.invoiceNumber, "BBE2026000016055");
+    assert.equal(inv.lines.length, 3);
+    assert.ok(nearlyEqual(inv.totals.discountTotal ?? 0, 784.58));
+    assert.ok(nearlyEqual(inv.totals.lineExtensionAmount ?? 0, 1693.27));
+    // Must sum both KDV rows: 23.62 + 291.42 = 315.04
+    assert.ok(nearlyEqual(inv.totals.vatAmount ?? 0, 315.04));
+    assert.ok(nearlyEqual(inv.totals.taxInclusiveAmount ?? 0, 2008.31));
+    assert.ok(nearlyEqual(inv.totals.payableAmount ?? 0, 2008.31));
+    assert.deepEqual(validateInvoice(inv), []);
+  });
 });

@@ -348,6 +348,51 @@ def labeled_amount(text: str, label: str) -> float | None:
     return None
 
 
+def sum_labeled_amounts(text: str, label: str) -> float | None:
+    re_ = re.compile(
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?([\d.\s]+,\d{{2,}})\s*(?:TL|TRY)?",
+        re.I,
+    )
+    amounts = [parse_tr_money(m.group(1)) for m in re_.finditer(text)]
+    amounts = [a for a in amounts if a is not None and a > 0]
+    if not amounts:
+        return None
+    if len(amounts) == 1:
+        return amounts[0]
+    return round(sum(amounts), 2)
+
+
+def extract_vat_amount(text: str) -> float | None:
+    """Sum multi-rate KDV rows: KDV (%10) + KDV (%20)."""
+    rate_re = re.compile(
+        r"(?:Hesaplanan\s+)?KDV(?!\s*(?:TEVK|Tevkifat|Matrah[ıi]?))"
+        r"(?:\s*\(\s*%?\s*[\d.,]+\s*%?\s*\))\s*:?\s*([\d.\s]+,\d{2,})",
+        re.I,
+    )
+    rate_amounts = [parse_tr_money(m.group(1)) for m in rate_re.finditer(text)]
+    rate_amounts = [a for a in rate_amounts if a is not None and a > 0]
+    if rate_amounts:
+        return round(sum(rate_amounts), 2)
+
+    footnote_re = re.compile(r"Kdv\s*Tutar[ıi]\s*:?\s*([\d.\s]+,\d{2,})", re.I)
+    footnotes = [parse_tr_money(m.group(1)) for m in footnote_re.finditer(text)]
+    footnotes = [a for a in footnotes if a is not None and a > 0]
+    if footnotes:
+        unique = sorted({round(a, 2) for a in footnotes})
+        return round(sum(unique), 2)
+
+    return labeled_amount(text, r"Hesaplanan KDV(?!\s*Tevkifat)") or labeled_amount(
+        text, r"KDV(?!\s*(?:TEVK|Tevkifat|Matrah))"
+    )
+
+
+def extract_withholding_vat_amount(text: str) -> float | None:
+    summed = sum_labeled_amounts(text, "Hesaplanan KDV Tevkifat")
+    if summed is not None:
+        return summed
+    return labeled_amount(text, "KDV Tevkifat")
+
+
 def normalize_ocr_uuid(raw: str) -> str | None:
     """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, B→8)."""
     cleaned = raw.strip().upper()
@@ -734,9 +779,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         totals=Totals(
             lineExtensionAmount=line_ext,
             discountTotal=discount,
-            withholdingVatAmount=labeled_amount(text, "Hesaplanan KDV Tevkifat"),
-            vatAmount=labeled_amount(text, r"Hesaplanan KDV(?!\s*Tevkifat)")
-            or labeled_amount(text, "KDV"),
+            withholdingVatAmount=extract_withholding_vat_amount(text),
+            vatAmount=extract_vat_amount(text),
             taxInclusiveAmount=labeled_amount(text, "Vergiler Dahil Toplam Tutar")
             or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR"),
             payableAmount=payable,
