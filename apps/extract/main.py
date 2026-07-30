@@ -1267,11 +1267,16 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
             if len(digits) >= 6 and len(letters) <= 2:
                 junk += 2
             vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
-            if len(letters) >= 8 and vowels <= 1:
+            # Product SKUs (HP 146GB SAS…) are vowel-poor but valid
+            if (
+                len(letters) >= 10
+                and vowels <= 1
+                and not re.search(r"(?i)\b(?:HP|GB|SAS|SSD|NVMe|USB|CPU|RAM|LED)\b", n)
+            ):
                 junk += 1
             if (l.lineTotal or 0) >= 10 and len(letters) >= 4 and vowels >= 1:
                 useful += 1
-        if junk >= max(1, len(inv.lines) // 2):
+        if junk > useful and junk >= max(1, len(inv.lines) // 2):
             return False
         # Tiny "payable" while line OCR is UUID noise — not a real invoice total
         if payable < 20 and line_sum < 20:
