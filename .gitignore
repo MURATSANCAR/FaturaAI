@@ -6,3 +6,5 @@ dist
 .env.local
 apps/web/dist
 apps/api/dist
+
+fatura/
