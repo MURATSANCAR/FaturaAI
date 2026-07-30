@@ -1474,7 +1474,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     # Thermal/print: "MUSTERİ: MURAT SANCAR" on same line as address
     if not customer.name or customer.name == "Nihai Tüketici":
         m = re.search(
-            r"M[ÜU][ŞS]TER[İI]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
+            r"M[ÜU][ŞS]TER[İIÍ]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
             text,
             re.I,
         )
@@ -1492,13 +1492,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     # Drop thermal OCR junk lines when totals clearly don't match payable
     if ocr_lines and payable:
         line_sum = sum(l.lineTotal or 0.0 for l in ocr_lines if l.lineTotal is not None)
-        junk = 0
-        for l in ocr_lines:
-            letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", l.name or "")
-            vowels = len(re.findall(r"[aeıioöuüAEIİOÖUÜ]", letters))
-            if len(letters) >= 8 and vowels <= 2 and not re.search(r"BM-|HOMEND|BABYMALL|A101", l.name or "", re.I):
-                junk += 1
-        if line_sum > 0 and (line_sum / payable) < 0.4 and junk >= max(1, len(ocr_lines) // 2):
+        if line_sum > 0 and (line_sum / payable) < 0.45:
             ocr_lines = []
             lines_sum = None
 
@@ -1544,7 +1538,7 @@ def _party_name_quality(name: str | None) -> int:
     score = letters
     if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş|SANAY|TICARET|MAGAZA|BABYMALL|A101|EVPARK)", n, re.I):
         score += 20
-    if re.search(r"Senaryo|Fatura\s*Tipi|==", n, re.I):
+    if re.search(r"Senaryo|Fatura\s*Tipi|==|^[#]+", n, re.I):
         score -= 30
     return score
 
@@ -1573,16 +1567,24 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
                 continue
             if k != "name":
                 continue
+            # Never replace a real person/company with generic retail fallback
+            if re.search(r"Nihai\s+T[uü]ketici", str(v), re.I) and not re.search(
+                r"Nihai\s+T[uü]ketici", str(cur), re.I
+            ):
+                continue
             q_new, q_old = _party_name_quality(str(v)), _party_name_quality(str(cur))
-            if q_new > q_old:
+            if q_new > q_old + 3:
                 data[side][k] = v
             elif (
                 q_new >= max(8, q_old - 5)
                 and len(str(v)) < len(str(cur))
                 and "Senaryo" not in str(v)
                 and "Fatura" not in str(v)
+                and not re.search(r"^[#=\-]", str(v))
             ):
                 # Prefer cleaner shorter party name when quality is comparable
+                data[side][k] = v
+            elif q_old < 8 and q_new >= 8:
                 data[side][k] = v
     for k, v in over["totals"].items():
         if v is not None and data["totals"].get(k) is None:
@@ -1592,18 +1594,19 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
             return sum((l.get("lineTotal") or 0) for l in lines if isinstance(l, dict))
 
         pay = data["totals"].get("payableAmount") or over["totals"].get("payableAmount")
+        over_sum = _line_sum(over["lines"])
+        over_ok = bool(pay and over_sum and abs(over_sum - pay) / pay < 0.45)
         if not data["lines"]:
-            data["lines"] = over["lines"]
+            if over_ok or not pay:
+                data["lines"] = over["lines"]
         else:
             base_sum = _line_sum(data["lines"])
-            over_sum = _line_sum(over["lines"])
-            base_ok = pay and base_sum and abs(base_sum - pay) / pay < 0.35
-            over_ok = pay and over_sum and abs(over_sum - pay) / pay < 0.35
+            base_ok = bool(pay and base_sum and abs(base_sum - pay) / pay < 0.45)
             if over_ok and not base_ok:
                 data["lines"] = over["lines"]
-            elif over_ok == base_ok and len(over["lines"]) >= len(data["lines"]):
-                # Prefer names with more letters when counts equal
+            elif over_ok and base_ok and len(over["lines"]) >= len(data["lines"]):
                 data["lines"] = over["lines"]
+            # else keep base (do not import junk OCR lines)
     if over["notes"] and not data["notes"]:
         data["notes"] = over["notes"]
     return Invoice.model_validate(data)
