@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState, type ReactNode } from "react";
 import type { ExtractResult, InvoiceLine } from "./types";
 import { formatDate, formatMoney, formatSeconds } from "./types";
+import { sanitizePublicMessage } from "./lib/public-facing";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/fatura-api";
 /** How many jobs may be submitted & polling at once (feeds server workers). */
@@ -171,7 +172,7 @@ function InvoiceResult({
           <p className="font-semibold">Uyarılar</p>
           <ul className="mt-2 list-disc space-y-1 pl-5">
             {result.warnings.map((w) => (
-              <li key={w}>{w}</li>
+              <li key={w}>{sanitizePublicMessage(w)}</li>
             ))}
           </ul>
         </div>
@@ -511,7 +512,7 @@ export default function App() {
           patchItem(next.id, {
             status: "failed",
             progress: null,
-            error: created.warnings?.[0] ?? `HTTP ${create?.status ?? "?"}`,
+            error: sanitizePublicMessage(created.warnings?.[0] ?? `HTTP ${create?.status ?? "?"}`),
           });
           continue;
         }
@@ -574,7 +575,9 @@ export default function App() {
                 patchItem(job.id, {
                   status: "failed",
                   progress: null,
-                  error: body.warnings?.[0] ?? body.error ?? `HTTP ${res.status}`,
+                  error: sanitizePublicMessage(
+                    body.warnings?.[0] ?? body.error ?? `HTTP ${res.status}`,
+                  ),
                 });
                 return;
               }
@@ -598,7 +601,7 @@ export default function App() {
                   patchItem(job.id, {
                     status: "failed",
                     progress: null,
-                    error: body.error ?? "Okuma sonucu alınamadı",
+                    error: sanitizePublicMessage(body.error ?? "Okuma sonucu alınamadı"),
                   });
                   return;
                 }
@@ -606,7 +609,9 @@ export default function App() {
                   patchItem(job.id, {
                     status: "failed",
                     progress: null,
-                    error: body.error ?? body.result.warnings?.[0] ?? "Okuma başarısız",
+                    error: sanitizePublicMessage(
+                      body.error ?? body.result.warnings?.[0] ?? "Okuma başarısız",
+                    ),
                   });
                   return;
                 }
@@ -623,7 +628,7 @@ export default function App() {
               patchItem(job.id, {
                 status: "failed",
                 progress: null,
-                error: e instanceof Error ? e.message : String(e),
+                error: sanitizePublicMessage(e instanceof Error ? e.message : String(e)),
               });
             }
           }),

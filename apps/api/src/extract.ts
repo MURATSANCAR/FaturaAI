@@ -33,7 +33,7 @@ async function extractViaV2(
     noteV2();
     return {
       status: data.status,
-      method: data.method || "docling",
+      method: data.method || "nanobase-ai",
       durationMs: data.durationMs ?? 0,
       warnings: data.warnings ?? [],
       invoice: data.invoice,
@@ -267,11 +267,11 @@ async function extractInvoiceInternal(
   if (asImage) {
     return legacyResult(
       null,
-      "docling",
+      "nanobase-ai",
       Math.round(performance.now() - started),
       [
         v2?.warnings?.[0] ??
-          "Fotoğraf okuma servisi yanıt vermedi. PDF deneyin veya tekrar deneyin.",
+          "NanobaseAI fotoğrafı okuyamadı. PDF deneyin veya tekrar deneyin.",
       ],
       null,
     );
@@ -282,7 +282,7 @@ async function extractInvoiceInternal(
   } catch (err) {
     return legacyResult(
       null,
-      "pdf-text",
+      "nanobase-ai",
       Math.round(performance.now() - started),
       [err instanceof Error ? err.message : String(err)],
       null,
