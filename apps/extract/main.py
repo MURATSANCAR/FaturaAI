@@ -293,6 +293,7 @@ def normalize_ocr_text(text: str) -> str:
         (r"\beArgiv\b", "e-Arşiv"),
         (r"\be-?Arpiv\b", "e-Arşiv"),
         (r"\be-?Arglv\b", "e-Arşiv"),
+        (r"TEARETAS\.?", "TICARET A.S."),
         (r"\bTEARET\b", "TICARET"),
         (r"T[İI]CARET\s*A\.?\s*S\.?", "TICARET A.S."),
         (r"HAGAZACILIK", "MAGAZACILIK"),
@@ -1530,6 +1531,9 @@ def extract_supplier(text: str) -> Party:
         and not re.match(r"^M[ÜU][ŞS]TER", ln.strip(), re.I)
         and not re.match(r"^(?:PDF|XML)\s*indir", ln.strip(), re.I)
         and not re.match(r"^Page\s+\d+", ln.strip(), re.I)
+        and not re.match(r"^\d{1,2}:\d{2}\b", ln.strip())
+        and not re.match(r"^https?://", ln.strip(), re.I)
+        and not re.search(r"Nolu\s+.*Fatura|Detay\s*Ekran|edoksis", ln.strip(), re.I)
         and not _is_registry_or_chrome_line(ln.strip())
     ]
     # Explicit Satıcı: label (GİB / ERP layouts)
@@ -2155,7 +2159,9 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 best = min(cands, key=lambda a: abs(a - target))
                 if abs(best - target) <= max(2.0, base * 0.02):
                     vat = best
-        if (vat is None or vat == 0) and re.search(r"%\s*20|KDV\s*%?\s*20", text) and base > 0:
+        if (vat is None or vat == 0) and base > 0 and re.search(
+            r"%\s*20|KDV\s*%?\s*20|\b20\s*KD|\bKD[VİI]?\s*20", text, re.I
+        ):
             # Last resort for KDV-dahil totals
             vat = round(base * 20 / 120, 2)
     if vat is None and ocr_lines:
@@ -2195,6 +2201,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             line_ext = round(payable - vat, 2)
 
     # Reconcile: heal missed multi-rate VAT from lines/totals
+    if line_ext is None and tax_inclusive is not None and vat and vat > 0:
+        line_ext = round(tax_inclusive - vat, 2)
     if line_ext is not None and tax_inclusive is not None and tax_inclusive >= line_ext:
         implied = round(tax_inclusive - line_ext, 2)
         if nearly_equal(line_ext, tax_inclusive, 0.05) and vat and vat > 0.5:
