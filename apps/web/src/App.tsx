@@ -3,6 +3,9 @@ import type { ExtractResult, InvoiceLine } from "./types";
 import { formatDate, formatMoney, formatSeconds } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/fatura-api";
+/** Max parallel create+poll cycles — avoids browser ERR_INSUFFICIENT_RESOURCES and API 429. */
+const UPLOAD_CONCURRENCY = 4;
+const CREATE_MAX_ATTEMPTS = 12;
 
 type UploadItemStatus = "queued" | "uploading" | "reading" | "done" | "failed";
 
@@ -14,6 +17,12 @@ type UploadItem = {
   result: ExtractResult | null;
   error: string | null;
 };
+
+type PendingUpload = { id: string; file: File };
+
+function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
+}
 
 function Field({ label, value }: { label: string; value: ReactNode }) {
   return (
@@ -367,6 +376,8 @@ function createItemId() {
 export default function App() {
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const uploadQueueRef = useRef<PendingUpload[]>([]);
+  const activeUploadsRef = useRef(0);
   const [dragging, setDragging] = useState(false);
   const [items, setItems] = useState<UploadItem[]>([]);
   const [showRawIds, setShowRawIds] = useState<Record<string, boolean>>({});
@@ -383,7 +394,7 @@ export default function App() {
   const batchProgress =
     loading && items.length > 0
       ? activeCount > 0
-        ? `${doneCount + failedCount}/${items.length} tamam · ${activeCount} okunuyor…`
+        ? `${doneCount + failedCount}/${items.length} tamam · ${activeCount} işlemde (en fazla ${UPLOAD_CONCURRENCY} paralel)…`
         : "Okunuyor…"
       : null;
 
@@ -395,17 +406,35 @@ export default function App() {
     async (id: string, file: File) => {
       patchItem(id, { status: "uploading", progress: "Kuyruğa alınıyor…", error: null });
       try {
-        const form = new FormData();
-        form.append("file", file);
-        const create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
-        const created = (await create.json()) as {
+        let create: Response | null = null;
+        let created: {
           jobId?: string | null;
           status?: string;
           queuePosition?: number | null;
           warnings?: string[];
-        };
-        if (!create.ok || !created.jobId) {
-          throw new Error(created.warnings?.[0] ?? `HTTP ${create.status}`);
+        } = {};
+
+        for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++) {
+          const form = new FormData();
+          form.append("file", file);
+          create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+          created = (await create.json()) as typeof created;
+
+          if (create.status === 429 || create.status === 503) {
+            const retryAfter = Number(create.headers.get("Retry-After") || "2");
+            const waitMs = Math.min(30_000, Math.max(1, retryAfter) * 1000) + Math.random() * 400;
+            patchItem(id, {
+              status: "queued",
+              progress: `Sunucu meşgul, tekrar denenecek (${attempt}/${CREATE_MAX_ATTEMPTS})…`,
+            });
+            await sleep(waitMs);
+            continue;
+          }
+          break;
+        }
+
+        if (!create || !create.ok || !created.jobId) {
+          throw new Error(created.warnings?.[0] ?? `HTTP ${create?.status ?? "?"}`);
         }
 
         const jobId = created.jobId;
@@ -420,7 +449,7 @@ export default function App() {
 
         const started = Date.now();
         while (Date.now() - started < 180_000) {
-          await new Promise((r) => setTimeout(r, 700));
+          await sleep(700);
           const res = await fetch(`${API_BASE}/jobs/${jobId}`);
           const job = (await res.json()) as {
             status: string;
@@ -474,6 +503,18 @@ export default function App() {
     [patchItem],
   );
 
+  const pumpUploads = useCallback(() => {
+    while (activeUploadsRef.current < UPLOAD_CONCURRENCY && uploadQueueRef.current.length > 0) {
+      const next = uploadQueueRef.current.shift();
+      if (!next) break;
+      activeUploadsRef.current += 1;
+      void uploadOne(next.id, next.file).finally(() => {
+        activeUploadsRef.current -= 1;
+        pumpUploads();
+      });
+    }
+  }, [uploadOne]);
+
   const onFiles = useCallback(
     (files: FileList | null) => {
       if (!files || files.length === 0) return;
@@ -494,13 +535,15 @@ export default function App() {
 
       setItems((prev) => [...prev, ...batch.map((b) => b.item)]);
       for (const { file, item } of batch) {
-        void uploadOne(item.id, file);
+        uploadQueueRef.current.push({ id: item.id, file });
       }
+      pumpUploads();
     },
-    [uploadOne],
+    [pumpUploads],
   );
 
   const clearAll = () => {
+    uploadQueueRef.current = [];
     setItems([]);
     setShowRawIds({});
   };
