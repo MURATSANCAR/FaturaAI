@@ -47,27 +47,22 @@ function extractSupplier(text: string): InvoiceParty {
 
   const lines = head
     .split("\n")
-    .map((l) => l.trim())
+    .map((l) => l.replace(/^#+\s*/, "").trim())
     .filter(Boolean)
     .filter((l) => !/^e-?Ar[sş]iv\s+Fatura$/i.test(l))
-    .filter((l) => !/^Sayfa\s+\d+/i.test(l))
-    .map((l) => l.replace(/^#+\s*/, "").trim())
-    .filter(Boolean);
+    .filter((l) => !/^Sayfa\s+\d+/i.test(l));
 
-  const companyIdx = lines.findIndex(
-    (ln) =>
-      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M|Ş[İI]RKET)/i.test(ln) &&
-      !/^(?:Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kurumsal\s+Ofis|Adres)/i.test(ln) &&
-      !/Mahallesi|Cadde(?:si)?|Bulvar/i.test(ln),
-  );
-  if (companyIdx >= 0) {
-    party.name = lines[companyIdx].slice(0, 180);
-  } else if (lines[0] && !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Kurumsal\s+Ofis)/i.test(lines[0])) {
+  if (
+    lines[0] &&
+    !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Kurumsal\s+Ofis)/i.test(lines[0])
+  ) {
     let name = lines[0];
     if (
       lines[1] &&
-      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M)/i.test(lines[1]) &&
-      !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)/i.test(lines[1])
+      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M|VE\s+SAN)/i.test(lines[1]) &&
+      !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE|Kurumsal\s+Ofis)/i.test(lines[1]) &&
+      // continuation legal-form line, not a full second company
+      (lines[1].length < 40 || /^(VE\s+)?(?:SAN|T[İI]C|LTD|TA[ŞS])/i.test(lines[1]))
     ) {
       name = `${lines[0]} ${lines[1]}`;
     }
@@ -75,12 +70,12 @@ function extractSupplier(text: string): InvoiceParty {
   }
 
   const addrParts: string[] = [];
-  for (const line of lines.slice(companyIdx >= 0 ? companyIdx + 1 : 1)) {
+  for (const line of lines.slice(1)) {
     if (/^(Tel|Web|E-Posta|Vergi|TCKN|VKN)\b/i.test(line)) break;
     if (
       /^Kurumsal\s+Ofis/i.test(line) ||
       /Kap[ıi]\s*No/i.test(line) ||
-      /Türkiye|mah\.|Mahallesi|Cad\.|Cadde|Bul\.|Bulvar/i.test(line) ||
+      /Türkiye|mah\.|Mahallesi|Cad\.|Bul\./i.test(line) ||
       /\/\s*\w+/.test(line)
     ) {
       addrParts.push(line.replace(/^Kap[ıi]\s*No:\s*/i, "Kapı No: "));
@@ -278,6 +273,8 @@ function collectWrappedLineName(
       break;
     }
     if (!isLineContinuation(rawLines[j])) break;
+    // Continuation immediately before the next line-item belongs to that next item
+    if (j + 1 < rawLines.length && isNewLineItemRow(rawLines[j + 1])) break;
     parts.push(rawLines[j].trim());
   }
   const name = parts.join(" ").replace(/\s+/g, " ").trim();
