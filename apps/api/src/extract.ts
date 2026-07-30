@@ -2,6 +2,7 @@ import { extractEmbeddedUblXml, extractPdfText } from "./lib/pdf.js";
 import { parseGibPdfText, validateInvoice } from "./lib/parse-pdf-text.js";
 import { parseUblInvoice } from "./lib/parse-ubl.js";
 import { noteFastPath, noteV2 } from "./lib/metrics.js";
+import { toPublicExtractResult } from "./lib/public-facing.js";
 import type { ExtractResult, ParsedInvoice } from "./types.js";
 
 const EXTRACT_V2_URL = process.env.EXTRACT_V2_URL ?? "http://127.0.0.1:8106";
@@ -184,11 +185,18 @@ export async function extractInvoice(
   buffer: Buffer,
   fileName: string,
 ): Promise<ExtractResult> {
+  return toPublicExtractResult(await extractInvoiceInternal(buffer, fileName));
+}
+
+async function extractInvoiceInternal(
+  buffer: Buffer,
+  fileName: string,
+): Promise<ExtractResult> {
   const started = performance.now();
   const name = normalizeUploadName(buffer, fileName);
   const asImage = isImageFileName(name) || Boolean(sniffImageExt(buffer));
 
-  // PDF fast-path: local pdftotext/UBL before expensive Docling
+  // PDF fast-path: local text/UBL before heavy vision pipeline
   if (!asImage && PDF_FAST_PATH) {
     try {
       const fast = await extractLegacyPdf(buffer, name, started);

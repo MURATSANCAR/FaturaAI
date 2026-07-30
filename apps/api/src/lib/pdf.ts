@@ -26,7 +26,7 @@ function runPdftotext(pdfPath: string): Promise<string> {
     child.on("error", (err) => {
       reject(
         new Error(
-          `pdftotext bulunamadı. poppler-utils kurulu olmalı: ${err.message}`,
+          "NanobaseAI PDF okuma bileşeni hazır değil. Lütfen daha sonra tekrar deneyin.",
         ),
       );
     });
@@ -34,7 +34,7 @@ function runPdftotext(pdfPath: string): Promise<string> {
       if (code !== 0) {
         reject(
           new Error(
-            `pdftotext failed (${code}): ${Buffer.concat(errChunks).toString("utf8")}`,
+            "NanobaseAI PDF metin çıkarma başarısız oldu. Dosyayı kontrol edip tekrar deneyin.",
           ),
         );
         return;
