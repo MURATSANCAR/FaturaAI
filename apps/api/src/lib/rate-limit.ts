@@ -3,8 +3,8 @@ type Bucket = { tokens: number; updatedAt: number };
 const buckets = new Map<string, Bucket>();
 
 /** Defaults support bulk portal uploads; override via env in production if needed. */
-const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN ?? 600);
-const RATE_LIMIT_BURST = Number(process.env.RATE_LIMIT_BURST ?? 80);
+const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN ?? 1200);
+const RATE_LIMIT_BURST = Number(process.env.RATE_LIMIT_BURST ?? 120);
 
 export function takeRateToken(key: string): { ok: boolean; retryAfterSec: number } {
   const now = Date.now();

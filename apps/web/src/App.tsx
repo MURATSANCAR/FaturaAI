@@ -3,11 +3,18 @@ import type { ExtractResult, InvoiceLine } from "./types";
 import { formatDate, formatMoney, formatSeconds } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/fatura-api";
-/** Max parallel create+poll cycles — avoids browser ERR_INSUFFICIENT_RESOURCES and API 429. */
-const UPLOAD_CONCURRENCY = 3;
-/** Pace POSTs so we stay under API token-bucket (~600/min with burst). */
-const CREATE_MIN_INTERVAL_MS = 200;
-const CREATE_MAX_ATTEMPTS = 40;
+/** How many jobs may be submitted & polling at once (feeds server workers). */
+const MAX_ACTIVE_JOBS = 12;
+/** Space POSTs; production was ~120/min — stay safely under even before API redeploy. */
+const CREATE_MIN_INTERVAL_MS = 600;
+const CREATE_MAX_ATTEMPTS = 60;
+const POLL_INTERVAL_MS = 1200;
+const UI_FLUSH_MS = 500;
+/** Per-job wait after create (server may queue behind others). */
+const JOB_WAIT_MS = 15 * 60_000;
+/** Above this, skip full invoice cards — list + summary only. */
+const DETAIL_CARD_LIMIT = 30;
+const LIST_ROW_LIMIT = 80;
 
 type UploadItemStatus = "queued" | "uploading" | "reading" | "done" | "failed";
 
@@ -22,8 +29,19 @@ type UploadItem = {
 
 type PendingUpload = { id: string; file: File };
 
+type ActiveJob = {
+  id: string;
+  jobId: string;
+  startedAt: number;
+};
+
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
+}
+
+function slimResult(result: ExtractResult): ExtractResult {
+  if (!result.rawTextPreview) return result;
+  return { ...result, rawTextPreview: null };
 }
 
 function Field({ label, value }: { label: string; value: ReactNode }) {
@@ -378,194 +396,310 @@ function createItemId() {
 export default function App() {
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
-  const uploadQueueRef = useRef<PendingUpload[]>([]);
-  const activeUploadsRef = useRef(0);
+  const pendingRef = useRef<PendingUpload[]>([]);
+  const activeJobsRef = useRef<Map<string, ActiveJob>>(new Map());
+  const itemsRef = useRef<Map<string, UploadItem>>(new Map());
+  const itemOrderRef = useRef<string[]>([]);
+  const creatingRef = useRef(false);
+  const pollingRef = useRef(false);
+  const stoppedRef = useRef(false);
   const lastCreateAtRef = useRef(0);
   const createLockRef = useRef(Promise.resolve());
+  const uiFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [dragging, setDragging] = useState(false);
   const [items, setItems] = useState<UploadItem[]>([]);
   const [showRawIds, setShowRawIds] = useState<Record<string, boolean>>({});
 
-  const loading = items.some(
-    (item) =>
-      item.status === "queued" ||
-      item.status === "uploading" ||
-      item.status === "reading",
-  );
   const doneCount = items.filter((item) => item.status === "done").length;
   const failedCount = items.filter((item) => item.status === "failed").length;
   const activeCount = items.length - doneCount - failedCount;
+  const loading = activeCount > 0;
+  const bulkMode = items.length > DETAIL_CARD_LIMIT;
   const batchProgress =
     loading && items.length > 0
-      ? activeCount > 0
-        ? `${doneCount + failedCount}/${items.length} tamam · ${activeCount} işlemde (en fazla ${UPLOAD_CONCURRENCY} paralel)…`
-        : "Okunuyor…"
+      ? `${doneCount + failedCount}/${items.length} tamam · ${activeCount} işlemde (sunucuda en fazla ${MAX_ACTIVE_JOBS})`
       : null;
 
-  const patchItem = useCallback((id: string, patch: Partial<UploadItem>) => {
-    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  const flushItemsToState = useCallback(() => {
+    setItems(itemOrderRef.current.map((id) => itemsRef.current.get(id)!).filter(Boolean));
   }, []);
 
-  const uploadOne = useCallback(
-    async (id: string, file: File) => {
-      patchItem(id, { status: "uploading", progress: "Kuyruğa alınıyor…", error: null });
-      try {
+  const scheduleFlush = useCallback(() => {
+    if (uiFlushTimerRef.current) return;
+    uiFlushTimerRef.current = setTimeout(() => {
+      uiFlushTimerRef.current = null;
+      flushItemsToState();
+    }, UI_FLUSH_MS);
+  }, [flushItemsToState]);
+
+  const patchItem = useCallback(
+    (id: string, patch: Partial<UploadItem>) => {
+      const prev = itemsRef.current.get(id);
+      if (!prev) return;
+      itemsRef.current.set(id, { ...prev, ...patch });
+      scheduleFlush();
+    },
+    [scheduleFlush],
+  );
+
+  const postJob = useCallback(async (file: File): Promise<Response> => {
+    const form = new FormData();
+    form.append("file", file);
+    const prev = createLockRef.current;
+    let release!: () => void;
+    createLockRef.current = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    try {
+      const wait = Math.max(0, lastCreateAtRef.current + CREATE_MIN_INTERVAL_MS - Date.now());
+      if (wait > 0) await sleep(wait);
+      lastCreateAtRef.current = Date.now();
+      return await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+    } finally {
+      release();
+    }
+  }, []);
+
+  const pumpCreates = useCallback(async () => {
+    if (creatingRef.current || stoppedRef.current) return;
+    creatingRef.current = true;
+    try {
+      while (
+        !stoppedRef.current &&
+        pendingRef.current.length > 0 &&
+        activeJobsRef.current.size < MAX_ACTIVE_JOBS
+      ) {
+        const next = pendingRef.current.shift();
+        if (!next) break;
+        patchItem(next.id, {
+          status: "uploading",
+          progress: "Kuyruğa alınıyor…",
+          error: null,
+        });
+
         let create: Response | null = null;
         let created: {
           jobId?: string | null;
-          status?: string;
           queuePosition?: number | null;
           warnings?: string[];
         } = {};
+        let ok = false;
 
         for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++) {
-          const form = new FormData();
-          form.append("file", file);
-
-          const prev = createLockRef.current;
-          let release!: () => void;
-          createLockRef.current = new Promise<void>((r) => {
-            release = r;
-          });
-          await prev;
-          try {
-            const wait = Math.max(0, lastCreateAtRef.current + CREATE_MIN_INTERVAL_MS - Date.now());
-            if (wait > 0) await sleep(wait);
-            lastCreateAtRef.current = Date.now();
-            create = await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
-          } finally {
-            release();
-          }
+          if (stoppedRef.current) return;
+          create = await postJob(next.file);
           created = (await create.json()) as typeof created;
-
           if (create.status === 429 || create.status === 503) {
             const retryAfter = Number(create.headers.get("Retry-After") || "3");
             const waitMs =
-              Math.min(45_000, Math.max(2, retryAfter) * 1000) + attempt * 250 + Math.random() * 500;
-            patchItem(id, {
+              Math.min(60_000, Math.max(2, retryAfter) * 1000) +
+              attempt * 200 +
+              Math.random() * 400;
+            patchItem(next.id, {
               status: "queued",
-              progress: `Rate limit — ${Math.ceil(waitMs / 1000)} sn sonra tekrar (${attempt}/${CREATE_MAX_ATTEMPTS})…`,
+              progress: `Bekleniyor ${Math.ceil(waitMs / 1000)} sn (${attempt}/${CREATE_MAX_ATTEMPTS})…`,
             });
             await sleep(waitMs);
             continue;
           }
+          ok = Boolean(create.ok && created.jobId);
           break;
         }
 
-        if (!create || !create.ok || !created.jobId) {
-          throw new Error(created.warnings?.[0] ?? `HTTP ${create?.status ?? "?"}`);
-        }
-
-        const jobId = created.jobId;
-        if (created.queuePosition && created.queuePosition > 1) {
-          patchItem(id, {
-            status: "queued",
-            progress: `Sırada (#${created.queuePosition})…`,
+        if (!ok || !created.jobId) {
+          patchItem(next.id, {
+            status: "failed",
+            progress: null,
+            error: created.warnings?.[0] ?? `HTTP ${create?.status ?? "?"}`,
           });
-        } else {
-          patchItem(id, { status: "reading", progress: "Okunuyor…" });
+          continue;
         }
 
-        const started = Date.now();
-        while (Date.now() - started < 180_000) {
-          await sleep(700);
-          const res = await fetch(`${API_BASE}/jobs/${jobId}`);
-          const job = (await res.json()) as {
-            status: string;
-            queuePosition?: number | null;
-            result?: ExtractResult | null;
-            error?: string | null;
-            warnings?: string[];
-          };
-          if (!res.ok) {
-            throw new Error(job.warnings?.[0] ?? job.error ?? `HTTP ${res.status}`);
-          }
-          if (job.status === "queued") {
-            patchItem(id, {
-              status: "queued",
-              progress:
-                job.queuePosition && job.queuePosition > 1
-                  ? `Sırada (#${job.queuePosition})…`
-                  : "Sırada…",
-            });
-            continue;
-          }
-          if (job.status === "running") {
-            patchItem(id, { status: "reading", progress: "Okunuyor…" });
-            continue;
-          }
-          if (job.status === "done" || job.status === "failed") {
-            if (!job.result) {
-              throw new Error(job.error ?? "Okuma sonucu alınamadı");
-            }
-            if (job.status === "failed" && !job.result.invoice) {
-              throw new Error(job.error ?? job.result.warnings?.[0] ?? "Okuma başarısız");
-            }
-            patchItem(id, {
-              status: "done",
-              progress: null,
-              result: job.result,
-              error: null,
-            });
-            return;
-          }
-        }
-        throw new Error("Okuma zaman aşımına uğradı");
-      } catch (e) {
-        patchItem(id, {
-          status: "failed",
-          progress: null,
-          error: e instanceof Error ? e.message : String(e),
+        activeJobsRef.current.set(next.id, {
+          id: next.id,
+          jobId: created.jobId,
+          startedAt: Date.now(),
+        });
+        patchItem(next.id, {
+          status:
+            created.queuePosition && created.queuePosition > 1 ? "queued" : "reading",
+          progress:
+            created.queuePosition && created.queuePosition > 1
+              ? `Sırada (#${created.queuePosition})…`
+              : "Okunuyor…",
         });
       }
-    },
-    [patchItem],
-  );
-
-  const pumpUploads = useCallback(() => {
-    while (activeUploadsRef.current < UPLOAD_CONCURRENCY && uploadQueueRef.current.length > 0) {
-      const next = uploadQueueRef.current.shift();
-      if (!next) break;
-      activeUploadsRef.current += 1;
-      void uploadOne(next.id, next.file).finally(() => {
-        activeUploadsRef.current -= 1;
-        pumpUploads();
-      });
+    } finally {
+      creatingRef.current = false;
     }
-  }, [uploadOne]);
+  }, [patchItem, postJob]);
+
+  const pumpPolls = useCallback(async () => {
+    if (pollingRef.current || stoppedRef.current) return;
+    pollingRef.current = true;
+    try {
+      await pumpCreates();
+      while (
+        !stoppedRef.current &&
+        (activeJobsRef.current.size > 0 || pendingRef.current.length > 0)
+      ) {
+        if (activeJobsRef.current.size === 0) {
+          await pumpCreates();
+          if (activeJobsRef.current.size === 0) break;
+        }
+        const entries = [...activeJobsRef.current.values()];
+        await Promise.all(
+          entries.map(async (job) => {
+            try {
+              if (Date.now() - job.startedAt > JOB_WAIT_MS) {
+                activeJobsRef.current.delete(job.id);
+                patchItem(job.id, {
+                  status: "failed",
+                  progress: null,
+                  error: "Okuma zaman aşımına uğradı",
+                });
+                return;
+              }
+              const res = await fetch(`${API_BASE}/jobs/${job.jobId}`);
+              const body = (await res.json()) as {
+                status: string;
+                queuePosition?: number | null;
+                result?: ExtractResult | null;
+                error?: string | null;
+                warnings?: string[];
+              };
+              if (!res.ok) {
+                activeJobsRef.current.delete(job.id);
+                patchItem(job.id, {
+                  status: "failed",
+                  progress: null,
+                  error: body.warnings?.[0] ?? body.error ?? `HTTP ${res.status}`,
+                });
+                return;
+              }
+              if (body.status === "queued") {
+                patchItem(job.id, {
+                  status: "queued",
+                  progress:
+                    body.queuePosition && body.queuePosition > 1
+                      ? `Sırada (#${body.queuePosition})…`
+                      : "Sırada…",
+                });
+                return;
+              }
+              if (body.status === "running") {
+                patchItem(job.id, { status: "reading", progress: "Okunuyor…" });
+                return;
+              }
+              if (body.status === "done" || body.status === "failed") {
+                activeJobsRef.current.delete(job.id);
+                if (!body.result) {
+                  patchItem(job.id, {
+                    status: "failed",
+                    progress: null,
+                    error: body.error ?? "Okuma sonucu alınamadı",
+                  });
+                  return;
+                }
+                if (body.status === "failed" && !body.result.invoice) {
+                  patchItem(job.id, {
+                    status: "failed",
+                    progress: null,
+                    error: body.error ?? body.result.warnings?.[0] ?? "Okuma başarısız",
+                  });
+                  return;
+                }
+                const keepHeavy = itemOrderRef.current.length <= DETAIL_CARD_LIMIT;
+                patchItem(job.id, {
+                  status: "done",
+                  progress: null,
+                  result: keepHeavy ? body.result : slimResult(body.result),
+                  error: null,
+                });
+              }
+            } catch (e) {
+              activeJobsRef.current.delete(job.id);
+              patchItem(job.id, {
+                status: "failed",
+                progress: null,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }),
+        );
+        await pumpCreates();
+        if (activeJobsRef.current.size === 0 && pendingRef.current.length === 0) break;
+        await sleep(POLL_INTERVAL_MS);
+      }
+    } finally {
+      pollingRef.current = false;
+      if (
+        !stoppedRef.current &&
+        (activeJobsRef.current.size > 0 || pendingRef.current.length > 0)
+      ) {
+        void pumpPolls();
+      } else {
+        flushItemsToState();
+      }
+    }
+  }, [flushItemsToState, patchItem, pumpCreates]);
+
+  const startPipeline = useCallback(() => {
+    stoppedRef.current = false;
+    void pumpPolls();
+  }, [pumpPolls]);
 
   const onFiles = useCallback(
     (files: FileList | null) => {
       if (!files || files.length === 0) return;
-      const batch = Array.from(files).map((file) => {
+      const batch = Array.from(files);
+      for (const file of batch) {
         const id = createItemId();
-        return {
-          file,
-          item: {
-            id,
-            fileName: file.name,
-            status: "queued" as const,
-            progress: "Bekliyor…",
-            result: null,
-            error: null,
-          } satisfies UploadItem,
+        const item: UploadItem = {
+          id,
+          fileName: file.name,
+          status: "queued",
+          progress: "Bekliyor…",
+          result: null,
+          error: null,
         };
-      });
-
-      setItems((prev) => [...prev, ...batch.map((b) => b.item)]);
-      for (const { file, item } of batch) {
-        uploadQueueRef.current.push({ id: item.id, file });
+        itemsRef.current.set(id, item);
+        itemOrderRef.current.push(id);
+        pendingRef.current.push({ id, file });
       }
-      pumpUploads();
+      flushItemsToState();
+      startPipeline();
     },
-    [pumpUploads],
+    [flushItemsToState, startPipeline],
   );
 
   const clearAll = () => {
-    uploadQueueRef.current = [];
+    stoppedRef.current = true;
+    pendingRef.current = [];
+    activeJobsRef.current.clear();
+    itemsRef.current.clear();
+    itemOrderRef.current = [];
+    creatingRef.current = false;
+    pollingRef.current = false;
+    if (uiFlushTimerRef.current) {
+      clearTimeout(uiFlushTimerRef.current);
+      uiFlushTimerRef.current = null;
+    }
     setItems([]);
     setShowRawIds({});
   };
+
+  const listRows = (() => {
+    if (items.length <= LIST_ROW_LIMIT) return items;
+    const active = items.filter(
+      (i) => i.status === "queued" || i.status === "uploading" || i.status === "reading",
+    );
+    const failed = items.filter((i) => i.status === "failed");
+    const done = items.filter((i) => i.status === "done");
+    return [...active.slice(0, 40), ...failed.slice(0, 30), ...done.slice(-20)];
+  })();
+  const hiddenListCount = Math.max(0, items.length - listRows.length);
 
   return (
     <div className="mx-auto min-h-dvh max-w-6xl px-3 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(1.25rem,env(safe-area-inset-top))] sm:px-6 sm:py-8 lg:px-8">
@@ -647,10 +781,9 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary w-full sm:w-auto"
-                disabled={loading}
                 onClick={clearAll}
               >
-                Temizle
+                {loading ? "Durdur ve temizle" : "Temizle"}
               </button>
             )}
           </div>
@@ -695,8 +828,13 @@ export default function App() {
                 </p>
               )}
             </div>
-            <ul className="space-y-2">
-              {items.map((item) => (
+            {bulkMode && (
+              <p className="mb-2 px-1 text-left text-xs text-slate-500">
+                Toplu mod: tarayıcıyı yormamak için liste kısaltıldı; detay kartları gizlendi.
+              </p>
+            )}
+            <ul className="max-h-[28rem] space-y-2 overflow-y-auto">
+              {listRows.map((item) => (
                 <li
                   key={item.id}
                   className="flex items-start justify-between gap-3 rounded-2xl border border-white/70 bg-white/60 px-3.5 py-3 text-left"
@@ -729,11 +867,16 @@ export default function App() {
                 </li>
               ))}
             </ul>
+            {hiddenListCount > 0 && (
+              <p className="mt-2 px-1 text-xs text-slate-500">
+                +{hiddenListCount} dosya listede gizlendi (özet yukarıda)
+              </p>
+            )}
           </div>
         )}
       </section>
 
-      {items.some((item) => item.result || item.error) && (
+      {!bulkMode && items.some((item) => item.result || item.error) && (
         <div className="mt-5 space-y-8 sm:mt-6">
           {items.map((item) => {
             if (item.error && !item.result) {
@@ -759,6 +902,22 @@ export default function App() {
               />
             );
           })}
+        </div>
+      )}
+
+      {bulkMode && !loading && failedCount > 0 && (
+        <div className="glass mt-5 border-red-200/80 bg-red-50/70 p-4 text-sm text-red-800">
+          <p className="font-semibold">{failedCount} dosya başarısız</p>
+          <ul className="mt-2 max-h-48 list-disc space-y-1 overflow-y-auto pl-5">
+            {items
+              .filter((i) => i.status === "failed")
+              .slice(0, 50)
+              .map((i) => (
+                <li key={i.id}>
+                  {i.fileName}: {i.error}
+                </li>
+              ))}
+          </ul>
         </div>
       )}
 

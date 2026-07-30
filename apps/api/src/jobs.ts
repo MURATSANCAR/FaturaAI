@@ -24,7 +24,7 @@ type InternalJob = JobRecord & {
 };
 
 const MAX_INFLIGHT = Number(process.env.JOB_MAX_INFLIGHT ?? 8);
-const MAX_QUEUE = Number(process.env.JOB_MAX_QUEUE ?? 200);
+const MAX_QUEUE = Number(process.env.JOB_MAX_QUEUE ?? 2000);
 const JOB_TTL_MS = Number(process.env.JOB_TTL_MS ?? 30 * 60_000);
 const JOB_DIR = process.env.JOB_DIR ?? "/tmp/fatura-jobs";
 
