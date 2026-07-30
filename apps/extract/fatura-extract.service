@@ -9,6 +9,7 @@ WorkingDirectory=/data/nanobaseai/fatura/apps/extract
 Environment=PORT=8106
 Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
+Environment=FORCE_IMAGE_OCR=1
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/data/nanobaseai/fatura/apps/extract/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers 1

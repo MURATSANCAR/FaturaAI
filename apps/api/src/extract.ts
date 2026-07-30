@@ -75,27 +75,74 @@ function isImageFileName(fileName: string): boolean {
   return /\.(jpe?g|png|webp|heic|heif|tif|tiff|bmp)$/i.test(fileName);
 }
 
+function sniffImageExt(buffer: Buffer): string | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return ".jpg";
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return ".png";
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return ".webp";
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(4, 8).toString("ascii") === "ftyp"
+  ) {
+    const brand = buffer.subarray(8, 12).toString("ascii");
+    if (["heic", "heif", "mif1", "msf1", "heix", "heim"].includes(brand)) {
+      return ".heic";
+    }
+  }
+  return null;
+}
+
+function normalizeUploadName(buffer: Buffer, fileName: string): string {
+  if (/\.pdf$/i.test(fileName) || isImageFileName(fileName)) return fileName;
+  if (buffer.subarray(0, 4).toString("latin1") === "%PDF") {
+    return fileName.includes(".") ? fileName : "invoice.pdf";
+  }
+  const imgExt = sniffImageExt(buffer);
+  if (imgExt) {
+    const base = fileName.replace(/\.[^.]+$/, "") || "invoice";
+    return `${base}${imgExt}`;
+  }
+  return fileName;
+}
+
 export async function extractInvoice(
   buffer: Buffer,
   fileName: string,
 ): Promise<ExtractResult> {
   const started = performance.now();
+  const name = normalizeUploadName(buffer, fileName);
+  const asImage = isImageFileName(name) || Boolean(sniffImageExt(buffer));
 
-  const v2 = await extractViaV2(buffer, fileName);
+  const v2 = await extractViaV2(buffer, name);
   if (v2 && v2.status !== "failed") {
     return {
       ...v2,
       durationMs: Math.round(performance.now() - started),
     };
   }
-  // Prefer v2 even when partial; only fall through when v2 unavailable/hard-fail
-  if (v2 && isImageFileName(fileName)) {
+  // Prefer v2 even when partial/failed for images — legacy PDF path cannot help
+  if (v2 && asImage) {
     return {
       ...v2,
       durationMs: Math.round(performance.now() - started),
     };
   }
-  if (isImageFileName(fileName)) {
+  if (asImage) {
     return legacyResult(
       null,
       "docling",
@@ -136,7 +183,7 @@ export async function extractInvoice(
       );
     }
 
-    const invoice = parseGibPdfText(text, fileName);
+    const invoice = parseGibPdfText(text, name);
     warnings.push(...validateInvoice(invoice));
     return legacyResult(
       invoice,

@@ -367,7 +367,10 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   let documentType: ParsedInvoice["documentType"] = "unknown";
   if (/e-?Ar[sş]iv\s+Fatura/i.test(normalized) || /EARSIVFATURA/i.test(normalized)) {
     documentType = "earsiv";
-  } else if (/e-?Fatura/i.test(normalized)) {
+  } else if (
+    /e-?Fatura/i.test(normalized) ||
+    /EFATURA|TICARIFATURA|TEMELFATURA|IHRACATFATURA|KAMUFATURA/i.test(normalized)
+  ) {
     documentType = "efatura";
   }
 

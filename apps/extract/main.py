@@ -506,7 +506,11 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     doc_type: Literal["earsiv", "efatura", "ubl", "unknown"] = "unknown"
     if re.search(r"e-?Ar[sş]iv\s+Fatura|EARSIVFATURA", text, re.I):
         doc_type = "earsiv"
-    elif re.search(r"e-?Fatura", text, re.I):
+    elif re.search(
+        r"e-?Fatura|EFATURA|TICARIFATURA|TEMELFATURA|IHRACATFATURA|KAMUFATURA",
+        text,
+        re.I,
+    ):
         doc_type = "efatura"
 
     inv_no = right_field(text, "Fatura No") or first_match(file_name, r"([A-Z]{2,5}\d{10,})")
