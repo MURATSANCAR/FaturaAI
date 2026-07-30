@@ -475,9 +475,10 @@ def gib_invoice_number(text: str, file_name: str = "") -> str | None:
 
 def extract_ettn_candidate(text: str) -> str | None:
     """Find ETTN even when OCR glues label+uuid (ETTN9A83...)."""
+    hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqz"
     m = re.search(
-        r"ETTN\s*[:\-]?\s*([0-9A-Fa-fİILOSBloş]{8}[-‑]?[0-9A-Fa-fİILOSBloş]{4}[-‑]?"
-        r"[0-9A-Fa-fİILOSBloş]{4}[-‑]?[0-9A-Fa-fİILOSBloş]{4}[-‑]?[0-9A-Fa-fİILOSBloş]{12})",
+        rf"ETTN\s*[:\-]?\s*([{hexish}]{{8}}[-‑]?[{hexish}]{{4}}[-‑]?"
+        rf"[{hexish}]{{4}}[-‑]?[{hexish}]{{4}}[-‑]?[{hexish}]{{12}})",
         text,
         re.I,
     )
@@ -489,6 +490,62 @@ def extract_ettn_candidate(text: str) -> str | None:
         re.I,
     )
     return normalize_ocr_uuid(m.group(1)) if m else None
+
+
+def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
+    """Prefer Fatura/Tarih near metadata; ignore voucher expiry dates."""
+    # Drop voucher / çek expiry blocks so they don't steal the invoice date
+    scrubbed = re.sub(
+        r"Son\s+Kullanma\s+Tarihi\s*:?\s*\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4}",
+        " ",
+        text,
+        flags=re.I,
+    )
+    issue_raw = (
+        right_field(scrubbed, "Fatura Tarihi")
+        or right_field(scrubbed, "Tarih")
+        or right_field(scrubbed, "Tarth")
+        or first_match(
+            scrubbed,
+            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+        )
+        or first_match(
+            scrubbed,
+            r"(?:Fatera\s*No|Fatura\s*No)[^\n]{0,40}?\n[^\n]*?"
+            r"(?:Tarih|Tarth)\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+        )
+        or first_match(
+            scrubbed,
+            r"(?:Tarih|Tarth)\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+        )
+    )
+    if issue_raw:
+        issue_raw = issue_raw.replace(",", ".")
+    return parse_issue_date(issue_raw)
+
+
+def extract_payable_from_ocr(text: str) -> float | None:
+    """Prefer bank/payment lines over mangled 'Genel Toplam' OCR."""
+    bank = re.search(
+        r"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
+        r"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{0,48}?"
+        r"(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2})\s*TRY",
+        text,
+        re.I,
+    )
+    if bank:
+        return parse_tr_money(bank.group(1))
+    for label in (
+        "Ödenecek Tutar",
+        "ÖDENECEK TUTAR",
+        "Odenecek Tutar",
+        "Genel Toplam",
+        "Vergiler Dahil Toplam Tutar",
+    ):
+        amt = labeled_amount(text, label)
+        if amt is not None:
+            return amt
+    return None
 
 
 def tesseract_ocr(path: Path) -> str:
@@ -535,15 +592,29 @@ def empty_party() -> Party:
 def extract_supplier(text: str) -> Party:
     party = empty_party()
     sayin = re.search(r"\bSAYIN\b", text, re.I)
-    head = text[: sayin.start()] if sayin else text[:900]
+    head = text[: sayin.start()] if sayin else text[:1200]
     lines = [
         ln.strip()
         for ln in head.splitlines()
         if ln.strip()
         and not re.match(r"^e-?Ar[sş]iv\s+Fatura$", ln.strip(), re.I)
         and not re.match(r"^Sayfa\s+\d+", ln.strip(), re.I)
+        and not re.match(r"^(?:SUBE|ŞUBE)\s*:", ln.strip(), re.I)
+        and not re.match(r"^M[ÜU][ŞS]TER", ln.strip(), re.I)
     ]
-    if lines and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi])", lines[0], re.I):
+    # Prefer a line that looks like a company title
+    company = next(
+        (
+            ln
+            for ln in lines
+            if re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|T[İI]CARET|ANON[İI]M)", ln, re.I)
+            or re.search(r"BABYMALL|ÖZELCAN|MA[ĞG]AZA", ln, re.I)
+        ),
+        None,
+    )
+    if company:
+        party.name = company[:180]
+    elif lines and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Telefon)", lines[0], re.I):
         name = lines[0]
         if (
             len(lines) > 1
@@ -552,16 +623,30 @@ def extract_supplier(text: str) -> Party:
         ):
             name = f"{lines[0]} {lines[1]}"
         party.name = name[:180]
-    party.taxOffice = (first_match(head, r"Vergi\s*Dairesi\s*:?\s*([^\n]+)") or "").split("  ")[0].strip() or None
+    party.taxOffice = (
+        first_match(head, r"Vergi\s*Dai(?:resi|resi|r[ae]s[il])\s*:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{3,40})")
+        or ""
+    ).strip() or None
+    if party.taxOffice:
+        party.taxOffice = re.split(r"\s{2,}|Vergi\s*num", party.taxOffice, maxsplit=1)[0].strip()
     tckn = first_match(head, r"TCKN\s*:?\s*(\d{11})")
-    vkn = first_match(head, r"VKN\s*:?\s*(\d{10})")
+    vkn = first_match(head, r"(?:VKN|Vergi\s*numar\w*)\s*:?\s*(\d{10})")
+    if not vkn:
+        vkn = first_match(head, r"\b(\d{10})\b")
     if tckn:
         party.taxId, party.taxIdScheme = tckn, "TCKN"
     elif vkn:
         party.taxId, party.taxIdScheme = vkn, "VKN"
-    party.email = first_match(head, r"E-?Posta\s*:?\s*([^\s]+)")
+    party.email = first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
     party.website = first_match(head, r"Web\s*Sitesi\s*:?\s*([^\s]+)")
-    party.phone = re.sub(r"\s+", "", first_match(head, r"Tel\s*:?\s*([0-9\s()]+)") or "") or None
+    party.phone = (
+        re.sub(
+            r"\s+",
+            "",
+            first_match(head, r"(?:Tel|Telefon)\s*:?\s*([0-9\s()\-]+)") or "",
+        )
+        or None
+    )
     return party
 
 
@@ -814,26 +899,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         if not re.fullmatch(r"[A-Z]{2,5}\d{10,16}", inv_no):
             inv_no = None
 
-    issue_raw = (
-        right_field(text, "Fatura Tarihi")
-        or right_field(text, "Tarih")
-        or right_field(text, "Tarth")  # OCR typo
-        or first_match(
-            text,
-            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
-        )
-        or first_match(
-            text,
-            r"(?:^|\n)[^\n]*?\bTarih\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
-        )
-        or first_match(
-            text,
-            r":\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
-        )
-    )
-    if issue_raw:
-        issue_raw = issue_raw.replace(",", ".")
-    issue_date, issue_time = parse_issue_date(issue_raw)
+    issue_date, issue_time = prefer_invoice_issue_date(text)
     for label in ("Fatura Saati", "Düzenleme Zamanı", "Oluşma Zamanı"):
         raw = right_field(text, label)
         if raw and not issue_time:
@@ -845,7 +911,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     if not uuid:
         uuid = first_match(
             text,
-            r"ETTN\s*:?\s*([0-9a-fA-FOoİIlLSBb]{8}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{12})",
+            r"ETTN\s*:?\s*([0-9a-fA-FOoİIlLSBbPpGg]{8}-[0-9a-fA-FOoİIlLSBbPpGg]{4}-[0-9a-fA-FOoİIlLSBbPpGg]{4}-[0-9a-fA-FOoİIlLSBbPpGg]{4}-[0-9a-fA-FOoİIlLSBbPpGg]{12})",
         )
         if uuid:
             uuid = normalize_ocr_uuid(uuid)
@@ -868,30 +934,29 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         else (round(net - discount, 2) if net is not None and discount and discount > 0 else net)
     )
 
-    payable = (
-        labeled_amount(text, "Ödenecek Tutar")
-        or labeled_amount(text, "ÖDENECEK TUTAR")
-        or labeled_amount(text, "Odenecek Tutar")
-        or labeled_amount(text, "Genel Toplam")
-        or labeled_amount(text, "Gaal Taplain")  # OCR: Genel Toplam
-        or labeled_amount(text, "Genel Taplain")
-    )
-    # POS / bank payment line often clearer on thermal print OCR
-    if payable is None:
-        pay_m = re.search(
-            r"(?:Kuveyt|Ziraat|Garanti|İş\s*Bank|Akbank|Yap[ıi]\s*Kredi|TEK)[^\n]{0,40}?"
-            r"(\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+[.,]\d{2})\s*TRY",
-            text,
-            re.I,
-        )
-        if pay_m:
-            payable = parse_tr_money(pay_m.group(1))
+    payable = extract_payable_from_ocr(text)
     tax_inclusive = (
         labeled_amount(text, "Vergiler Dahil Toplam Tutar")
         or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR")
         or labeled_amount(text, "Genel Toplam")
         or payable
     )
+    # If OCR "Genel Toplam" is clearly wrong vs bank payment, prefer payment
+    bank_pay = None
+    bank_m = re.search(
+        r"(?:Kuveyt|Ziraat|Garanti|Yap[ıi]\s*Kredi|Akbank|Denizbank|Vak[ıi]f|"
+        r"Halkbank|İş\s*Bank|TEB|QNB|Enpara)[^\n]{0,48}?"
+        r"(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2})\s*TRY",
+        text,
+        re.I,
+    )
+    if bank_m:
+        bank_pay = parse_tr_money(bank_m.group(1))
+    if bank_pay is not None and (
+        payable is None or abs(payable - bank_pay) > 1.0 and bank_pay > payable
+    ):
+        payable = bank_pay
+        tax_inclusive = bank_pay
     vat = extract_vat_amount(text)
     withholding = extract_withholding_vat_amount(text)
 
