@@ -37,7 +37,7 @@ PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
-IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
+IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "3.0"))
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -188,6 +188,9 @@ def parse_tr_money(raw: str | None) -> float | None:
         return None
     s = re.sub(r"(?i)TL|TRY|₺", "", raw).strip()
     s = s.replace("\u00a0", " ")
+    # OCR: "1570L,00" / "12O00,00" — letter as thousand/decimal junk
+    s = re.sub(r"(?<=\d)[LlIiOo](?=[.,]\d)", "", s)
+    s = re.sub(r"(?<=\d)[Oo](?=\d)", "0", s)
     # OCR often uses space as decimal: "359 96" / "133 33"
     if re.fullmatch(r"\d{1,6}\s+\d{2}", s):
         s = s.replace(" ", ",")
@@ -197,14 +200,30 @@ def parse_tr_money(raw: str | None) -> float | None:
     s = s.replace(" ", "").strip()
     if not s:
         return None
-    # 1.457.08 → thousands dots + decimal dot
-    if re.fullmatch(r"\d{1,3}(\.\d{3})+\.\d{2,4}", s):
+    # US/OCR thousands: 12,000,00 or 12,000.00 (last group = decimals)
+    if re.fullmatch(r"\d{1,3}(,\d{3}){1,3}[.,]\d{2,4}", s):
+        last_sep = max(s.rfind(","), s.rfind("."))
+        head, frac = s[:last_sep], s[last_sep + 1 :]
+        s = head.replace(",", "").replace(".", "") + "." + frac
+    # TR classic: 1.457.08 / 12.000,00
+    elif re.fullmatch(r"\d{1,3}(\.\d{3})+\.\d{2,4}", s):
         head, _, frac = s.rpartition(".")
         s = head.replace(".", "") + "." + frac
     elif "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
+        # Decide decimal by last separator
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
     elif "," in s:
-        s = s.replace(",", ".")
+        # 1234,56 → decimal; 1,234 → ambiguous — if 3 digits after comma treat thousands only when another sep
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) == 3 and len(parts[0]) <= 3:
+            # Ambiguous 12,000 — prefer thousands when exactly 3 fractional digits and value would be huge as decimal
+            # Treat as thousands (TR OCR of 12.000 without decimals)
+            s = parts[0] + parts[1]
+        else:
+            s = s.replace(",", ".")
     elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
         s = s.replace(".", "")
     try:
@@ -214,18 +233,74 @@ def parse_tr_money(raw: str | None) -> float | None:
         return None
 
 
-_MONEY_TOKEN = r"(?:\d{1,3}(?:[.\s]\d{3})*[.,]\d{2,4}|\d+[.,]\d{2,4}|\d{1,6}\s\d{2})"
+_MONEY_TOKEN = (
+    r"(?:\d{1,3}(?:[.,\s]\d{3})+[.,]\d{1,4}"  # 12.000,00 / 12,000.00 / 1.453,7
+    r"|\d{1,3}(?:[.\s]\d{3})*[.,]\d{1,4}"
+    r"|\d+[LlIiOo]?[.,]\d{1,4}"
+    r"|\d{1,6}\s\d{2})"
+)
+
+
+def normalize_ocr_text(text: str) -> str:
+    """Generic OCR label/typo normalization for Turkish e-invoice layouts."""
+    if not text:
+        return text
+    # Strip portal / viewer chrome
+    text = re.sub(r"(?im)^\s*(?:PDF|XML)\s*indir\s*", "", text)
+    text = re.sub(r"(?i)\bPDF\s*indir\b|\bXML\s*indir\b", " ", text)
+    replacements = (
+        (r"\bSAYDN\b", "SAYIN"),
+        (r"\bSAVIN\b", "SAYIN"),
+        (r"\bSAY[İI]N\b", "SAYIN"),
+        (r"\bETIN\b", "ETTN"),
+        (r"\bETTN\b", "ETTN"),
+        (r"\bFatera\b", "Fatura"),
+        (r"\bFatara\b", "Fatura"),
+        (r"\bYarihi\b", "Tarihi"),
+        (r"\bTanible\b", "Tarihi"),
+        (r"\b[ÖO]DENECEKTUTAR\b", "ÖDENECEK TUTAR"),
+        (r"\bOdenecek\s*Tutar\b", "ÖDENECEK TUTAR"),
+        (r"\benecel\s*Tutar\b", "ÖDENECEK TUTAR"),
+        (r"\bVergies?\s*Dald\s*Teglam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bVergiler\s*Dahil\s*Toplam\s*Tutar\b", "Vergiler Dahil Toplam Tutar"),
+        (r"\bBesaplaesnKOV\b", "Hesaplanan KDV"),
+        (r"\bHesaplanan\s*K\.?\s*D\.?\s*V\.?\b", "Hesaplanan KDV"),
+        (r"\bAlica\b", "Alıcı"),
+        (r"\bAlici\b", "Alıcı"),
+        (r"\bAL[İI]C[İI]\b", "Alıcı"),
+        (r"\bSatici\b", "Satıcı"),
+        (r"\bSAT[İI]C[İI]\b", "Satıcı"),
+        (r"\beArgiv\b", "e-Arşiv"),
+        (r"\be-?Arpiv\b", "e-Arşiv"),
+    )
+    for pat, repl in replacements:
+        text = re.sub(pat, repl, text, flags=re.I)
+    # Glued label+amount: "ÖDENECEK TUTAR:12,000,00"
+    text = re.sub(
+        rf"([ÖO]DENECEK\s+TUTAR)\s*:?\s*({_MONEY_TOKEN})",
+        r"\1: \2",
+        text,
+        flags=re.I,
+    )
+    return text
 
 
 def labeled_amount(text: str, label: str) -> float | None:
     # Plain layout + OCR (comma/dot/space decimals) + optional TRY
     re_ = re.compile(
-        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?({_MONEY_TOKEN})\s*(?:TL|TRY)?",
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?({_MONEY_TOKEN})\s*(?:TL|TRY|T[L1])?",
         re.I,
     )
     matches = list(re_.finditer(text))
     if matches:
-        return parse_tr_money(matches[-1].group(1))
+        # Prefer larger plausible invoice totals when multiple hits (avoid stray footnotes)
+        amounts = [parse_tr_money(m.group(1)) for m in matches]
+        amounts = [a for a in amounts if a is not None and a > 0]
+        if amounts:
+            lab_u = re.sub(r"[^A-Z0-9]", "", label.upper().replace("Ö", "O").replace("İ", "I"))
+            if "ODENECEK" in lab_u or "DAHIL" in lab_u or "TOPLAM" in lab_u:
+                return max(amounts)
+            return amounts[-1]
     re_nl = re.compile(
         rf"{label}(?:\s*\([^)]*\))?\s*:?\s*\|?[^\n]{{0,40}}?\n+\s*\|?\s*({_MONEY_TOKEN})",
         re.I,
@@ -318,6 +393,140 @@ def parse_ocr_line_items(text: str) -> list[Line]:
                 lineTotal=line_total,
             )
         )
+    if out:
+        return out
+
+    # GİB table OCR: "1 21.560 kg 0,089TL %0,00 0,00TL … %18,00 345,39 TL 1.918,84"
+    gib_qty = re.compile(
+        rf"(?m)^(?P<seq>\d{{1,3}})\s+"
+        rf"(?P<name>.*?)\s*"
+        rf"(?P<qty>\d{{1,3}}(?:[.,]\d+)?|\d+[.,]\d+)\s*"
+        rf"(?P<unit>kg|adet|ad|NIU|C62|KGM|MTR|LTR)?\s+"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL?\s+"
+        rf"(?:%?\s*(?P<discRate>[\d.,]+)\s+)?"
+        rf"(?:(?P<discAmt>{_MONEY_TOKEN}|L\d+[^\s]*)\s*TL?\s+)?"
+        rf".{{0,48}}?"
+        rf"%\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+        rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s+"
+        rf"(?P<total>{_MONEY_TOKEN})",
+        re.I,
+    )
+    for m in gib_qty.finditer(text):
+        name = re.sub(r"\s+", " ", (m.group("name") or "")).strip(" -")
+        if not name or re.match(
+            r"^(?:ARA|TOPLAM|KDV|Mal\s*Hizmet|Vergi|S[ıi]ra|No\b)", name, re.I
+        ):
+            name = f"Kalem {m.group('seq')}"
+        total = parse_tr_money(m.group("total"))
+        if total is None or total <= 0:
+            continue
+        qty = parse_tr_money(m.group("qty")) or float(m.group("qty").replace(",", "."))
+        unit_price = parse_tr_money(m.group("unitPrice"))
+        vat_rate = normalize_vat_rate(parse_percent(m.group("vat")))
+        disc_amt = parse_tr_money(m.group("discAmt")) if m.groupdict().get("discAmt") else None
+        out.append(
+            Line(
+                id=m.group("seq"),
+                name=name[:240],
+                quantity=qty,
+                unit=(m.group("unit") or "Adet"),
+                unitPrice=unit_price,
+                discountAmount=disc_amt,
+                vatRate=vat_rate,
+                vatAmount=parse_tr_money(m.group("vatAmt")),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
+    # Numbered GİB row with trailing money tokens (description + amounts)
+    numbered = re.compile(rf"(?m)^(?P<seq>\d{{1,3}})\s+(?P<body>.{{8,220}})$")
+    skip_body = re.compile(
+        r"^(?:ARA|TOPLAM|KDV|Mal\s*Hizmet|Vergi|ÖDEN|ODEN|S[ıi]ra|No\b|ETTN|Notlar)",
+        re.I,
+    )
+    for m in numbered.finditer(text):
+        body = m.group("body").strip()
+        if skip_body.match(body):
+            continue
+        if re.match(r"^adet\s*[x×X]\b", body, re.I):
+            continue
+        money_hits = list(re.finditer(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", body, re.I))
+        if len(money_hits) < 1:
+            continue
+        total = parse_tr_money(money_hits[-1].group(1))
+        if total is None or total < 1:
+            continue
+        # Ignore tiny footnote amounts misread as lines
+        if total < 5 and len(money_hits) == 1:
+            continue
+        name_end = money_hits[0].start()
+        name = body[:name_end].strip(" -|")
+        name = re.sub(r"\s+", " ", name)
+        # Drop pure header fragments
+        if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 3:
+            continue
+        if re.search(r"Miktar|Birim\s*Fiyat|K\.?D\.?V|Oran|Tutar\s*$", name, re.I):
+            continue
+        unit_price = parse_tr_money(money_hits[-2].group(1)) if len(money_hits) >= 2 else None
+        vat_rate = None
+        vat_m = re.search(r"%\s*(\d{1,2}(?:[.,]\d+)?)", body)
+        if vat_m:
+            vat_rate = normalize_vat_rate(parse_percent(vat_m.group(1)))
+        qty = 1.0
+        qty_m = re.search(r"(\d+[.,]\d+|\d+)\s*(kg|adet|ad|NIU)\b", body, re.I)
+        if qty_m:
+            qty = parse_tr_money(qty_m.group(1)) or float(qty_m.group(1).replace(",", "."))
+        out.append(
+            Line(
+                id=m.group("seq"),
+                name=name[:240] or f"Kalem {m.group('seq')}",
+                quantity=qty,
+                unit=(qty_m.group(2) if qty_m else "Adet"),
+                unitPrice=unit_price,
+                vatRate=vat_rate,
+                lineTotal=total,
+            )
+        )
+        if len(out) >= 30:
+            break
+    if out:
+        return out
+
+    # Unnumbered product row: "DESC 1.453,70 1.463,70"
+    bare = re.compile(
+        rf"(?m)^(?P<name>[A-ZÇĞİÖŞÜa-zçğıöşü0-9][A-ZÇĞİÖŞÜa-zçğıöşü0-9 /.\-]{{4,80}}?)\s+"
+        rf"(?P<a>{_MONEY_TOKEN})\s+(?P<b>{_MONEY_TOKEN})\s*$"
+    )
+    skip_bare = re.compile(
+        r"^(?:ARA|TOPLAM|Mal\s*Hizmet|Vergi|Toplam|Odenecek|ÖDEN|KDV|CARD|No\b)",
+        re.I,
+    )
+    for i, m in enumerate(bare.finditer(text), start=1):
+        name = m.group("name").strip()
+        if skip_bare.search(name):
+            continue
+        a = parse_tr_money(m.group("a"))
+        b = parse_tr_money(m.group("b"))
+        if a is None or b is None:
+            continue
+        total = max(a, b)
+        unit = min(a, b)
+        if total < 1:
+            continue
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=1.0,
+                unit="Adet",
+                unitPrice=unit,
+                lineTotal=total,
+            )
+        )
+        if len(out) >= 12:
+            break
     if out:
         return out
 
@@ -855,11 +1064,13 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
 
     issue_raw = (
         right_field(scrubbed, "Fatura Tarihi")
+        or right_field(scrubbed, "Fatura Tarihi")
         or right_field(scrubbed, "Tarih")
         or right_field(scrubbed, "Tarth")
         or first_match(
             scrubbed,
-            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+            r"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|(]*\s*"
+            r"(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
         )
         or first_match(
             scrubbed,
@@ -869,6 +1080,10 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         or first_match(
             scrubbed,
             r"(?:Tarih|Tarth)\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+        )
+        or first_match(
+            scrubbed,
+            r"(?<!\d)(\d{1,2}/\d{1,2}/\d{4})(?!\d)",
         )
     )
     if issue_raw:
@@ -894,12 +1109,11 @@ def extract_payable_from_ocr(text: str) -> float | None:
         r"Ödenecek\s+Tutar",
         r"VERG[İIEÉ]\s+DAH[İI]L\s+TOPLAM\s+TUTAR",
         r"Vergiler\s+Dahil\s+Toplam\s+Tutar",
-        r"(?<!ARA\s)TOPLAM",
-        r"Tutar",
+        r"(?<!ARA\s)TOPLAM(?!\s*ISKONTO|\s*[İI]SKONTO)",
         r"Genel\s+Toplam",
     ):
         amt = labeled_amount(text, label)
-        if amt is not None:
+        if amt is not None and amt >= 1:
             return amt
     # TOPLAM *760,00 / TOPLAM 3.499,00 (star prefix)
     m = re.search(rf"(?<!ARA\s)TOPLAM\s*\*?\s*({_MONEY_TOKEN})", text, re.I)
@@ -938,10 +1152,13 @@ def parse_issue_date(raw: str | None) -> tuple[str | None, str | None]:
     )
     if not m:
         return None, None
-    date = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100):
+        return None, None
+    date = f"{year:04d}-{month:02d}-{day:02d}"
     time_ = None
     if m.group(4) and m.group(5):
-        time_ = f"{m.group(4).zfill(2)}:{m.group(5)}:00"
+        time_ = f"{int(m.group(4)):02d}:{m.group(5)}:00"
     return date, time_
 
 
@@ -961,49 +1178,91 @@ def extract_supplier(text: str) -> Party:
         and not re.match(r"^Sayfa\s+\d+", ln.strip(), re.I)
         and not re.match(r"^(?:SUBE|ŞUBE)\s*:", ln.strip(), re.I)
         and not re.match(r"^M[ÜU][ŞS]TER", ln.strip(), re.I)
+        and not re.match(r"^(?:PDF|XML)\s*indir", ln.strip(), re.I)
+        and not re.match(r"^Page\s+\d+", ln.strip(), re.I)
     ]
-    # Prefer a line that looks like a company title (legal form / retail trade words)
-    company = next(
-        (
-            ln
-            for ln in lines
-            if re.search(
-                r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|T[İI]CARET|ANON[İI]M|MA[ĞG]AZA)",
-                ln,
-                re.I,
-            )
-        ),
-        None,
+    # Explicit Satıcı: label (GİB / ERP layouts)
+    sat_m = re.search(
+        r"Sat[ıi]c[ıi]\s*[^:\n]{0,24}:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü0-9].{2,120})",
+        head,
+        re.I,
     )
-    if company:
-        party.name = company[:180]
-    elif lines and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Telefon)", lines[0], re.I):
-        name = lines[0]
-        if (
-            len(lines) > 1
-            and re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M)", lines[1], re.I)
-            and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)", lines[1], re.I)
+    if sat_m:
+        cand = re.split(r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi", sat_m.group(1), maxsplit=1)[
+            0
+        ].strip(" :.-[]{}")
+        cand = re.sub(r"^(?:şube|sube)\]?\s*:?\s*", "", cand, flags=re.I).strip(" :.-[]{}")
+        if len(cand) >= 4:
+            party.name = cand[:180]
+    # Prefer a line that looks like a company title (legal form / retail trade words)
+    if not party.name:
+        company = next(
+            (
+                ln
+                for ln in lines
+                if re.search(
+                    r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|T[İI]CARET|ANON[İI]M|MA[ĞG]AZA)",
+                    ln,
+                    re.I,
+                )
+                and not re.search(r"^(?:PDF|XML|Page|Adres|Tel|Web|Vergi)", ln, re.I)
+            ),
+            None,
+        )
+        if company:
+            party.name = company[:180]
+        elif lines and not re.match(
+            r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Telefon|Adres)", lines[0], re.I
         ):
-            name = f"{lines[0]} {lines[1]}"
-        party.name = name[:180]
+            name = lines[0]
+            if (
+                len(lines) > 1
+                and re.search(r"(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M)", lines[1], re.I)
+                and not re.match(r"^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)", lines[1], re.I)
+            ):
+                name = f"{lines[0]} {lines[1]}"
+            party.name = name[:180]
     if party.name:
+        party.name = re.sub(
+            r"^(?:Sat[ıi]c[ıi]\s*(?:\([^)]*\)|\{[^}]*\}|\[[^\]]*\])?\s*:?\s*)",
+            "",
+            party.name,
+            flags=re.I,
+        )
         party.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
         party.name = re.sub(r"\bMAČAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
-        party.name = re.sub(r"\s+", " ", party.name).strip()[:180]
-    party.taxOffice = (
-        first_match(head, r"Vergi\s*Dai(?:resi|resi|r[ae]s[il])\s*:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{3,40})")
-        or ""
-    ).strip() or None
+        party.name = re.sub(r"\s+", " ", party.name).strip(" :.-[]{}")[:180]
+    # Vergi No / Dairesi: 4470211661 / KADIKÖY
+    vkn_office = re.search(
+        r"Vergi\s*No\s*/?\s*Dairesi?\s*:?[.\s]*(\d{10,11})\s*/\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
+        head,
+        re.I,
+    )
+    if vkn_office:
+        tid = vkn_office.group(1)
+        party.taxId = tid
+        party.taxIdScheme = "TCKN" if len(tid) == 11 else "VKN"
+        party.taxOffice = vkn_office.group(2).strip()
+    if not party.taxOffice:
+        party.taxOffice = (
+            first_match(
+                head, r"Vergi\s*Dai(?:resi|resi|r[ae]s[il])\s*:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{3,40})"
+            )
+            or ""
+        ).strip() or None
     if party.taxOffice:
         party.taxOffice = re.split(r"\s{2,}|Vergi\s*num", party.taxOffice, maxsplit=1)[0].strip()
     tckn = first_match(head, r"TCKN\s*:?\s*(\d{11})")
-    vkn = first_match(head, r"(?:VKN|Vergi\s*numar\w*)\s*:?\s*(\d{10})")
+    vkn = first_match(head, r"(?:VKN|Vergi\s*numar\w*|Vergi\s*No)\s*:?[.\s]*(\d{10})")
     if not vkn:
-        vkn = first_match(head, r"\b(\d{10})\b")
-    if tckn:
-        party.taxId, party.taxIdScheme = tckn, "TCKN"
-    elif vkn:
+        vkn = first_match(head, r"\bV\.?\s*N\.?\s*:?[.\s]*(\d{10})\b")
+    if not vkn:
+        vkn = first_match(head, r"Vergi\s*No\s*/?\s*Dairesi?\s*:?[.\s]*(\d{10})")
+    # Prefer VKN for company suppliers when both appear
+    if vkn and not party.taxId:
         party.taxId, party.taxIdScheme = vkn, "VKN"
+    elif tckn and not party.taxId:
+        party.taxId, party.taxIdScheme = tckn, "TCKN"
     party.email = first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
     party.website = first_match(head, r"Web\s*Sitesi\s*:?\s*([^\s]+)")
     party.phone = (
@@ -1036,61 +1295,84 @@ def extract_customer(text: str) -> Party:
             party.phone = phone
         return party
 
-    sayin = re.search(r"\bSAYIN\b", text, re.I)
-    if not sayin:
-        return party
-    block = text[sayin.start() :]
-    lines = []
-    for ln in block.splitlines():
-        cleaned = re.sub(
-            r"\s{2,}(Özelleştirme|Senaryo|Fatura\s+Tipi|Fatura\s+No|Fatura\s+Tarihi|Fatura\s+Saati|Sipari[sş].*|Düzenleme.*).*$",
-            "",
-            ln,
-            flags=re.I,
-        ).strip()
-        if cleaned:
-            lines.append(cleaned)
-    name_parts: list[str] = []
-    addr_parts: list[str] = []
-    for ln in lines[1:]:
-        if re.match(r"^(Web|E-?Posta|Tel|Vergi|VKN|TCKN|ETTN|S[ıi]ra|Mal|NOTLAR|Not:)", ln, re.I):
-            break
-        if re.search(
-            r"\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|Sok\.|No:|daire|sitesi|Apartman|Blok)\b",
-            ln,
-            re.I,
-        ) or re.search(r"\b\d{5}\b", ln) or re.search(
-            r"/\s*[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}", ln
-        ):
-            addr_parts.append(ln)
-            continue
-        if not name_parts:
-            name_parts.append(ln)
-        elif not addr_parts and len(ln) < 80:
-            name_parts.append(ln)
-    party.name = " ".join(name_parts).strip() or None
-    if party.name:
-        party.name = re.split(
-            r"\s*[|\[]?\s*(?:Senaryo|Fatura\s+No|Fatura\s+Tipi|Özelleştirme)\b",
-            party.name,
+    # Explicit Alıcı: (ERP / e-Fatura)
+    alici = re.search(
+        r"Al[ıi]c[ıi]\s*[^:\nA-ZÇĞİÖŞÜ]{0,20}:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü].{2,80})",
+        text,
+        re.I,
+    )
+    if alici:
+        cand = re.split(
+            r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi|Özelleştirme|Senaryo|Fatura",
+            alici.group(1),
             maxsplit=1,
-            flags=re.I,
-        )[0].strip(" ,|;:-")
-        halves = party.name.split()
-        mid = len(halves) // 2
-        if mid > 0 and " ".join(halves[:mid]) == " ".join(halves[mid:]):
-            party.name = " ".join(halves[:mid])
+        )[0].strip(" :.-[]{}")
+        if len(cand) >= 3 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
+            party.name = cand[:120]
+
+    sayin = re.search(r"\bSAYIN\b", text, re.I)
+    if not sayin and not party.name:
+        return party
+    if sayin:
+        block = text[sayin.start() :]
+        lines = []
+        for ln in block.splitlines():
+            cleaned = re.sub(
+                r"\s{2,}(Özelleştirme|Senaryo|Fatura\s+Tipi|Fatura\s+No|Fatura\s+Tarihi|Fatura\s+Saati|Sipari[sş].*|Düzenleme.*).*$",
+                "",
+                ln,
+                flags=re.I,
+            ).strip()
+            if cleaned:
+                lines.append(cleaned)
+        name_parts: list[str] = []
+        addr_parts: list[str] = []
+        for ln in lines[1:]:
+            if re.match(r"^(Web|E-?Posta|Tel|Vergi|VKN|TCKN|ETTN|S[ıi]ra|Mal|NOTLAR|Not:)", ln, re.I):
+                break
+            if re.search(
+                r"\b(mah\.|Mah\.|Bul\.|Cad\.|Sk\.|Sok\.|No:|daire|sitesi|Apartman|Blok)\b",
+                ln,
+                re.I,
+            ) or re.search(r"\b\d{5}\b", ln) or re.search(
+                r"/\s*[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}", ln
+            ):
+                addr_parts.append(ln)
+                continue
+            if not name_parts:
+                name_parts.append(ln)
+            elif not addr_parts and len(ln) < 80:
+                name_parts.append(ln)
         if not party.name:
-            party.name = None
-    party.address = ", ".join(addr_parts) or None
-    near = block[:1500]
+            party.name = " ".join(name_parts).strip() or None
+        if party.name:
+            party.name = re.split(
+                r"\s*[|\[]?\s*(?:Senaryo|Fatura\s+No|Fatura\s+Tipi|Özelleştirme)\b",
+                party.name,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip(" ,|;:-")
+            halves = party.name.split()
+            mid = len(halves) // 2
+            if mid > 0 and " ".join(halves[:mid]) == " ".join(halves[mid:]):
+                party.name = " ".join(halves[:mid])
+            if not party.name:
+                party.name = None
+        party.address = ", ".join(addr_parts) or None
+        near = block[:1500]
+    else:
+        near = text[alici.start() : alici.start() + 1500] if alici else text[:1500]
+
     vkn_tckn = first_match(near, r"VKN\s*/\s*TCKN\s*:?\s*(\d{10,11})")
     tckn = first_match(near, r"TCKN\s*:?\s*(\d{11})")
     vkn = first_match(near, r"VKN\s*:?\s*(\d{10})")
+    if not vkn:
+        vkn = first_match(near, r"Vergi\s*No\s*/?\s*Dairesi?\s*:?\s*(\d{10,11})")
     if tckn:
         party.taxId, party.taxIdScheme = tckn, "TCKN"
     elif vkn:
-        party.taxId, party.taxIdScheme = vkn, "VKN"
+        party.taxId = vkn
+        party.taxIdScheme = "TCKN" if len(vkn) == 11 else "VKN"
     elif vkn_tckn:
         party.taxId = vkn_tckn
         party.taxIdScheme = "TCKN" if len(vkn_tckn) == 11 else "VKN"
@@ -1223,6 +1505,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
     )
+    text = normalize_ocr_text(text)
     doc_type: Literal["earsiv", "efatura", "ubl", "unknown"] = "unknown"
     profile = right_field(text, "Senaryo") or first_match(text, r"ProfileID\s*:?\s*([A-Z0-9_]+)")
     if profile:
@@ -1376,6 +1659,16 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             or first_match_money(text, rf"TOPKDV\s*\*\s*({_MONEY_TOKEN})")
             or first_match_money(text, rf"(?m)^KDV\s*\*\s*({_MONEY_TOKEN})")
         )
+    if vat is None and ocr_lines:
+        line_vats = [l.vatAmount for l in ocr_lines if l.vatAmount is not None]
+        if line_vats:
+            vat = round(sum(line_vats), 2)
+        elif lines_sum is not None:
+            # Infer from dominant line VAT rate
+            rates = [l.vatRate for l in ocr_lines if l.vatRate is not None]
+            if rates:
+                rate = max(set(rates), key=rates.count)
+                vat = round(lines_sum * (rate / 100.0), 2)
     withholding = extract_withholding_vat_amount(text)
 
     # Retail POS: line totals are usually tax-inclusive
@@ -1412,6 +1705,19 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         and abs(tax_inclusive - payable) <= 0.02
     ):
         payable = tax_inclusive
+
+    # Screenshot OCR often misses ödenecek label but has line totals / KDV matrah
+    if payable is None and lines_sum is not None and lines_sum > 0:
+        if vat is not None and not retail_fiş:
+            payable = round(lines_sum + vat, 2)
+            tax_inclusive = tax_inclusive or payable
+            line_ext = line_ext or lines_sum
+        else:
+            payable = lines_sum
+            tax_inclusive = tax_inclusive or lines_sum
+    if payable is None and line_ext is not None and vat is not None:
+        payable = round(line_ext + vat, 2)
+        tax_inclusive = tax_inclusive or payable
 
     iban = first_match(text, r"I?İ?BAN\s*:\s*(TR[\d\s]+)")
     if iban:
@@ -1506,6 +1812,33 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         if line_sum > 0 and (line_sum / payable) < 0.45:
             ocr_lines = []
             lines_sum = None
+        elif line_sum > 0 and payable < line_sum * 0.55:
+            # Payable is a stray footnote; prefer ödenecek/line reconciliation
+            od = labeled_amount(text, r"[ÖO]DENECEK\s+TUTAR")
+            if od is not None and od >= line_sum * 0.85:
+                payable = od
+                tax_inclusive = od
+            elif vat is not None:
+                payable = round(line_sum + vat, 2) if not retail_fiş else line_sum
+                tax_inclusive = payable
+            elif retail_fiş:
+                payable = line_sum
+                tax_inclusive = line_sum
+
+    # Reject junk supplier names
+    if supplier.name and _party_name_quality(supplier.name) < 6:
+        better = next(
+            (
+                ln.strip()
+                for ln in text.splitlines()
+                if _party_name_quality(ln.strip()) >= 20
+            ),
+            None,
+        )
+        if better:
+            supplier.name = better[:180]
+        elif _party_name_quality(supplier.name) < 4:
+            supplier.name = None
 
     return Invoice(
         documentType=doc_type,
@@ -1543,6 +1876,12 @@ def _party_name_quality(name: str | None) -> int:
     n = name.strip()
     if len(n) < 3 or re.fullmatch(r"[=_\-—.\s]+", n):
         return 0
+    if re.search(
+        r"(?:[İI]mza|PDF\s*indir|XML\s*indir|<!--\s*image|Page\s+\d+|adet\s*[x×]|Higz\s*Adi)",
+        n,
+        re.I,
+    ):
+        return 0
     letters = len(re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]", n))
     if letters < 4:
         return 0
@@ -1552,6 +1891,25 @@ def _party_name_quality(name: str | None) -> int:
     if re.search(r"Senaryo|Fatura\s*Tipi|==|^[#]+", n, re.I):
         score -= 30
     return score
+
+
+def _lines_useful(lines: list[Line] | list[dict] | None) -> bool:
+    if not lines:
+        return False
+    named = 0
+    totaled = 0
+    for l in lines:
+        if isinstance(l, dict):
+            name, total = l.get("name"), l.get("lineTotal")
+        else:
+            name, total = l.name, l.lineTotal
+        if name and len(re.sub(r"\s+", "", str(name))) >= 3 and not re.match(
+            r"^(?:adet|kalem|ad)\b", str(name), re.I
+        ):
+            named += 1
+        if total is not None and total > 0:
+            totaled += 1
+    return totaled > 0 and named >= max(1, totaled // 2)
 
 
 def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
@@ -1705,19 +2063,19 @@ def get_docling_converter(ocr: bool, for_image: bool = False):
             options.images_scale = IMAGE_OCR_SCALE
         except Exception:
             pass
-        # Prefer system tesseract (tur+eng on portal); fall back to RapidOCR / EasyOCR
+        # Prefer RapidOCR (same stack as photo OCR) for image documents; Tesseract last
         ocr_opts = None
         try:
-            from docling.datamodel.pipeline_options import TesseractCliOcrOptions
+            from docling.datamodel.pipeline_options import RapidOcrOptions
 
-            ocr_opts = TesseractCliOcrOptions(lang=["tur", "eng"])
+            ocr_opts = RapidOcrOptions()
         except Exception:
             ocr_opts = None
         if ocr_opts is None:
             try:
-                from docling.datamodel.pipeline_options import RapidOcrOptions
+                from docling.datamodel.pipeline_options import TesseractCliOcrOptions
 
-                ocr_opts = RapidOcrOptions()
+                ocr_opts = TesseractCliOcrOptions(lang=["tur", "eng"])
             except Exception:
                 ocr_opts = None
         if ocr_opts is None:
@@ -1877,13 +2235,26 @@ async def extract(
                     use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
                     md2, table_lines = await run_docling(path, ocr=use_ocr, for_image=True)
                     pipeline.append("docling-image-ocr" if use_ocr else "docling-image")
-                    if table_lines:
-                        invoice.lines = table_lines or invoice.lines
-                        pipeline.append(f"docling-tables:{len(table_lines)}")
+                    if table_lines and _lines_useful(table_lines):
+                        if not _lines_useful(invoice.lines):
+                            invoice.lines = table_lines
+                            pipeline.append(f"docling-tables:{len(table_lines)}")
+                        else:
+                            # Keep photo lines unless Docling has more complete named rows
+                            photo_n = len([l for l in invoice.lines if l.name and l.lineTotal])
+                            doc_n = len([l for l in table_lines if l.name and l.lineTotal])
+                            if doc_n > photo_n:
+                                invoice.lines = table_lines
+                                pipeline.append(f"docling-tables:{len(table_lines)}")
+                    elif table_lines:
+                        pipeline.append(f"docling-tables-skipped:{len(table_lines)}")
                     if md2.strip():
                         inv_md = parse_text_invoice(md2.replace("\t", " "), name)
+                        # Avoid Docling markdown party junk (<!-- image -->) clobbering photo OCR
+                        if inv_md.supplier and _party_name_quality(inv_md.supplier.name) < 8:
+                            inv_md.supplier.name = None
                         invoice = merge_invoice(invoice, inv_md)
-                        if not invoice.lines and inv_md.lines:
+                        if not _lines_useful(invoice.lines) and _lines_useful(inv_md.lines):
                             invoice.lines = inv_md.lines
                         md = (md + "\n\n" + md2).strip() if md else md2
                 except Exception as exc:  # noqa: BLE001

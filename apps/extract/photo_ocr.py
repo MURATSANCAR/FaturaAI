@@ -3,6 +3,11 @@
 Stack (open-source, CPU):
   OpenCV preprocess → RapidOCR Latin PP-OCRv5 (primary) + PP-OCRv6
   → Tesseract tur+eng only as last-resort if RapidOCR structure is weak
+
+Improvements for GİB document screenshots (not brand-specific):
+  - Aggressive upscale for tiny UI thumbnails
+  - Column-aware reading order (left block then right)
+  - Extra binary / sharp preprocess candidates on small images
 """
 
 from __future__ import annotations
@@ -20,10 +25,11 @@ import numpy as np
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1800"))
 PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2800"))
-PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "3600"))
+PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "4200"))
 PHOTO_OCR_CLAHE = os.getenv("PHOTO_OCR_CLAHE", "1") == "1"
 PHOTO_OCR_DUAL = os.getenv("PHOTO_OCR_DUAL", "1") == "1"
 PHOTO_OCR_TESSERACT = os.getenv("PHOTO_OCR_TESSERACT", "1") == "1"
+PHOTO_OCR_COLUMNS = os.getenv("PHOTO_OCR_COLUMNS", "1") == "1"
 
 _engine_latin = None
 _engine_v6 = None
@@ -31,11 +37,13 @@ _engine_lock = threading.Lock()
 
 _STRUCT_RE = re.compile(
     r"(?:"
-    r"\bETTN\b|\bTOPLAM\b|\bTOPKDV\b|\bARA\s*TOPLAM\b|"
+    r"\bETTN\b|\bETIN\b|\bTOPLAM\b|\bTOPKDV\b|\bARA\s*TOPLAM\b|"
     r"\bBELGE\s*N[O0]\b|\bBE[LİI]?GE\s*N[O0]\b|"
     r"\bFATURA\s*N[O0]\b|\bFATERA\s*N[O0]\b|"
     r"\bVKN\b|\bKDV\b|\badet\s*[x×X]\b|"
     r"\bTAR[İI]H\b|\bMERS[İI]S\b|\b[ÖO]DENECEK\b|"
+    r"\bSAY[İI]N\b|\bSAYDN\b|\bSAVIN\b|"
+    r"\bSENARYO\b|\bAL[İI]C[İI]\b|\bSAT[İI]C[İI]\b|"
     r"\be-?Ar[sş]iv\b|\bB[İI]LG[İI]\s*F[İIİI]?[ŞS]\b|"
     r"\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}"
     r")",
@@ -114,67 +122,137 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
     )
 
 
-def preprocess_bgr(img: np.ndarray, *, strong: bool = False) -> np.ndarray:
+def _resize_long_side(img: np.ndarray, target: int) -> np.ndarray:
     h, w = img.shape[:2]
     long_side = max(h, w)
-    target = PHOTO_OCR_TARGET_SIDE if not strong else min(PHOTO_OCR_MAX_SIDE, 3200)
-    if long_side < PHOTO_OCR_MIN_SIDE:
-        scale = target / long_side
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-    elif long_side > PHOTO_OCR_MAX_SIDE:
-        scale = PHOTO_OCR_MAX_SIDE / long_side
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    if long_side == target:
+        return img
+    scale = target / long_side
+    interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=interp)
 
-    if PHOTO_OCR_CLAHE:
+
+def preprocess_bgr(
+    img: np.ndarray,
+    *,
+    strong: bool = False,
+    deskew: bool = True,
+    binary: bool = False,
+    target_side: int | None = None,
+) -> np.ndarray:
+    h, w = img.shape[:2]
+    long_side = max(h, w)
+    # Tiny UI screenshots need heavier upscale than phone receipt photos
+    if target_side is None:
+        if long_side < 700:
+            target_side = min(PHOTO_OCR_MAX_SIDE, 4000 if strong else 3600)
+        elif strong:
+            target_side = min(PHOTO_OCR_MAX_SIDE, 3200)
+        else:
+            target_side = PHOTO_OCR_TARGET_SIDE
+
+    if long_side < PHOTO_OCR_MIN_SIDE or long_side < target_side * 0.9:
+        img = _resize_long_side(img, target_side)
+    elif long_side > PHOTO_OCR_MAX_SIDE:
+        img = _resize_long_side(img, PHOTO_OCR_MAX_SIDE)
+
+    if PHOTO_OCR_CLAHE and not binary:
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clip = 2.5 if strong else 2.0
         l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
         img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    if strong:
+    if strong and not binary:
         img = cv2.bilateralFilter(img, 5, 35, 35)
         blur = cv2.GaussianBlur(img, (0, 0), 0.9)
-        img = cv2.addWeighted(img, 1.2, blur, -0.2, 0)
+        img = cv2.addWeighted(img, 1.35, blur, -0.35, 0)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = _deskew(gray)
+    if deskew:
+        gray = _deskew(gray)
+
+    if binary:
+        gray = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9
+        )
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-def _group_lines(boxes: np.ndarray, txts: list[str], scores: list[float]) -> str:
-    items: list[tuple[float, float, float, str, float]] = []
+def _items_from_boxes(
+    boxes: np.ndarray, txts: list[str], scores: list[float]
+) -> list[tuple[float, float, float, float, str, float]]:
+    """(y0, x0, y1, x1, text, score)"""
+    items: list[tuple[float, float, float, float, str, float]] = []
     for box, txt, score in zip(boxes, txts, scores, strict=False):
         arr = np.asarray(box, dtype=np.float32).reshape(-1, 2)
         y0, x0 = float(arr[:, 1].min()), float(arr[:, 0].min())
-        y1 = float(arr[:, 1].max())
-        items.append((y0, x0, y1 - y0, str(txt).strip(), float(score)))
-    items = [it for it in items if it[3]]
-    if not items:
-        return ""
-    items.sort(key=lambda t: (t[0], t[1]))
-    heights = [it[2] for it in items if it[2] > 0]
-    median_h = float(np.median(heights)) if heights else 20.0
-    thresh = max(12.0, median_h * 0.55)
+        y1, x1 = float(arr[:, 1].max()), float(arr[:, 0].max())
+        t = str(txt).strip()
+        if t:
+            items.append((y0, x0, y1, x1, t, float(score)))
+    return items
 
-    lines: list[list[tuple[float, str]]] = []
-    current: list[tuple[float, str]] = []
+
+def _cluster_lines(
+    items: list[tuple[float, float, float, float, str, float]], thresh: float
+) -> list[list[tuple[float, float, float, float, str, float]]]:
+    if not items:
+        return []
+    items = sorted(items, key=lambda t: (t[0], t[1]))
+    lines: list[list[tuple[float, float, float, float, str, float]]] = []
+    current: list[tuple[float, float, float, float, str, float]] = []
     current_y: float | None = None
-    for y0, x0, _h, txt, _score in items:
+    for it in items:
+        y0 = it[0]
         if current_y is None or abs(y0 - current_y) <= thresh:
-            current.append((x0, txt))
+            current.append(it)
             current_y = y0 if current_y is None else (current_y * 0.7 + y0 * 0.3)
         else:
             lines.append(current)
-            current = [(x0, txt)]
+            current = [it]
             current_y = y0
     if current:
         lines.append(current)
+    return lines
 
+
+def _group_lines(boxes: np.ndarray, txts: list[str], scores: list[float]) -> str:
+    items = _items_from_boxes(boxes, txts, scores)
+    if not items:
+        return ""
+    heights = [it[2] - it[0] for it in items if it[2] > it[0]]
+    median_h = float(np.median(heights)) if heights else 20.0
+    thresh = max(12.0, median_h * 0.55)
+
+    # Column-aware: if X positions form two clear clusters, read left then right
+    if PHOTO_OCR_COLUMNS and len(items) >= 12:
+        xs = np.array([(it[1] + it[3]) / 2 for it in items], dtype=np.float32)
+        x_min, x_max = float(xs.min()), float(xs.max())
+        span = x_max - x_min
+        if span > 200:
+            mid = (x_min + x_max) / 2
+            left = [it for it in items if (it[1] + it[3]) / 2 <= mid]
+            right = [it for it in items if (it[1] + it[3]) / 2 > mid]
+            # Require both columns to be substantial and gap between means
+            if len(left) >= 5 and len(right) >= 5:
+                left_mean = float(np.mean([(it[1] + it[3]) / 2 for it in left]))
+                right_mean = float(np.mean([(it[1] + it[3]) / 2 for it in right]))
+                if right_mean - left_mean > span * 0.22:
+                    left_txt = _lines_to_text(_cluster_lines(left, thresh))
+                    right_txt = _lines_to_text(_cluster_lines(right, thresh))
+                    return f"{left_txt}\n\n{right_txt}".strip()
+
+    return _lines_to_text(_cluster_lines(items, thresh))
+
+
+def _lines_to_text(
+    lines: list[list[tuple[float, float, float, float, str, float]]],
+) -> str:
     out_lines: list[str] = []
     for line in lines:
-        line.sort(key=lambda t: t[0])
-        out_lines.append(" ".join(t for _, t in line))
+        line = sorted(line, key=lambda t: t[1])
+        out_lines.append(" ".join(t[4] for t in line))
     return "\n".join(out_lines)
 
 
@@ -201,12 +279,14 @@ def structure_score(text: str) -> int:
 def _rank_key(c: tuple[str, str, float, int]) -> tuple:
     eng, text, mean, n = c
     struct = structure_score(text)
-    # Tesseract often invents Turkish diacritics on noise — demote unless structure wins clearly
     engine_boost = {
         "latin-ppocrv5": 8.0,
         "latin-ppocrv5-strong": 6.0,
+        "latin-ppocrv5-nodeskew": 7.0,
+        "latin-ppocrv5-binary": 5.0,
         "ppocrv6": 5.0,
         "ppocrv6-strong": 4.0,
+        "ppocrv6-binary": 3.0,
         "tesseract-tur": -25.0,
     }.get(eng, 0.0)
     return (
@@ -214,6 +294,7 @@ def _rank_key(c: tuple[str, str, float, int]) -> tuple:
         mean * 40.0,
         _turkish_richness(text) * 0.15,
         min(n, 150) * 0.02,
+        len(text),
     )
 
 
@@ -221,7 +302,7 @@ def _tesseract_tur(path: Path) -> str:
     import subprocess
     import tempfile
 
-    img = preprocess_bgr(_load_bgr(path), strong=False)
+    img = preprocess_bgr(_load_bgr(path), strong=False, deskew=False)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         cv2.imwrite(tmp.name, img)
         tmp_path = tmp.name
@@ -238,6 +319,15 @@ def _tesseract_tur(path: Path) -> str:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def _run_engine(engine: Any, img: np.ndarray, label: str, candidates: list) -> None:
+    try:
+        text, mean, n = _result_to_text(engine(img))
+        if text.strip():
+            candidates.append((label, text, mean, n))
+    except Exception:
+        pass
+
+
 def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
     """Return (text, meta)."""
     if not PHOTO_OCR_ENABLED:
@@ -245,39 +335,44 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
 
     started = time.perf_counter()
     raw = _load_bgr(path)
-    img = preprocess_bgr(raw, strong=False)
+    tiny = max(raw.shape[:2]) < 700
+    img = preprocess_bgr(raw, strong=False, deskew=not tiny)
     latin, v6 = get_engines()
 
     candidates: list[tuple[str, str, float, int]] = []
-    res_l = latin(img)
-    text_l, mean_l, n_l = _result_to_text(res_l)
-    candidates.append(("latin-ppocrv5", text_l, mean_l, n_l))
+    _run_engine(latin, img, "latin-ppocrv5", candidates)
 
     if v6 is not None:
-        try:
-            res_v = v6(img)
-            text_v, mean_v, n_v = _result_to_text(res_v)
-            candidates.append(("ppocrv6", text_v, mean_v, n_v))
-        except Exception:
-            pass
+        _run_engine(v6, img, "ppocrv6", candidates)
+
+    # No-deskew pass helps UI screenshots (deskew can smear fine fonts)
+    if tiny or (candidates and structure_score(max(candidates, key=_rank_key)[1]) < 12):
+        img_nd = preprocess_bgr(raw, strong=False, deskew=False)
+        _run_engine(latin, img_nd, "latin-ppocrv5-nodeskew", candidates)
+
+    best_so_far = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+    need_strong = structure_score(best_so_far[1]) < (10 if tiny else 8)
+    if need_strong:
+        img2 = preprocess_bgr(raw, strong=True, deskew=not tiny)
+        _run_engine(latin, img2, "latin-ppocrv5-strong", candidates)
+        if v6 is not None:
+            _run_engine(v6, img2, "ppocrv6-strong", candidates)
+
+    # Binary adaptive threshold often recovers dense GİB tables on screenshots
+    if tiny or structure_score(max(candidates, key=_rank_key)[1] if candidates else "") < 10:
+        img_bin = preprocess_bgr(raw, strong=True, deskew=False, binary=True)
+        _run_engine(latin, img_bin, "latin-ppocrv5-binary", candidates)
+        if v6 is not None:
+            _run_engine(v6, img_bin, "ppocrv6-binary", candidates)
+
+    if not candidates:
+        return "", {
+            "engine": "none",
+            "lineCount": 0,
+            "elapsedMs": int((time.perf_counter() - started) * 1000),
+        }
 
     best_so_far = max(candidates, key=_rank_key)
-    # Second pass with stronger enhance only if structure is thin (thermal / glare)
-    if structure_score(best_so_far[1]) < 8:
-        img2 = preprocess_bgr(raw, strong=True)
-        try:
-            t2, m2, n2 = _result_to_text(latin(img2))
-            candidates.append(("latin-ppocrv5-strong", t2, m2, n2))
-        except Exception:
-            pass
-        if v6 is not None:
-            try:
-                t2, m2, n2 = _result_to_text(v6(img2))
-                candidates.append(("ppocrv6-strong", t2, m2, n2))
-            except Exception:
-                pass
-        best_so_far = max(candidates, key=_rank_key)
-
     if PHOTO_OCR_TESSERACT and structure_score(best_so_far[1]) < 6:
         try:
             tess = _tesseract_tur(path)
@@ -299,4 +394,5 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         "turkishChars": _turkish_richness(best[1]),
         "structureScore": structure_score(best[1]),
         "altStructure": {c[0]: structure_score(c[1]) for c in candidates},
+        "tinyInput": tiny,
     }
