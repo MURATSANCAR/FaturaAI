@@ -20,6 +20,28 @@ app.use(
   }),
 );
 
+const ALLOWED_EXT =
+  /\.(pdf|jpe?g|png|webp|heic|heif|tif|tiff|bmp)$/i;
+const ALLOWED_MIME = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+  "image/tiff",
+  "image/bmp",
+  "image/x-adobe-dng",
+]);
+
+function isAllowedUpload(file: File): boolean {
+  if (ALLOWED_EXT.test(file.name)) return true;
+  if (file.type && ALLOWED_MIME.has(file.type)) return true;
+  // Mobile camera often sends empty type or generic image/*
+  if (file.type === "image/*" || file.type.startsWith("image/")) return true;
+  return false;
+}
+
 app.get("/health", (c) => c.json({ ok: true, service: "fatura-ai" }));
 
 app.post("/extract", async (c) => {
@@ -28,8 +50,15 @@ app.post("/extract", async (c) => {
   if (!file || !(file instanceof File)) {
     return c.json({ status: "failed", warnings: ["file alanı gerekli"], invoice: null }, 400);
   }
-  if (!/\.pdf$/i.test(file.name) && file.type !== "application/pdf") {
-    return c.json({ status: "failed", warnings: ["Sadece PDF kabul edilir"], invoice: null }, 400);
+  if (!isAllowedUpload(file)) {
+    return c.json(
+      {
+        status: "failed",
+        warnings: ["PDF veya fatura fotoğrafı (JPG/PNG/WEBP/HEIC) yükleyin"],
+        invoice: null,
+      },
+      400,
+    );
   }
   const maxMb = Number(process.env.MAX_UPLOAD_MB ?? 20);
   if (file.size > maxMb * 1024 * 1024) {

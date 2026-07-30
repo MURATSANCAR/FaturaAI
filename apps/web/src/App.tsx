@@ -75,8 +75,13 @@ function LineCard({
   );
 }
 
+const ACCEPT_UPLOAD =
+  "application/pdf,.pdf,image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif";
+const ACCEPT_CAMERA = "image/*";
+
 export default function App() {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -125,7 +130,7 @@ export default function App() {
             FaturaAI
           </h1>
           <p className="mt-2 max-w-xl text-sm leading-relaxed text-slate-600">
-            e-Arşiv / e-Fatura PDF yükleyin; tüm alanlar ve okuma süresi anında görünsün.
+            e-Arşiv veya e-Fatura PDF / fotoğraf yükleyin ya da telefondan çekin; alanlar ve okuma süresi anında görünsün.
           </p>
         </div>
         <a
@@ -165,19 +170,29 @@ export default function App() {
           </div>
           <div className="px-1">
             <p className="font-display text-base font-semibold text-slate-900 sm:text-lg">
-              <span className="sm:hidden">PDF faturanızı seçin</span>
-              <span className="hidden sm:inline">PDF faturanızı sürükleyip bırakın</span>
+              <span className="sm:hidden">Fatura PDF veya fotoğraf seçin</span>
+              <span className="hidden sm:inline">PDF / fotoğraf sürükleyip bırakın</span>
             </p>
-            <p className="mt-1 text-sm text-slate-500">veya dosya seçin · max 20 MB</p>
+            <p className="mt-1 text-sm text-slate-500">
+              e-Arşiv · e-Fatura · PDF, JPG, PNG · max 20 MB
+            </p>
           </div>
           <div className="flex w-full max-w-sm flex-col gap-2 sm:max-w-none sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-center sm:gap-3">
             <button
               type="button"
               className="btn-primary w-full sm:w-auto"
               disabled={loading}
-              onClick={() => inputRef.current?.click()}
+              onClick={() => uploadInputRef.current?.click()}
             >
-              {loading ? "Okunuyor…" : "Fatura seç"}
+              {loading ? "Okunuyor…" : "Yükle"}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary w-full sm:w-auto"
+              disabled={loading}
+              onClick={() => cameraInputRef.current?.click()}
+            >
+              Foto çek
             </button>
             {(result || error) && (
               <button
@@ -195,11 +210,25 @@ export default function App() {
             )}
           </div>
           <input
-            ref={inputRef}
+            ref={uploadInputRef}
             type="file"
-            accept="application/pdf,.pdf"
+            accept={ACCEPT_UPLOAD}
             className="hidden"
-            onChange={(e) => onFiles(e.target.files)}
+            onChange={(e) => {
+              onFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept={ACCEPT_CAMERA}
+            capture="environment"
+            className="hidden"
+            onChange={(e) => {
+              onFiles(e.target.files);
+              e.target.value = "";
+            }}
           />
           {fileName && (
             <p className="max-w-full px-2 text-xs text-slate-500 [overflow-wrap:anywhere]">

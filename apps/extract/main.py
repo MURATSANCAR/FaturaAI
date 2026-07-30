@@ -26,7 +26,22 @@ ALLOWED_ORIGINS = [
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 ENABLE_DOCLING = os.getenv("ENABLE_DOCLING", "1") == "1"
 ENABLE_DOCLING_OCR = os.getenv("ENABLE_DOCLING_OCR", "0") == "1"
+# Phone photos always OCR; PDF OCR stays behind ENABLE_DOCLING_OCR unless forced.
+FORCE_IMAGE_OCR = os.getenv("FORCE_IMAGE_OCR", "1") == "1"
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
+IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".heic",
+    ".heif",
+}
 
 app = FastAPI(title="FaturaAI Extract", version="2.0.0")
 app.add_middleware(

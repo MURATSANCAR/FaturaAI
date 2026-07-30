@@ -71,6 +71,10 @@ function legacyResult(
   };
 }
 
+function isImageFileName(fileName: string): boolean {
+  return /\.(jpe?g|png|webp|heic|heif|tif|tiff|bmp)$/i.test(fileName);
+}
+
 export async function extractInvoice(
   buffer: Buffer,
   fileName: string,
@@ -83,6 +87,25 @@ export async function extractInvoice(
       ...v2,
       durationMs: Math.round(performance.now() - started),
     };
+  }
+  // Prefer v2 even when partial; only fall through when v2 unavailable/hard-fail
+  if (v2 && isImageFileName(fileName)) {
+    return {
+      ...v2,
+      durationMs: Math.round(performance.now() - started),
+    };
+  }
+  if (isImageFileName(fileName)) {
+    return legacyResult(
+      null,
+      "docling",
+      Math.round(performance.now() - started),
+      [
+        v2?.warnings?.[0] ??
+          "Fotoğraf okuma servisi yanıt vermedi. PDF deneyin veya tekrar deneyin.",
+      ],
+      null,
+    );
   }
 
   const warnings: string[] = [];
