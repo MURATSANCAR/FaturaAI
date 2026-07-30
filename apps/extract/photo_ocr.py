@@ -1,13 +1,13 @@
 """High-quality photo OCR for Turkish invoices / receipts.
 
 Stack (open-source, CPU):
-  OpenCV preprocess → RapidOCR Latin PP-OCRv5 (primary) + PP-OCRv6
+  OpenCV preprocess → RapidOCR Latin PP-OCRv5 (primary) + optional PP-OCRv6
   → Tesseract tur+eng only as last-resort if RapidOCR structure is weak
 
-Improvements for GİB document screenshots (not brand-specific):
-  - Aggressive upscale for tiny UI thumbnails
-  - Column-aware reading order (left block then right)
-  - Extra binary / sharp preprocess candidates on small images
+Speed-first strategy (generic, not brand-specific):
+  - One good pass + early exit when GİB structure is already readable
+  - Extra engines / strong / binary / Tesseract only when structure is weak
+  - Modest upscale (default 2000px) instead of always 2800–4200
 """
 
 from __future__ import annotations
@@ -23,13 +23,15 @@ import cv2
 import numpy as np
 
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
-PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1800"))
-PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2800"))
-PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "4200"))
+PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1400"))
+PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2000"))
+PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "2800"))
 PHOTO_OCR_CLAHE = os.getenv("PHOTO_OCR_CLAHE", "1") == "1"
-PHOTO_OCR_DUAL = os.getenv("PHOTO_OCR_DUAL", "1") == "1"
+# Dual engine only as fallback when latin pass is weak (set 1 to always run both).
+PHOTO_OCR_DUAL = os.getenv("PHOTO_OCR_DUAL", "0") == "1"
 PHOTO_OCR_TESSERACT = os.getenv("PHOTO_OCR_TESSERACT", "1") == "1"
 PHOTO_OCR_COLUMNS = os.getenv("PHOTO_OCR_COLUMNS", "1") == "1"
+PHOTO_OCR_EARLY_STRUCT = int(os.getenv("PHOTO_OCR_EARLY_STRUCT", "8"))
 
 _engine_latin = None
 _engine_v6 = None
@@ -39,13 +41,25 @@ _STRUCT_RE = re.compile(
     r"(?:"
     r"\bETTN\b|\bETIN\b|\bTOPLAM\b|\bTOPKDV\b|\bARA\s*TOPLAM\b|"
     r"\bBELGE\s*N[O0]\b|\bBE[LİI]?GE\s*N[O0]\b|"
-    r"\bFATURA\s*N[O0]\b|\bFATERA\s*N[O0]\b|"
-    r"\bVKN\b|\bKDV\b|\badet\s*[x×X]\b|"
+    r"\bFATURA\s*N[O0]\b|\bFATERA\s*N[O0]\b|\bFATARA\s*N[AO0]\b|"
+    r"\bVKN\b|\bKDV\b|\badet\s*[x×X]\b|\b\d+\s*Ade[t1l]?\b|"
     r"\bTAR[İI]H\b|\bMERS[İI]S\b|\b[ÖO]DENECEK\b|"
     r"\bSAY[İI]N\b|\bSAYDN\b|\bSAVIN\b|"
     r"\bSENARYO\b|\bAL[İI]C[İI]\b|\bSAT[İI]C[İI]\b|"
     r"\be-?Ar[sş]iv\b|\bB[İI]LG[İI]\s*F[İIİI]?[ŞS]\b|"
     r"\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}"
+    r")",
+    re.I,
+)
+
+_GIB_HINT_RE = re.compile(
+    r"(?:"
+    r"\bETTN\b|"
+    r"\b(?:FATURA|FATERA|FATARA|FATACA|PATARA)\s*N[AO0]\b|"
+    r"\b[A-Z]{2,5}\d{10,16}\b|"
+    r"\bVKN\b|"
+    r"\b[ÖO]DEN|\bTOPLAM\b|"
+    r"\d{1,3}(?:[.,\s]\d{3})+[.,]\d{2}"
     r")",
     re.I,
 )
@@ -75,12 +89,12 @@ def _make_v6_engine():
     return RapidOCR()
 
 
-def get_engines() -> tuple[Any, Any | None]:
+def get_engines(*, need_v6: bool = False) -> tuple[Any, Any | None]:
     global _engine_latin, _engine_v6
     with _engine_lock:
         if _engine_latin is None:
             _engine_latin = _make_latin_engine()
-        if PHOTO_OCR_DUAL and _engine_v6 is None:
+        if (need_v6 or PHOTO_OCR_DUAL) and _engine_v6 is None:
             try:
                 _engine_v6 = _make_v6_engine()
             except Exception:
@@ -128,7 +142,11 @@ def _resize_long_side(img: np.ndarray, target: int) -> np.ndarray:
     if long_side == target:
         return img
     scale = target / long_side
-    interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+    # LANCZOS4 upscales UI screenshots sharper than CUBIC
+    if scale > 1:
+        interp = getattr(cv2, "INTER_LANCZOS4", cv2.INTER_CUBIC)
+    else:
+        interp = cv2.INTER_AREA
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=interp)
 
 
@@ -142,12 +160,11 @@ def preprocess_bgr(
 ) -> np.ndarray:
     h, w = img.shape[:2]
     long_side = max(h, w)
-    # Tiny UI screenshots need heavier upscale than phone receipt photos
     if target_side is None:
         if long_side < 700:
-            target_side = min(PHOTO_OCR_MAX_SIDE, 4000 if strong else 3600)
+            target_side = min(PHOTO_OCR_MAX_SIDE, 2400 if strong else 2000)
         elif strong:
-            target_side = min(PHOTO_OCR_MAX_SIDE, 3200)
+            target_side = min(PHOTO_OCR_MAX_SIDE, max(PHOTO_OCR_TARGET_SIDE, 2200))
         else:
             target_side = PHOTO_OCR_TARGET_SIDE
 
@@ -282,6 +299,14 @@ def structure_score(text: str) -> int:
     return len(_STRUCT_RE.findall(text or ""))
 
 
+def _good_enough(text: str, min_struct: int | None = None) -> bool:
+    """Stop multi-pass OCR when text already looks like a usable e-invoice."""
+    threshold = PHOTO_OCR_EARLY_STRUCT if min_struct is None else min_struct
+    if structure_score(text) < threshold:
+        return False
+    return bool(_GIB_HINT_RE.search(text or ""))
+
+
 def _rank_key(c: tuple[str, str, float, int]) -> tuple:
     eng, text, mean, n = c
     struct = structure_score(text)
@@ -293,6 +318,7 @@ def _rank_key(c: tuple[str, str, float, int]) -> tuple:
         "ppocrv6": 5.0,
         "ppocrv6-strong": 4.0,
         "ppocrv6-binary": 3.0,
+        "ppocrv6-nodeskew": 6.0,
         "tesseract-tur": -25.0,
     }.get(eng, 0.0)
     return (
@@ -317,7 +343,7 @@ def _tesseract_tur(path: Path) -> str:
             ["tesseract", tmp_path, "stdout", "-l", "tur+eng", "--psm", "6"],
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=45,
             check=False,
         )
         return r.stdout or ""
@@ -335,41 +361,62 @@ def _run_engine(engine: Any, img: np.ndarray, label: str, candidates: list) -> N
 
 
 def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
-    """Return (text, meta)."""
+    """Return (text, meta). Fast-first: early-exit after a strong single pass."""
     if not PHOTO_OCR_ENABLED:
         return "", {"engine": "disabled", "lineCount": 0, "elapsedMs": 0}
 
     started = time.perf_counter()
     raw = _load_bgr(path)
-    tiny = max(raw.shape[:2]) < 700
-    img = preprocess_bgr(raw, strong=False, deskew=not tiny)
-    latin, v6 = get_engines()
-
+    h0, w0 = raw.shape[:2]
+    long0 = max(h0, w0)
+    tiny = long0 < 700
+    # Tall phone screenshots / chat exports: deskew often smears fine fonts
+    screenshotish = tiny or (h0 > w0 * 1.35 and long0 < 1400)
+    latin, _ = get_engines(need_v6=PHOTO_OCR_DUAL)
+    v6 = None
     candidates: list[tuple[str, str, float, int]] = []
+
+    # Pass 1: single latin (nodeskew for screenshots)
+    img = preprocess_bgr(raw, strong=False, deskew=not screenshotish)
     _run_engine(latin, img, "latin-ppocrv5", candidates)
+    best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+    early = False
 
-    if v6 is not None:
-        _run_engine(v6, img, "ppocrv6", candidates)
+    if candidates and _good_enough(best[1]) and not PHOTO_OCR_DUAL:
+        early = True
+    else:
+        # Pass 2: second engine only when needed (or dual forced)
+        if PHOTO_OCR_DUAL or not _good_enough(best[1], PHOTO_OCR_EARLY_STRUCT):
+            _, v6 = get_engines(need_v6=True)
+            if v6 is not None:
+                _run_engine(v6, img, "ppocrv6", candidates)
+                best = max(candidates, key=_rank_key)
 
-    # No-deskew pass helps UI screenshots (deskew can smear fine fonts)
-    if tiny or (candidates and structure_score(max(candidates, key=_rank_key)[1]) < 12):
-        img_nd = preprocess_bgr(raw, strong=False, deskew=False)
-        _run_engine(latin, img_nd, "latin-ppocrv5-nodeskew", candidates)
+        if candidates and _good_enough(best[1]):
+            early = True
+        else:
+            if v6 is None:
+                _, v6 = get_engines(need_v6=True)
+            # Pass 3: nodeskew / strong only if still weak
+            if screenshotish or structure_score(best[1]) < PHOTO_OCR_EARLY_STRUCT + 2:
+                img_nd = preprocess_bgr(raw, strong=False, deskew=False)
+                _run_engine(latin, img_nd, "latin-ppocrv5-nodeskew", candidates)
+                if v6 is not None and structure_score(max(candidates, key=_rank_key)[1]) < 10:
+                    _run_engine(v6, img_nd, "ppocrv6-nodeskew", candidates)
+                best = max(candidates, key=_rank_key)
 
-    best_so_far = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
-    need_strong = structure_score(best_so_far[1]) < (10 if tiny else 8)
-    if need_strong:
-        img2 = preprocess_bgr(raw, strong=True, deskew=not tiny)
-        _run_engine(latin, img2, "latin-ppocrv5-strong", candidates)
-        if v6 is not None:
-            _run_engine(v6, img2, "ppocrv6-strong", candidates)
+            if structure_score(best[1]) < (10 if tiny else 8):
+                img2 = preprocess_bgr(raw, strong=True, deskew=not screenshotish)
+                _run_engine(latin, img2, "latin-ppocrv5-strong", candidates)
+                if v6 is not None:
+                    _run_engine(v6, img2, "ppocrv6-strong", candidates)
+                best = max(candidates, key=_rank_key)
 
-    # Binary adaptive threshold often recovers dense GİB tables on screenshots
-    if tiny or structure_score(max(candidates, key=_rank_key)[1] if candidates else "") < 10:
-        img_bin = preprocess_bgr(raw, strong=True, deskew=False, binary=True)
-        _run_engine(latin, img_bin, "latin-ppocrv5-binary", candidates)
-        if v6 is not None:
-            _run_engine(v6, img_bin, "ppocrv6-binary", candidates)
+            if tiny or structure_score(best[1]) < 8:
+                img_bin = preprocess_bgr(raw, strong=True, deskew=False, binary=True)
+                _run_engine(latin, img_bin, "latin-ppocrv5-binary", candidates)
+                if v6 is not None:
+                    _run_engine(v6, img_bin, "ppocrv6-binary", candidates)
 
     if not candidates:
         return "", {
@@ -378,16 +425,17 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
             "elapsedMs": int((time.perf_counter() - started) * 1000),
         }
 
-    best_so_far = max(candidates, key=_rank_key)
-    if PHOTO_OCR_TESSERACT and structure_score(best_so_far[1]) < 6:
+    best = max(candidates, key=_rank_key)
+    # Tesseract only when RapidOCR is clearly empty of invoice structure
+    if PHOTO_OCR_TESSERACT and structure_score(best[1]) < 4:
         try:
             tess = _tesseract_tur(path)
             if tess.strip():
                 candidates.append(("tesseract-tur", tess, 0.55, tess.count("\n") + 1))
+                best = max(candidates, key=_rank_key)
         except Exception:
             pass
 
-    best = max(candidates, key=_rank_key)
     text = best[1]
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return text, {
@@ -401,4 +449,6 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         "structureScore": structure_score(best[1]),
         "altStructure": {c[0]: structure_score(c[1]) for c in candidates},
         "tinyInput": tiny,
+        "earlyExit": early,
+        "screenshotish": screenshotish,
     }
