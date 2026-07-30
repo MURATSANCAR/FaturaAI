@@ -1353,6 +1353,10 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
     if ym:
         year = int(ym.group(1))
         if year < 2010 or year > 2100:
+            fixed = normalize_gib_invoice_number(inv.invoiceNumber)
+            ym2 = re.match(r"^[A-Z]{2,5}(\d{4})", fixed or "")
+            year = int(ym2.group(1)) if ym2 else year
+        if year < 2010 or year > 2100:
             return False
     # Reject when line totals are clearly not the invoice (bad thermal OCR names)
     line_sum = sum(l.lineTotal or 0.0 for l in inv.lines if l.lineTotal is not None)
@@ -2811,6 +2815,24 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             )[0].strip(" :.-")
             if len(cand) >= 5 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
                 customer.name = cand[:80]
+    # Photo OCR often drops the SAYIN label; recover person name near TCKN
+    if not customer.name or customer.name == "Nihai Tüketici":
+        tckn_m = re.search(r"\bTCKN\s*:?\s*\d{11}\b", text, re.I)
+        if tckn_m:
+            before = text[max(0, tckn_m.start() - 500) : tckn_m.start()]
+            for ln in reversed([x.strip() for x in before.splitlines() if x.strip()][-8:]):
+                if re.search(
+                    r"(?i)ANON[İI]M|Ş[İI]RKET|LTD|A\.?\s*Ş|VKN|ETTN|e-?Ar[sş]iv|"
+                    r"Fatura|Senaryo|Sipari|Mah\.|Cad\.|Sok\.|No:|Vergi",
+                    ln,
+                ):
+                    continue
+                words = ln.split()
+                if 2 <= len(words) <= 6 and re.match(r"^[A-ZÇĞİÖŞÜ]", ln):
+                    letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", ln)
+                    if len(letters) >= 6:
+                        customer.name = ln[:80]
+                        break
     if not customer.name or customer.name == "Nihai Tüketici":
         m = re.search(
             r"M[ÜU][ŞS]TER[İIÍ]\s*:?\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",

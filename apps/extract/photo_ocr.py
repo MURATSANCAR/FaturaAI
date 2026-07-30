@@ -411,16 +411,17 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
                 _run_engine(v6, img_hi, "ppocrv6-ettn", candidates)
             _run_engine(latin, img_hi, "latin-ppocrv5-ettn", candidates)
             cand_best = max(candidates, key=_rank_key)
-            # Don't drop a readable fatura serial just to chase a broken ETTN line
-            has_serial = lambda t: bool(re.search(r"\b[A-Z]{2,5}\d{10,16}\b", t or "", re.I))
-            if _ettn_hex_count(cand_best[1]) > _ettn_hex_count(prev_best[1]) or (
-                has_serial(cand_best[1]) or not has_serial(prev_best[1])
-            ):
-                if has_serial(cand_best[1]) or not has_serial(prev_best[1]):
-                    best = cand_best
-                elif _ettn_hex_count(cand_best[1]) >= 32:
-                    best = cand_best
-            if has_serial(prev_best[1]) and not has_serial(best[1]):
+
+            def has_serial(t: str) -> bool:
+                return bool(re.search(r"\b[A-Z]{2,5}\d{10,16}\b", t or "", re.I))
+
+            prev_n = _ettn_hex_count(prev_best[1])
+            new_n = _ettn_hex_count(cand_best[1])
+            if new_n >= 32 and (has_serial(cand_best[1]) or not has_serial(prev_best[1])):
+                best = cand_best
+            elif new_n > prev_n and has_serial(cand_best[1]):
+                best = cand_best
+            else:
                 best = prev_best
     else:
         _run_engine(latin, img, "latin-ppocrv5", candidates)
