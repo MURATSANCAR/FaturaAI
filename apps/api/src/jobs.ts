@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { extractInvoice } from "./extract.js";
 import type { ExtractResult } from "./types.js";
 import { pathHitStats } from "./lib/metrics.js";
+import { sanitizePublicMessage, toPublicExtractResult } from "./lib/public-facing.js";
 
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
@@ -48,8 +49,8 @@ function publicJob(job: InternalJob): JobRecord {
     finishedAt: job.finishedAt,
     fileName: job.fileName,
     queuePosition: pos,
-    result: job.result,
-    error: job.error,
+    result: job.result ? toPublicExtractResult(job.result) : null,
+    error: job.error ? sanitizePublicMessage(job.error) : null,
   };
 }
 
@@ -88,11 +89,11 @@ async function runJob(job: InternalJob): Promise<void> {
     if (job.status === "failed") failed += 1;
     else processed += 1;
     if (result.status === "failed") {
-      job.error = result.warnings?.[0] ?? "Okuma başarısız";
+      job.error = sanitizePublicMessage(result.warnings?.[0] ?? "Okuma başarısız");
     }
   } catch (err) {
     job.status = "failed";
-    job.error = err instanceof Error ? err.message : String(err);
+    job.error = sanitizePublicMessage(err instanceof Error ? err.message : String(err));
     failed += 1;
   } finally {
     job.finishedAt = Date.now();
