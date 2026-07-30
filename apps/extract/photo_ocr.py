@@ -360,6 +360,10 @@ def _run_engine(engine: Any, img: np.ndarray, label: str, candidates: list) -> N
         pass
 
 
+def _has_gib_serial(text: str) -> bool:
+    return bool(re.search(r"\b[A-Z]{2,5}\d{10,16}\b", text or "", re.I))
+
+
 def _ettn_hex_count(text: str) -> int:
     m = re.search(r"(?i)ETT?Ne?\s*[:\-]?\s*([^\n]{8,90})", text or "")
     if not m:
@@ -401,28 +405,6 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
             best = max(candidates, key=_rank_key) if candidates else best
             if candidates and _good_enough(best[1]):
                 early = True
-        # ETTN often needs a sharper pass on chat screenshots
-        if early and _ettn_hex_count(best[1]) < 32:
-            prev_best = best
-            img_hi = preprocess_bgr(
-                raw, strong=True, deskew=False, target_side=min(PHOTO_OCR_MAX_SIDE, 2800)
-            )
-            if v6 is not None:
-                _run_engine(v6, img_hi, "ppocrv6-ettn", candidates)
-            _run_engine(latin, img_hi, "latin-ppocrv5-ettn", candidates)
-            cand_best = max(candidates, key=_rank_key)
-
-            def has_serial(t: str) -> bool:
-                return bool(re.search(r"\b[A-Z]{2,5}\d{10,16}\b", t or "", re.I))
-
-            prev_n = _ettn_hex_count(prev_best[1])
-            new_n = _ettn_hex_count(cand_best[1])
-            if new_n >= 32 and (has_serial(cand_best[1]) or not has_serial(prev_best[1])):
-                best = cand_best
-            elif new_n > prev_n and has_serial(cand_best[1]):
-                best = cand_best
-            else:
-                best = prev_best
     else:
         _run_engine(latin, img, "latin-ppocrv5", candidates)
         best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
@@ -472,6 +454,29 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         }
 
     best = max(candidates, key=_rank_key)
+
+    # GİB screenshot: metadata (Fatura No / ETTN) sits in the right panel and is
+    # often missed at full-page scale — crop and OCR that panel once.
+    panel_note = ""
+    if screenshotish and (
+        not _has_gib_serial(best[1]) or _ettn_hex_count(best[1]) < 32
+    ):
+        if v6 is None:
+            _, v6 = get_engines(need_v6=True)
+        h, w = raw.shape[:2]
+        panel = raw[0 : int(h * 0.55), int(w * 0.40) : w]
+        panel_img = preprocess_bgr(
+            panel, strong=True, deskew=False, target_side=min(PHOTO_OCR_MAX_SIDE, 2000)
+        )
+        panel_cands: list[tuple[str, str, float, int]] = []
+        eng = v6 or latin
+        _run_engine(eng, panel_img, "gib-right-panel", panel_cands)
+        if panel_cands and panel_cands[0][1].strip():
+            merged = f"{best[1]}\n\n{panel_cands[0][1]}".strip()
+            best = (f"{best[0]}+panel", merged, best[2], best[3] + panel_cands[0][3])
+            panel_note = "panel"
+            candidates.append(best)
+
     # Tesseract only when RapidOCR is clearly empty of invoice structure
     if PHOTO_OCR_TESSERACT and structure_score(best[1]) < 4:
         try:
@@ -497,4 +502,5 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
         "tinyInput": tiny,
         "earlyExit": early,
         "screenshotish": screenshotish,
+        "panelBoost": panel_note or None,
     }
