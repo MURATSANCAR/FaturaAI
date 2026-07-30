@@ -255,8 +255,18 @@ def extract_embedded_ubl(data: bytes) -> str | None:
 def right_field(text: str, label: str) -> str | None:
     m = re.search(rf"{label}\s*:?\s*([^\n]+)", text, re.I)
     if not m:
+        # Markdown table: | Label: | value |
+        m = re.search(
+            rf"\|\s*{label}\s*:?\s*\|?\s*([^|\n]+)\|?",
+            text,
+            re.I,
+        )
+    if not m:
         return None
     raw = m.group(1).strip()
+    raw = re.sub(r"&#124;|&nbsp;|&amp;", " ", raw)
+    raw = re.sub(r"[|`\[\]]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" :.-")
     parts = [p.strip() for p in re.split(r"\s{2,}", raw) if p.strip()]
     return (parts[-1] if parts else raw) or None
 
@@ -267,14 +277,94 @@ def first_match(text: str, pattern: str, flags: int = re.I) -> str | None:
 
 
 def labeled_amount(text: str, label: str) -> float | None:
+    # Plain layout + OCR markdown tables (| Label | 1.234,56 TL |)
     re_ = re.compile(
-        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*([\d.\s]+,\d{{2,}})\s*(?:TL|TRY)?",
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*(?:\|+\s*)?([\d.\s]+,\d{{2,}})\s*(?:TL|TRY)?",
         re.I,
     )
     matches = list(re_.finditer(text))
-    if not matches:
-        return None
-    return parse_tr_money(matches[-1].group(1))
+    if matches:
+        return parse_tr_money(matches[-1].group(1))
+    re_nl = re.compile(
+        rf"{label}(?:\s*\([^)]*\))?\s*:?\s*\|?[^\n]{{0,40}}?\n+\s*\|?\s*([\d.\s]+,\d{{2,}})",
+        re.I,
+    )
+    matches = list(re_nl.finditer(text))
+    if matches:
+        return parse_tr_money(matches[-1].group(1))
+    return None
+
+
+def normalize_ocr_uuid(raw: str) -> str | None:
+    """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, B→8)."""
+    cleaned = raw.strip().upper()
+    # Drop obvious OCR insertions inside hex groups while preserving dashes
+    parts = cleaned.split("-")
+    if len(parts) == 5:
+        fixed_parts = []
+        expected = [8, 4, 4, 4, 12]
+        for part, n in zip(parts, expected):
+            p = (
+                part.replace("O", "0")
+                .replace("İ", "1")
+                .replace("I", "1")
+                .replace("L", "1")
+                .replace("S", "5")
+                .replace("B", "8")
+            )
+            p = re.sub(r"[^0-9A-F]", "", p)
+            if len(p) > n:
+                # Prefer keeping leading chars (common: extra digit inserted)
+                p = p[:n]
+            fixed_parts.append(p)
+        cleaned = "-".join(fixed_parts)
+    else:
+        cleaned = (
+            cleaned.replace("O", "0")
+            .replace("İ", "1")
+            .replace("I", "1")
+            .replace("L", "1")
+            .replace("S", "5")
+            .replace("B", "8")
+        )
+    cleaned = cleaned.lower()
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        cleaned,
+    ):
+        return cleaned
+    return None
+
+
+def gib_invoice_number(text: str, file_name: str = "") -> str | None:
+    """GIB-style fatura no: 3 letters + 13 digits (tolerate OCR spaces)."""
+    compact = re.sub(r"[\s|]+", "", text.upper())
+    m = re.search(r"\b([A-Z]{2,5}\d{10,16})\b", compact)
+    if m:
+        return m.group(1)
+    m = first_match(file_name, r"([A-Z]{2,5}\d{10,})")
+    return m.upper() if m else None
+
+
+def tesseract_ocr(path: Path) -> str:
+    r = subprocess.run(
+        [
+            "tesseract",
+            str(path),
+            "stdout",
+            "-l",
+            "tur+eng",
+            "--psm",
+            "6",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if r.returncode != 0 and not (r.stdout or "").strip():
+        raise RuntimeError(r.stderr.strip() or "tesseract failed")
+    return r.stdout or ""
 
 
 def parse_issue_date(raw: str | None) -> tuple[str | None, str | None]:
@@ -364,10 +454,18 @@ def extract_customer(text: str) -> Party:
             name_parts.append(ln)
     party.name = " ".join(name_parts).strip() or None
     if party.name:
+        party.name = re.split(
+            r"\s*[|\[]?\s*(?:Senaryo|Fatura\s+No|Fatura\s+Tipi|Özelleştirme)\b",
+            party.name,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" ,|;:-")
         halves = party.name.split()
         mid = len(halves) // 2
         if mid > 0 and " ".join(halves[:mid]) == " ".join(halves[mid:]):
             party.name = " ".join(halves[:mid])
+        if not party.name:
+            party.name = None
     party.address = ", ".join(addr_parts) or None
     near = block[:1500]
     vkn_tckn = first_match(near, r"VKN\s*/\s*TCKN\s*:?\s*(\d{10,11})")
@@ -503,8 +601,14 @@ def _rows_to_lines(rows: list[list[str]]) -> list[Line]:
 
 def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     text = text.replace("\x0c", "\n")
+    # Unescape common HTML entities from Docling markdown tables
+    text = (
+        text.replace("&#124;", "|")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+    )
     doc_type: Literal["earsiv", "efatura", "ubl", "unknown"] = "unknown"
-    if re.search(r"e-?Ar[sş]iv\s+Fatura|EARSIVFATURA", text, re.I):
+    if re.search(r"e-?Ar[sş]iv(?:\s+Fatura)?|EARSIVFATURA|e-?Ar[sş]iv\s+izni", text, re.I):
         doc_type = "earsiv"
     elif re.search(
         r"e-?Fatura|EFATURA|TICARIFATURA|TEMELFATURA|IHRACATFATURA|KAMUFATURA",
@@ -513,12 +617,26 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     ):
         doc_type = "efatura"
 
-    inv_no = right_field(text, "Fatura No") or first_match(file_name, r"([A-Z]{2,5}\d{10,})")
+    inv_no = gib_invoice_number(text, file_name)
+    labeled_no = right_field(text, "Fatura No")
+    if labeled_no:
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", labeled_no).upper()
+        if re.fullmatch(r"[A-Z]{2,5}\d{10,16}", cleaned):
+            inv_no = cleaned
     if inv_no:
         inv_no = re.sub(r"\s+", "", inv_no).upper()
+        if not re.fullmatch(r"[A-Z]{2,5}\d{10,16}", inv_no):
+            inv_no = None
 
-    issue_raw = right_field(text, "Fatura Tarihi") or first_match(
-        text, r"(?:^|\n)[^\n]*?\bTarih\s*:?\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})"
+    issue_raw = (
+        right_field(text, "Fatura Tarihi")
+        or first_match(
+            text,
+            r"Fatura\s*Tarihi\s*:?\s*[|(]*\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})",
+        )
+        or first_match(
+            text, r"(?:^|\n)[^\n]*?\bTarih\s*:?\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})"
+        )
     )
     issue_date, issue_time = parse_issue_date(issue_raw)
     for label in ("Fatura Saati", "Düzenleme Zamanı", "Oluşma Zamanı"):
@@ -530,16 +648,18 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 
     uuid = first_match(
         text,
-        r"ETTN\s*:?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"ETTN\s*:?\s*([0-9a-fA-FOoİIlLSBb]{8}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{4}-[0-9a-fA-FOoİIlLSBb]{12})",
     )
     if uuid:
-        uuid = uuid.lower()
+        uuid = normalize_ocr_uuid(uuid)
 
     net = labeled_amount(text, "Mal Hizmet Toplam Tutarı") or labeled_amount(text, "NET TOPLAM")
     discount = labeled_amount(text, "Toplam [İI]skonto") or labeled_amount(text, "TOPLAM [İI]SKONTO")
     line_ext = (
         round(net - discount, 2) if net is not None and discount and discount > 0 else net
     )
+
+    payable = labeled_amount(text, "Ödenecek Tutar") or labeled_amount(text, "ÖDENECEK TUTAR")
 
     iban = first_match(text, r"I?İ?BAN\s*:\s*(TR[\d\s]+)")
     if iban:
@@ -566,8 +686,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             or labeled_amount(text, "KDV"),
             taxInclusiveAmount=labeled_amount(text, "Vergiler Dahil Toplam Tutar")
             or labeled_amount(text, r"VERG[İI] DAH[İI]L TOPLAM TUTAR"),
-            payableAmount=labeled_amount(text, "Ödenecek Tutar")
-            or labeled_amount(text, "ÖDENECEK TUTAR"),
+            payableAmount=payable,
             currency="TRY",
         ),
         notes=[],
@@ -583,11 +702,27 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
     for k, v in over.items():
         if k in {"supplier", "customer", "totals", "lines", "notes"}:
             continue
-        if v and not data.get(k):
+        if not v:
+            continue
+        cur = data.get(k)
+        # Treat unknown documentType as empty so OCR/tesseract can fill earsiv/efatura
+        if k == "documentType" and cur in (None, "", "unknown"):
+            data[k] = v
+        elif v and not cur:
             data[k] = v
     for side in ("supplier", "customer"):
         for k, v in over[side].items():
             if v and not data[side].get(k):
+                data[side][k] = v
+            elif (
+                k == "name"
+                and v
+                and data[side].get(k)
+                and len(str(v)) < len(str(data[side][k]))
+                and "Senaryo" not in str(v)
+                and "Fatura" not in str(v)
+            ):
+                # Prefer cleaner shorter party name from tesseract when base is polluted
                 data[side][k] = v
     for k, v in over["totals"].items():
         if v is not None and data["totals"].get(k) is None:
@@ -680,12 +815,30 @@ def get_docling_converter(ocr: bool, for_image: bool = False):
             options.images_scale = IMAGE_OCR_SCALE
         except Exception:
             pass
+        # Prefer system tesseract (tur+eng on portal); fall back to RapidOCR / EasyOCR
+        ocr_opts = None
         try:
-            from docling.datamodel.pipeline_options import EasyOcrOptions
+            from docling.datamodel.pipeline_options import TesseractCliOcrOptions
 
-            options.ocr_options = EasyOcrOptions(lang=["tr", "en"])
+            ocr_opts = TesseractCliOcrOptions(lang=["tur", "eng"])
         except Exception:
-            pass
+            ocr_opts = None
+        if ocr_opts is None:
+            try:
+                from docling.datamodel.pipeline_options import RapidOcrOptions
+
+                ocr_opts = RapidOcrOptions()
+            except Exception:
+                ocr_opts = None
+        if ocr_opts is None:
+            try:
+                from docling.datamodel.pipeline_options import EasyOcrOptions
+
+                ocr_opts = EasyOcrOptions(lang=["tr", "en"])
+            except Exception:
+                ocr_opts = None
+        if ocr_opts is not None:
+            options.ocr_options = ocr_opts
 
     format_options: dict[Any, Any] = {
         InputFormat.PDF: PdfFormatOption(pipeline_options=options),
@@ -808,11 +961,29 @@ async def extract(
                         invoice.lines = inv_md.lines
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"docling-image-error:{exc}")
+                md = ""
+
+            # Supplemental Tesseract pass — often cleaner for GIB labels/totals
+            try:
+                tess = tesseract_ocr(path)
+                if tess.strip():
+                    pipeline.append("tesseract")
+                    text = tess
+                    inv_tess = parse_text_invoice(tess, name)
+                    invoice = merge_invoice(invoice, inv_tess)
+                    if not md.strip():
+                        md = tess
+                    else:
+                        md = md + "\n\n" + tess
+            except Exception as exc:  # noqa: BLE001
+                pipeline.append(f"tesseract-error:{exc}")
+
+            if not invoice.invoiceNumber and not invoice.totals.payableAmount and not invoice.lines and not invoice.supplier.name:
                 return ExtractResponse(
                     status="failed",
                     method="none",
                     durationMs=int((time.perf_counter() - started) * 1000),
-                    warnings=[f"Fotoğraf okunamadı: {exc}"],
+                    warnings=["Fotoğraf okunamadı — daha net çekim veya PDF deneyin"],
                     pipeline=pipeline,
                 )
         else:

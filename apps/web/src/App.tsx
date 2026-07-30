@@ -188,7 +188,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              className="btn-secondary w-full sm:w-auto"
+              className="btn-secondary w-full sm:hidden"
               disabled={loading}
               onClick={() => cameraInputRef.current?.click()}
             >
