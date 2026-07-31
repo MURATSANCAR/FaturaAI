@@ -1240,6 +1240,64 @@ def pdftotext(path: Path) -> str:
     return r.stdout or ""
 
 
+def is_unusable_extract_text(text: str) -> bool:
+    """True when text is empty, Docling image stubs only, or CID/binary soup."""
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+    without_img = re.sub(r"<!--\s*image\s*-->", "", stripped, flags=re.I).strip()
+    without_img = re.sub(r"&lt;|--+|#{1,6}\s*", " ", without_img)
+    if len(re.sub(r"\s+", "", without_img)) < 40:
+        return True
+    controls = sum(1 for c in stripped if ord(c) < 32 and c not in "\n\r\t")
+    if controls >= 15 or (len(stripped) > 80 and controls / max(len(stripped), 1) > 0.06):
+        return True
+    letters = sum(1 for c in stripped if c.isalpha())
+    if len(stripped) > 120 and letters < 20:
+        return True
+    return False
+
+
+def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[str, dict[str, Any]]:
+    """Render PDF pages and run photo OCR (for scanned / broken-text PDFs)."""
+    out_prefix = tmp / "raster"
+    r = subprocess.run(
+        [
+            "pdftoppm",
+            "-png",
+            "-r",
+            "200",
+            "-f",
+            "1",
+            "-l",
+            str(max_pages),
+            str(pdf_path),
+            str(out_prefix),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    pages = sorted(tmp.glob("raster*.png"))
+    if not pages:
+        raise RuntimeError(r.stderr.strip() or "pdftoppm produced no pages")
+    from photo_ocr import ocr_image
+
+    chunks: list[str] = []
+    meta: dict[str, Any] = {"pages": 0, "engine": None, "elapsedMs": 0}
+    for page in pages[:max_pages]:
+        txt, page_meta = ocr_image(page)
+        if txt.strip():
+            chunks.append(txt.strip())
+        meta["pages"] = int(meta["pages"]) + 1
+        meta["engine"] = page_meta.get("engine") or meta.get("engine")
+        meta["elapsedMs"] = int(meta.get("elapsedMs") or 0) + int(
+            page_meta.get("elapsedMs") or 0
+        )
+    return "\n\n".join(chunks), meta
+
+
 def extract_embedded_ubl(data: bytes) -> str | None:
     latin = data.decode("latin-1", errors="ignore")
     start = -1
@@ -1516,6 +1574,8 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
 def normalize_ocr_uuid(raw: str) -> str | None:
     """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, R→F, …)."""
     cleaned = raw.strip().upper().replace("‑", "-")
+    cleaned = cleaned.replace("\\_", "").replace("_", "").replace("{", "").replace("}", "")
+    cleaned = cleaned.replace("–", "-").replace("—", "-")
     # Non-hex OCR lookalikes (do not map valid hex letters B/C/D/A/E/F)
     safe_trans = str.maketrans(
         {
@@ -1734,11 +1794,11 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
 def extract_ettn_candidate(text: str) -> str | None:
     """Find ETTN even when OCR glues/truncates label (ETN…, ETTNe…) or mangles hex."""
     hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqzRrTtHhNnUuYyWwMm"
-    # Labeled, tolerate length slip per group
+    # Labeled; tolerate OCR junk labels (ETTı{ / ETİN) and underscore escapes
     m = re.search(
-        rf"(?i)ETT?Ne?\s*[:\-]?\s*"
-        rf"([{hexish}]{{6,10}}[-‑]?[{hexish}]{{3,5}}[-‑]?"
-        rf"[{hexish}]{{3,5}}[-‑]?[{hexish}]{{3,5}}[-‑]?[{hexish}]{{10,14}})",
+        rf"(?i)ETT[İIıiNnNne\{{]{{0,4}}\s*[:\-]?\s*"
+        rf"([{hexish}_\\]{{6,12}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?"
+        rf"[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{10,16}})",
         text,
     )
     if m:
@@ -1788,6 +1848,26 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         text,
         flags=re.I,
     )
+    # Explicit Fatura Tarihi first (ISO table cells from Docling/GİB)
+    fatura_iso = first_match(
+        scrubbed,
+        r"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|]*\s*"
+        r"(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+    )
+    if fatura_iso:
+        d, tm = parse_issue_date(fatura_iso)
+        if d:
+            return d, tm
+    fatura_tr = first_match(
+        scrubbed,
+        r"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|(]*\s*"
+        r"(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+    ) or right_field(scrubbed, "Fatura Tarihi")
+    if fatura_tr:
+        d, tm = parse_issue_date(fatura_tr.replace(",", "."))
+        if d:
+            return d, tm
+
     tarih_lbl = re.search(
         r"TAR[İI]H\s*:?\s*(\d{1,2}[./]\d{1,2}[./]\d{4})(?:\s+(\d{1,2}:\d{2}))?",
         scrubbed,
@@ -1814,15 +1894,8 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
             return d, tm
 
     issue_raw = (
-        right_field(scrubbed, "Fatura Tarihi")
-        or right_field(scrubbed, "Fatura Tarihi")
-        or right_field(scrubbed, "Tarih")
+        right_field(scrubbed, "Tarih")
         or right_field(scrubbed, "Tarth")
-        or first_match(
-            scrubbed,
-            r"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|(]*\s*"
-            r"(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
-        )
         or first_match(
             scrubbed,
             r"(?:Fatera\s*No|Fatura\s*No)[^\n]{0,40}?\n[^\n]*?"
@@ -1925,6 +1998,20 @@ def tesseract_ocr(path: Path) -> str:
 def parse_issue_date(raw: str | None) -> tuple[str | None, str | None]:
     if not raw:
         return None, None
+    # ISO from Docling/GİB tables: 2026-07-30 13:14:02
+    iso = re.search(
+        r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?",
+        raw,
+    )
+    if iso:
+        year, month, day = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100:
+            date = f"{year:04d}-{month:02d}-{day:02d}"
+            time_ = None
+            if iso.group(4) is not None and iso.group(5) is not None:
+                sec = iso.group(6) or "00"
+                time_ = f"{int(iso.group(4)):02d}:{iso.group(5)}:{sec}"
+            return date, time_
     m = re.search(
         r"(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?",
         raw,
@@ -1962,6 +2049,7 @@ def extract_supplier(text: str) -> Party:
         and not re.match(r"^\d{1,2}:\d{2}\b", ln.strip())
         and not re.match(r"^https?://", ln.strip(), re.I)
         and not re.search(r"Nolu\s+.*Fatura|Detay\s*Ekran|edoksis", ln.strip(), re.I)
+        and not re.search(r"<!--\s*image", ln.strip(), re.I)
         and not _is_registry_or_chrome_line(ln.strip())
     ]
     # Explicit Satıcı: label (GİB / ERP layouts)
@@ -2113,6 +2201,38 @@ def extract_supplier(text: str) -> Party:
     party.phone = re.sub(r"\s+", "", phone_raw) if phone_raw else None
     if party.phone and len(re.sub(r"\D", "", party.phone)) < 10:
         party.phone = None
+    # Docling often emits SAYIN first → empty head. Recover seller from any
+    # legal-entity line in the document (footer / merkez adres / imprint).
+    if not party.name or _looks_like_address_party_line(party.name):
+        legal = re.compile(
+            r"(?m)^(?:#+\s*)?"
+            r"([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&'\-]{2,90}"
+            r"(?:Ticaret|Sanayi|Perakende|Ma[ğg]azac[ıi]l[ıi]k|Marketleri|"
+            r"Anonim|Limited|Teknoloji|Bili[sş]im|Lojistik|İn[sş]aat)"
+            r".{0,48}"
+            r"(?:A\.?\s*[SŞ]\.?|LTD\.?\s*ŞT[İI]?\.?|ANON[İI]M\s+Ş[İI]RKET[İI]?))"
+            r"\s*$",
+            re.I,
+        )
+        # Prefer the longest legal-entity match (full unvan, not a mid-line fragment)
+        best = ""
+        for m in legal.finditer(text):
+            cand = re.sub(r"^#+\s*", "", m.group(1))
+            cand = re.sub(r"\s+", " ", cand).strip(" :.-#")
+            if (
+                len(cand) >= 8
+                and len(cand) > len(best)
+                and not _looks_like_address_party_line(cand)
+                and _party_name_quality(cand) >= 12
+                and not re.search(
+                    r"(?:Çözüm\s+Merkezi|İnternet\s+Sitesi|SAYIN|M[ÜU][ŞS]TER)",
+                    cand,
+                    re.I,
+                )
+            ):
+                best = cand
+        if best:
+            party.name = best[:180]
     return party
 
 
@@ -2282,7 +2402,7 @@ def parse_markdown_tables(md: str) -> list[Line]:
 def _rows_to_lines(rows: list[list[str]]) -> list[Line]:
     if not rows:
         return []
-    header = [h.lower() for h in rows[0]]
+    header = [re.sub(r"\s+", " ", h.lower()).strip() for h in rows[0]]
     # Skip non-item summary tables
     header_join = " ".join(header)
     if "mal hizmet toplam" in header_join or (
@@ -2291,46 +2411,120 @@ def _rows_to_lines(rows: list[list[str]]) -> list[Line]:
         # totals-only mini table — ignore for lines
         return []
 
-    def col(*names: str) -> int | None:
+    def col_prefer(*names: str, exclude: tuple[str, ...] = ()) -> int | None:
+        """Pick best header index: prefer longer/more specific label; skip excluded."""
+        best_i: int | None = None
+        best_score = -1
         for n in names:
+            n_l = n.lower()
             for i, h in enumerate(header):
-                if n in h:
-                    return i
-        return None
+                if n_l not in h:
+                    continue
+                if any(ex in h for ex in exclude):
+                    continue
+                # Prefer exact header equality over looser substring (açıklama vs tanım)
+                score = len(n_l) * 3 + len(h)
+                if h == n_l:
+                    score += 200
+                elif h.endswith(n_l) or h.startswith(n_l):
+                    score += 40
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+        return best_i
 
-    idx_id = col("sıra", "sira")
-    idx_name = col("mal/hizmet tanımı", "mal hizmet tanımı", "mal hizmet", "mal/hizmet", "açıklama", "tanım")
-    # Avoid matching "ürün kodu" as description
-    idx_code = col("ürün kodu", "urun kodu", "satıcı ürün")
-    idx_qty = col("miktar")
-    idx_unit_price = col("birim fiyat")
-    idx_line = col("mal hizmet tutarı", "hizmet tutarı")
-    idx_vat_rate = col("kdv oranı")
-    idx_vat_amt = col("kdv tutarı", "kdv tutari")
+    def desc_col() -> int | None:
+        """Description: prefer filled Tanım/Mal Hizmet over empty Açıklama."""
+        candidates: list[int] = []
+        for n in (
+            "mal/hizmet tanımı",
+            "mal hizmet tanımı",
+            "malzeme/hizmet",
+            "mal hizmet",
+            "mal/hizmet",
+            "tanım",
+            "cinsi",
+            "açıklama",
+        ):
+            i = col_prefer(n, exclude=("oran", "tutar", "miktar", "kod", "no"))
+            if i is not None and i not in candidates:
+                candidates.append(i)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Prefer column with more non-empty body cells
+        best_i = candidates[0]
+        best_fill = -1
+        for i in candidates:
+            fill = 0
+            for row in rows[1:]:
+                if i < len(row) and row[i].strip():
+                    fill += 1
+            # Prefer tanım/mal over açıklama on tie
+            bonus = 0
+            if "tanım" in header[i] or "hizmet" in header[i] or "cinsi" in header[i]:
+                bonus = 10
+            if fill + bonus > best_fill:
+                best_fill = fill + bonus
+                best_i = i
+        return best_i
+
+    idx_id = col_prefer("sıra no", "sira no", "sıra", "sira")
+    idx_name = desc_col()
+    idx_code = col_prefer(
+        "malzeme no",
+        "ürün kodu",
+        "urun kodu",
+        "stok kodu",
+        "satıcı ürün",
+        "kod",
+        exclude=("posta", "barkod no"),
+    )
+    idx_qty = col_prefer("miktar")
+    idx_unit_price = col_prefer("birim fiyat", "birim fiyati", "fiyat")
+    idx_line = col_prefer(
+        "mal hizmet tutarı",
+        "mal hizmet tutari",
+        "hizmet tutarı",
+        "satır tutarı",
+        "toplam tutar",
+        "tutar",
+        exclude=("kdv", "vergi", "iskonto", "matrah", "birim"),
+    )
+    idx_vat_rate = col_prefer("kdv oranı", "vergi oranı", "kdv oran", exclude=("tutar",))
+    idx_vat_amt = col_prefer("kdv tutarı", "kdv tutari", "vergi tutarı")
     if idx_name is None:
-        idx_name = col("açıklama", "tanım")
+        idx_name = col_prefer("açıklama", "tanım", "cinsi")
     if idx_line is None:
-        idx_line = col("tutarı", "tutar")
+        # Last resort: plain tutar still excluding kdv/iskonto
+        idx_line = col_prefer("tutarı", "tutari", "tutar", exclude=("kdv", "vergi", "iskonto", "matrah"))
     if idx_id is None:
         idx_id = 0
     if idx_vat_rate is None:
-        idx_vat_rate = col("oran")
+        idx_vat_rate = col_prefer("oran", exclude=("iskonto",))
+    # Never treat bare "Birim" (Adet/C62) as unit price
     if idx_unit_price is None:
-        idx_unit_price = col("birim")
-    if idx_code is None:
-        idx_code = col("kod")
-    # Prefer description column not equal to totals
+        idx_unit_price = col_prefer("birim fiyat", "fiyat", exclude=("miktar",))
+
     out: list[Line] = []
     for row in rows[1:]:
         if not row:
             continue
         raw_id = row[idx_id] if idx_id is not None and idx_id < len(row) else row[0]
-        if not re.match(r"^\d+$", raw_id.strip()):
+        id_s = raw_id.strip()
+        # Accept Sıra No (1,2,…) or numeric Malzeme/Stok codes as row ids
+        if not re.match(r"^\d{1,14}$", id_s):
             continue
         name = row[idx_name] if idx_name is not None and idx_name < len(row) else None
         code = row[idx_code] if idx_code is not None and idx_code < len(row) else None
+        # When first column is product code (not sıra), use it as code if name empty of code
+        if idx_id == 0 and code is None and re.match(r"^\d{5,}$", id_s):
+            code = id_s
         if code and name and code not in name:
             name = f"{code} {name}"
+        elif code and not name:
+            name = code
         qty_raw = row[idx_qty] if idx_qty is not None and idx_qty < len(row) else None
         qty = None
         unit = None
@@ -2357,13 +2551,35 @@ def _rows_to_lines(rows: list[list[str]]) -> list[Line]:
             if idx_vat_amt is not None and idx_vat_amt < len(row)
             else None
         )
-        # Avoid grabbing wrong "tutar" column that is unit price when ambiguous
-        if line_total is not None and unit_price is not None and qty and nearly_equal(line_total, unit_price) and qty > 1:
-            # likely swapped — keep as-is if product of qty matches alternate
-            pass
+        # Heal swapped KDV Tutarı vs Mal Hizmet Tutarı (generic)
+        if (
+            unit_price is not None
+            and qty
+            and qty > 0
+            and line_total is not None
+            and vat_amount is not None
+        ):
+            expected = round(unit_price * qty, 2)
+            if abs(line_total - expected) > 1.0 and abs(vat_amount - expected) <= 1.0:
+                line_total, vat_amount = vat_amount, line_total
+            elif abs(line_total - expected) > 1.0 and abs(line_total - expected * (vat_rate or 0) / 100) <= 1.0:
+                # line_total looks like VAT of unit*qty
+                if vat_amount is None or abs(vat_amount - expected) > 1.0:
+                    vat_amount, line_total = line_total, expected
+        elif unit_price is not None and qty and qty > 0 and line_total is not None:
+            expected = round(unit_price * qty, 2)
+            if abs(line_total - expected) > 1.0 and abs(line_total - expected) > expected * 0.4:
+                # Prefer recomputed extension when "tutar" column was VAT/iskonto
+                if vat_amount is not None and abs(line_total - vat_amount) < 0.05:
+                    line_total = expected
+                elif expected >= 1 and (line_total / expected) < 0.45:
+                    if vat_amount is None:
+                        vat_amount = line_total
+                    line_total = expected
+
         out.append(
             Line(
-                id=raw_id.strip(),
+                id=id_s if len(id_s) <= 6 else str(len(out) + 1),
                 name=(name or "").strip() or None,
                 quantity=qty,
                 unit=unit,
@@ -2495,6 +2711,17 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     ocr_lines = parse_ocr_line_items(text)
     if not ocr_lines:
         ocr_lines = parse_retail_pos_lines(text)
+    # Docling / GİB HTML→markdown pipe tables (generic; not OCR regex lines)
+    md_lines = parse_markdown_tables(text)
+    if md_lines:
+        if not ocr_lines or (
+            _lines_useful(md_lines)
+            and (
+                not _lines_useful(ocr_lines)
+                or sum(1 for l in md_lines if l.name) > sum(1 for l in ocr_lines if l.name)
+            )
+        ):
+            ocr_lines = md_lines
     retail_fiş = bool(
         re.search(r"\badet\s*[x×X]\b|B[İI]LG[İI]\s*F[İI][ŞS]|TOPKDV|BELGE\s*N[O0]|BEBGE\s*N[O0]", text, re.I)
     )
@@ -2966,12 +3193,33 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         else:
             customer.name = "Nihai Tüketici"
 
-    # Drop OCR junk lines when totals clearly don't match payable
+    # Drop OCR junk lines when totals clearly don't match payable — but first
+    # try healing swapped VAT↔extension (generic), don't wipe recoverable rows.
     if ocr_lines and payable:
         line_sum = sum(l.lineTotal or 0.0 for l in ocr_lines if l.lineTotal is not None)
         if line_sum > 0 and (line_sum / payable) < 0.45:
-            ocr_lines = []
-            lines_sum = None
+            healed = False
+            for l in ocr_lines:
+                if (
+                    l.unitPrice
+                    and l.quantity
+                    and l.quantity > 0
+                    and l.lineTotal is not None
+                ):
+                    expected = round(l.unitPrice * l.quantity, 2)
+                    if expected >= 1 and abs(l.lineTotal - expected) > 1.0:
+                        if l.vatAmount is None or abs(l.vatAmount - expected) > 1.0:
+                            if (l.lineTotal / expected) < 0.45:
+                                l.vatAmount = l.vatAmount or l.lineTotal
+                                l.lineTotal = expected
+                                healed = True
+            if healed:
+                line_sum = sum(l.lineTotal or 0.0 for l in ocr_lines if l.lineTotal is not None)
+            if line_sum > 0 and (line_sum / payable) < 0.45:
+                ocr_lines = []
+                lines_sum = None
+            else:
+                lines_sum = round(line_sum, 2) if line_sum else lines_sum
         elif line_sum > 0 and payable < line_sum * 0.55:
             # Payable is a stray footnote; prefer ödenecek/line reconciliation
             od = labeled_amount(text, r"[ÖO]DENECEK\s+TUTAR")
@@ -2990,6 +3238,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         _party_name_quality(supplier.name) < 6
         or _is_registry_or_chrome_line(supplier.name)
         or _looks_like_address_party_line(supplier.name)
+        or re.search(r"<!--\s*image", supplier.name or "", re.I)
     ):
         better = next(
             (
@@ -2998,8 +3247,14 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
                 if _party_name_quality(ln.strip()) >= 20
                 and not _is_registry_or_chrome_line(ln)
                 and not _looks_like_address_party_line(ln.strip())
+                and re.search(
+                    r"(?:A\.?\s*Ş\.?|LTD\.?\s*ŞT[İI]|ANON[İI]M|T[İI]CARET|MA[ĞG]AZA|Market)",
+                    ln,
+                    re.I,
+                )
                 and not re.search(
-                    r"(?:Arac[ıi]|Ta[şs][ıi]y[ıi]c[ıi])\s+Firma|^Not\s*:",
+                    r"(?:Arac[ıi]|Ta[şs][ıi]y[ıi]c[ıi])\s+Firma|^Not\s*:|Çözüm\s+Merkezi|"
+                    r"İnternet\s+Sitesi|Vergi\s+Dairesi|ETTN\s*:|YALNIZ\b|\|",
                     ln,
                     re.I,
                 )
@@ -3012,6 +3267,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             _party_name_quality(supplier.name) < 4
             or _is_registry_or_chrome_line(supplier.name)
             or _looks_like_address_party_line(supplier.name)
+            or re.search(r"<!--\s*image", supplier.name or "", re.I)
         ):
             supplier.name = None
 
@@ -3067,6 +3323,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
 def _looks_like_address_party_line(name: str) -> bool:
     """True when a line is an office/address block, not a legal company title."""
     n = name.strip()
+    if re.search(r"<!--\s*image", n, re.I):
+        return True
     if re.match(
         r"^(?:Kurumsal\s+Ofis|Merkez(?:\s+Ofis)?|Adres|Ofis)\s*:",
         n,
@@ -3079,10 +3337,19 @@ def _looks_like_address_party_line(name: str) -> bool:
         re.I,
     ):
         return True
+    # Street/quarter without legal form (e.g. "Kumludere cad 1 TOPÇUASIM/...")
+    if re.search(
+        r"(?i)\b(?:cad(?:de)?|mah(?:alle)?\.?|sok(?:ak)?|bul(?:var)?|no:|blok)\b",
+        n,
+    ) and not re.search(
+        r"(?i)(?:A\.?\s*Ş\.?|LTD\.?\s*ŞT[İI]|ANON[İI]M|T[İI]CARET|MA[ĞG]AZA|Market)",
+        n,
+    ):
+        return True
     # Long line dominated by address tokens without a clean legal-form title
     addr_hits = len(
         re.findall(
-            r"\b(?:Mahallesi|Mah\.|Cadde(?:si)?|Cad\.|Bulvar[ıi]?|Sokak|Sk\.|No:|Kat:|Blok)\b",
+            r"\b(?:Mahallesi|Mah\.|Cadde(?:si)?|Cad\.|cad\b|Bulvar[ıi]?|Sokak|Sk\.|No:|Kat:|Blok)\b",
             n,
             re.I,
         )
@@ -3413,6 +3680,19 @@ async def extract(
 
     ext = sniff_extension(data, name)
     as_image = is_image_ext(ext)
+    if not as_image and ext == ".pdf" and not data.startswith(b"%PDF"):
+        # Misnamed / corrupt upload (common portal fail)
+        _metrics["extract_failed"] += 1
+        return ExtractResponse(
+            status="failed",
+            method="none",
+            durationMs=int((time.perf_counter() - started) * 1000),
+            warnings=[
+                "Dosya geçerli bir PDF değil (bozuk, şifreli veya yanlış uzantı). "
+                "Orijinal e-fatura PDF/XML veya net fotoğraf yükleyin."
+            ],
+            pipeline=pipeline + ["invalid-pdf-magic"],
+        )
 
     with tempfile.TemporaryDirectory(prefix="fatura-ai-") as tmp:
         path = Path(tmp) / f"invoice{ext if ext != '.bin' else ('.jpg' if as_image else '.pdf')}"
@@ -3559,6 +3839,9 @@ async def extract(
             try:
                 text = await asyncio.to_thread(pdftotext, path)
                 pipeline.append("pdftotext")
+                if is_unusable_extract_text(text):
+                    pipeline.append("pdftotext-unusable")
+                    text = ""
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"pdftotext-error:{exc}")
 
@@ -3636,7 +3919,60 @@ async def extract(
                 or any("kalemi" in w for w in warnings)
             )
         )
-        if need_ocr:
+        # Scanned / broken-text PDFs: prod keeps ENABLE_DOCLING_OCR=0 for speed,
+        # so force raster photo-OCR (and optional Docling OCR) when extract is weak.
+        force_raster = (
+            not as_image
+            and "fast-path" not in pipeline
+            and PHOTO_OCR_ENABLED
+            and (
+                is_unusable_extract_text(md or text)
+                or (
+                    not invoice.invoiceNumber
+                    and (
+                        invoice.totals.payableAmount is None
+                        or validation.confidence < 0.55
+                        or status_from(warnings, validation) == "failed"
+                    )
+                )
+                or (
+                    bool(invoice.supplier.name)
+                    and sum(1 for c in (invoice.supplier.name or "") if ord(c) < 32) >= 2
+                )
+            )
+        )
+        if force_raster:
+            try:
+                raster_txt, raster_meta = await asyncio.to_thread(
+                    pdf_raster_ocr_text, path, Path(tmp), 2
+                )
+                if raster_txt.strip():
+                    pipeline.append(
+                        f"pdf-raster-ocr:{raster_meta.get('engine', '?')}:"
+                        f"{raster_meta.get('elapsedMs', 0)}ms:"
+                        f"p{raster_meta.get('pages', 0)}"
+                    )
+                    _metrics["photo_ocr"] += 1
+                    inv_r = parse_text_invoice(raster_txt, name)
+                    # Drop binary junk supplier before merge
+                    if invoice.supplier and invoice.supplier.name:
+                        if sum(1 for c in invoice.supplier.name if ord(c) < 32) >= 2:
+                            invoice.supplier.name = None
+                    invoice = merge_invoice(invoice, inv_r)
+                    if not _lines_useful(invoice.lines) and _lines_useful(inv_r.lines):
+                        invoice.lines = inv_r.lines
+                    text = (text + "\n\n" + raster_txt).strip() if text else raster_txt
+                    md = (md + "\n\n" + raster_txt).strip() if md else raster_txt
+                    warnings, validation = validate_invoice(invoice)
+            except Exception as exc:  # noqa: BLE001
+                pipeline.append(f"pdf-raster-ocr-error:{exc}")
+
+        still_weak = (
+            not invoice.invoiceNumber
+            or validation.confidence < 0.55
+            or is_unusable_extract_text(md or text)
+        )
+        if need_ocr or (force_raster and still_weak and ENABLE_DOCLING):
             try:
                 md2, table_lines2 = await run_docling(path, ocr=True, for_image=False)
                 pipeline.append("docling-ocr")

@@ -31,6 +31,23 @@ function emptyParty(): InvoiceParty {
 
 function parseIssueDateTime(raw: string | null): { date: string | null; time: string | null } {
   if (!raw) return { date: null, time: null };
+  // ISO (Docling/GİB tables): 2026-07-30 13:14:02
+  const iso = raw.match(
+    /(?<!\d)(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/,
+  );
+  if (iso) {
+    const year = Number(iso[1]);
+    const month = Number(iso[2]);
+    const day = Number(iso[3]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && year >= 1990 && year <= 2100) {
+      const date = `${iso[1]}-${iso[2]}-${iso[3]}`;
+      const time =
+        iso[4] != null && iso[5] != null
+          ? `${iso[4].padStart(2, "0")}:${iso[5]}:${(iso[6] ?? "00").padStart(2, "0")}`
+          : null;
+      return { date, time };
+    }
+  }
   const m = raw.match(
     /(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/,
   );
