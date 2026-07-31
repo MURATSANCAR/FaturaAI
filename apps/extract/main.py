@@ -270,6 +270,8 @@ def normalize_ocr_text(text: str) -> str:
     text = re.sub(r"\bT[8B]Y\b", "TRY", text)
     text = re.sub(r"\b[7T]RY\b", "TRY", text)
     text = re.sub(r"\bTRV\b", "TRY", text)
+    # Glued "118,09.TRY" / "1.457,08.TRY"
+    text = re.sub(r"(\d)\.TRY\b", r"\1 TRY", text, flags=re.I)
     replacements = (
         (r"\bSAYDN\b", "SAYIN"),
         (r"\bSAVIN\b", "SAYIN"),
@@ -633,9 +635,119 @@ def normalize_company_legal_ocr(name: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
+def parse_split_try_name_amount_lines(text: str) -> list[Line]:
+    """Pair numbered product names with separate unit/discount/%/total TRY rows.
+
+    Common phone-OCR GİB layout: names in one column block, amounts in another
+    (or names above, amount rows below) — not on the same line.
+    """
+    # Amount-only: 2.241,6700 TRY 784,58 TRY %20.00 1.457,08 TRY
+    amount_re = re.compile(
+        rf"(?m)^(?P<up>{_MONEY_TOKEN})\s*TRY\s+"
+        rf"(?P<disc>{_MONEY_TOKEN})\s*TRY\s+"
+        rf"%?\s*(?P<vat>\d{{1,4}}(?:[.,]\d+)?)\s+"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TRY\b",
+        re.I,
+    )
+    amounts = list(amount_re.finditer(text))
+    if not amounts:
+        return []
+
+    # Numbered product lines without money on the same line
+    name_re = re.compile(
+        rf"(?m)^(?P<seq>\d{{1,3}})\s+"
+        rf"(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,200}})$"
+    )
+    skip_name = re.compile(
+        r"(?i)^(?:NET|TOPLAM|KDV|VERGI|ODENE|ÖDENE|ARA|S[ıi]ra|Mal\s*/?\s*Hizmet|"
+        r"Birim\s*Fiyat|Iskonto|ETT?N|SAYIN|Fatura)"
+    )
+    names: list[tuple[str, str]] = []
+    rows = text.splitlines()
+    for i, ln in enumerate(rows):
+        m = name_re.match(ln.strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if skip_name.search(name):
+            continue
+        if re.search(rf"{_MONEY_TOKEN}\s*TRY", name, re.I):
+            continue
+        # Append asorti / colorway continuations on following lines
+        j = i + 1
+        while j < len(rows):
+            nxt = rows[j].strip()
+            if not nxt:
+                j += 1
+                continue
+            if name_re.match(nxt) or amount_re.match(nxt):
+                break
+            if re.search(r"(?i)Asort|//", nxt) and len(nxt) < 60:
+                name = f"{name} {nxt}".strip()
+                j += 1
+                continue
+            break
+        names.append((m.group("seq"), re.sub(r"\s+", " ", name)[:240]))
+
+    if not names:
+        # Fallback: SKU-like lines without leading sıra no
+        sku_re = re.compile(
+            rf"(?m)^(?P<name>[A-Z]{{2,5}}[-_][A-Z0-9\-_/]{{3,}}(?:\s*-\s*\d{{8,14}})?"
+            rf"(?:\s*-\s*.{{4,80}})?)$",
+            re.I,
+        )
+        for m in sku_re.finditer(text):
+            name = m.group("name").strip()
+            if re.search(rf"TRY|{_MONEY_TOKEN}", name, re.I):
+                continue
+            names.append((str(len(names) + 1), name[:240]))
+
+    if not names:
+        return []
+
+    out: list[Line] = []
+    n = min(len(names), len(amounts))
+    for i in range(n):
+        seq, name = names[i]
+        am = amounts[i]
+        # Skip amount rows that are clearly summary (unit ≈ total and huge discount block)
+        if re.search(r"(?i)NET\s*TOPLAM|TOPLAM\s*ISKONTO|ODENECEK|VERGI\s*DAHIL", name):
+            continue
+        _append_ocr_try_row(
+            out,
+            seq=seq,
+            name=name,
+            qty_raw="1",
+            unit_raw=am.group("up"),
+            disc_raw=am.group("disc"),
+            vat_raw=am.group("vat"),
+            total_raw=am.group("total"),
+        )
+    # Extra amount rows without names (same SKU repeats)
+    for i in range(n, len(amounts)):
+        am = amounts[i]
+        # Reuse last product name when totals look like duplicate SKU lines
+        name = names[-1][1] if names else f"Kalem {i + 1}"
+        _append_ocr_try_row(
+            out,
+            seq=str(i + 1),
+            name=name,
+            qty_raw="1",
+            unit_raw=am.group("up"),
+            disc_raw=am.group("disc"),
+            vat_raw=am.group("vat"),
+            total_raw=am.group("total"),
+        )
+    return out
+
+
 def parse_ocr_line_items(text: str) -> list[Line]:
     """Parse GİB-style flat OCR rows into invoice lines."""
     out: list[Line] = []
+    # Split layout first (names ≠ amount rows) — common on phone screenshots
+    split_lines = parse_split_try_name_amount_lines(text)
+    if split_lines:
+        return split_lines
     # qty unitPrice TRY discount TRY %vat lineTotal TRY
     row_re = re.compile(
         rf"^(\d{{1,3}})\s+(.+?)\s+"
