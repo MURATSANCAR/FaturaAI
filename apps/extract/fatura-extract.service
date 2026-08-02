@@ -11,7 +11,16 @@ Environment=ENABLE_DOCLING=1
 Environment=ENABLE_DOCLING_OCR=0
 Environment=FORCE_IMAGE_OCR=1
 Environment=PHOTO_OCR_ENABLED=1
+Environment=PHOTO_OCR_ENGINE=auto
+Environment=PHOTO_OCR_THREADS=8
+Environment=PHOTO_OCR_CONF_THRESHOLD=0.90
+Environment=PHOTO_OCR_WARMUP=1
 Environment=FAST_PATH_PDF=1
+Environment=PDF_RASTER_DPI=250
+Environment=EXTRACT_WORKERS=5
+Environment=OMP_NUM_THREADS=8
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
 Environment=DOCLING_MAX_INFLIGHT=1
 Environment=DOCLING_TIMEOUT_S=120
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
@@ -21,8 +30,8 @@ ExecStart=/data/nanobaseai/fatura/apps/extract/run.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
-# RapidOCR + Docling headroom (~2–3GB/worker × 4)
-MemoryMax=16G
+# PP-OCRv6 Small+Medium + Docling (~3–4GB/worker × 5)
+MemoryMax=24G
 
 [Install]
 WantedBy=multi-user.target

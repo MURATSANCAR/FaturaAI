@@ -32,9 +32,11 @@ FORCE_IMAGE_OCR = os.getenv("FORCE_IMAGE_OCR", "1") == "1"
 # Skip Docling when pdftotext already yields a strong invoice (metadata+totals).
 FAST_PATH_PDF = os.getenv("FAST_PATH_PDF", "1") == "1"
 FAST_PATH_MIN_CONF = float(os.getenv("FAST_PATH_MIN_CONF", "0.82"))
-# Photo path: RapidOCR PP-OCRv6 (ONNX) before Docling/Tesseract.
+# Photo path: PP-OCRv6 Small→Medium (OpenVINO auto / ONNX fallback).
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
+PHOTO_OCR_WARMUP = os.getenv("PHOTO_OCR_WARMUP", "1") == "1"
+PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "250")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
@@ -1266,7 +1268,7 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
             "pdftoppm",
             "-png",
             "-r",
-            "200",
+            str(PDF_RASTER_DPI),
             "-f",
             "1",
             "-l",
@@ -1285,7 +1287,12 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
     from photo_ocr import ocr_image
 
     chunks: list[str] = []
-    meta: dict[str, Any] = {"pages": 0, "engine": None, "elapsedMs": 0}
+    meta: dict[str, Any] = {
+        "pages": 0,
+        "engine": None,
+        "elapsedMs": 0,
+        "dpi": PDF_RASTER_DPI,
+    }
     for page in pages[:max_pages]:
         txt, page_meta = ocr_image(page)
         if txt.strip():
@@ -3616,16 +3623,31 @@ def docling_convert(path: Path, ocr: bool = False, for_image: bool = False) -> t
 
 @app.on_event("startup")
 def warmup() -> None:
-    if not ENABLE_DOCLING:
-        return
-    try:
-        get_docling_converter(ocr=False, for_image=False)
-    except Exception as exc:  # noqa: BLE001
-        print(f"docling warmup skipped: {exc}")
+    if ENABLE_DOCLING:
+        try:
+            get_docling_converter(ocr=False, for_image=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"docling warmup skipped: {exc}")
+    if PHOTO_OCR_ENABLED and PHOTO_OCR_WARMUP:
+        try:
+            from photo_ocr import warmup_engines
+
+            status = warmup_engines(include_medium=True)
+            print(f"photo OCR warmup: {status}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"photo OCR warmup skipped: {exc}")
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    photo_status: dict[str, Any] = {"enabled": PHOTO_OCR_ENABLED}
+    if PHOTO_OCR_ENABLED:
+        try:
+            from photo_ocr import engine_status
+
+            photo_status = engine_status()
+        except Exception as exc:  # noqa: BLE001
+            photo_status = {"enabled": True, "error": str(exc)}
     return {
         "ok": True,
         "service": "fatura-ai-extract",
@@ -3633,7 +3655,9 @@ def health() -> dict[str, Any]:
         "doclingOcr": ENABLE_DOCLING_OCR,
         "forceImageOcr": FORCE_IMAGE_OCR,
         "photoOcr": PHOTO_OCR_ENABLED,
+        "photoOcrStatus": photo_status,
         "fastPathPdf": FAST_PATH_PDF,
+        "pdfRasterDpi": PDF_RASTER_DPI,
         "doclingMaxInflight": DOCLING_MAX_INFLIGHT,
         "doclingTimeoutS": DOCLING_TIMEOUT_S,
         "inflight": _metrics["inflight"],

@@ -13,7 +13,7 @@ Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=EXTRACT_V2_URL=http://127.0.0.1:8106
 Environment=EXTRACT_V2_ENABLED=1
 Environment=PDF_FAST_PATH=1
-Environment=JOB_MAX_INFLIGHT=8
+Environment=JOB_MAX_INFLIGHT=6
 Environment=JOB_MAX_QUEUE=500
 Environment=RATE_LIMIT_PER_MIN=1200
 Environment=RATE_LIMIT_BURST=120

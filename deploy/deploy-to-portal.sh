@@ -53,8 +53,14 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 QA_SITE=$(/data/nanobaseai/NanobaseAI-QA/.venv/bin/python -c 'import site; print(":".join(site.getsitepackages()))')
 export PYTHONPATH="${DIR}:${QA_SITE}:${PYTHONPATH:-}"
-# Prefer extract venv for fastapi/uvicorn, QA site-packages for docling/torch
-WORKERS="${EXTRACT_WORKERS:-4}"
+# 5 OCR workers × 8 threads; leave headroom for PDF/API
+export PHOTO_OCR_THREADS="${PHOTO_OCR_THREADS:-8}"
+export OMP_NUM_THREADS="${PHOTO_OCR_THREADS}"
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+WORKERS="${EXTRACT_WORKERS:-5}"
 exec "$DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "${PORT:-8106}" --workers "$WORKERS"
 RUN
   chmod +x "$EXTRACT/run.sh"
@@ -63,7 +69,7 @@ else
   echo "Installing docling into extract venv (slow first time)"
   .venv/bin/pip install -q -U pip
   .venv/bin/pip install -q -r requirements.txt docling
-  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers ${EXTRACT_WORKERS:-4}"
+  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers ${EXTRACT_WORKERS:-5}"
 fi
 
 # systemd extract
@@ -82,20 +88,27 @@ Environment=ENABLE_DOCLING_OCR=0
 Environment=FORCE_IMAGE_OCR=1
 Environment=FAST_PATH_PDF=1
 Environment=PHOTO_OCR_ENABLED=1
-Environment=PHOTO_OCR_DUAL=0
+Environment=PHOTO_OCR_ENGINE=auto
+Environment=PHOTO_OCR_THREADS=8
+Environment=PHOTO_OCR_CONF_THRESHOLD=0.90
 Environment=PHOTO_OCR_TARGET_SIDE=2000
 Environment=PHOTO_OCR_MAX_SIDE=2800
+Environment=PHOTO_OCR_WARMUP=1
+Environment=PDF_RASTER_DPI=250
 Environment=IMAGE_OCR_SCALE=2.0
 Environment=DOCLING_MAX_INFLIGHT=1
 Environment=DOCLING_TIMEOUT_S=120
-Environment=EXTRACT_WORKERS=4
+Environment=EXTRACT_WORKERS=5
+Environment=OMP_NUM_THREADS=8
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
-MemoryMax=12G
+MemoryMax=24G
 
 [Install]
 WantedBy=multi-user.target

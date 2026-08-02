@@ -15,13 +15,14 @@ Browser
   → GET  /fatura-api/jobs/:id  (poll: queued|running|done)
 API (:8105)
   ├─ rate limit (IP)
-  ├─ job queue (max inflight 8, max queue 200)
+  ├─ job queue (max inflight 6, max queue 500)
   ├─ PDF fast-path: pdftotext/UBL (~ms–sn)
-  └─ weak PDF / foto → Extract v2 Docling
-Extract (:8106, uvicorn workers=4)
-  ├─ asyncio.to_thread(Docling) + semaphore
-  ├─ FAST_PATH_PDF (text-layer güçlüyse Docling skip)
-  └─ image OCR (Tesseract + Docling)
+  └─ weak PDF / foto → Extract v2
+Extract (:8106, uvicorn workers=5 × 8 OCR threads)
+  ├─ FAST_PATH_PDF (text-layer güçlüyse OCR/Docling skip)
+  ├─ Photo/raster OCR: PP-OCRv6 Small → (conf<0.90 / alan fail) → Medium
+  │    backend: OpenVINO (auto) → ONNX Runtime fallback
+  └─ Docling structure (+ optional OCR)
 ```
 
 ## Desteklenen girdiler
