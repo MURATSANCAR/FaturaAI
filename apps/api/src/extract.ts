@@ -1,4 +1,4 @@
-import { extractEmbeddedUblXml, extractPdfText } from "./lib/pdf.js";
+import { extractEmbeddedUblXml, extractPdfTextDetailed } from "./lib/pdf.js";
 import { parseGibPdfText, validateInvoice } from "./lib/parse-pdf-text.js";
 import { parseUblInvoice } from "./lib/parse-ubl.js";
 import { noteFastPath, noteV2 } from "./lib/metrics.js";
@@ -199,7 +199,8 @@ async function extractLegacyPdf(
     }
   }
 
-  const text = await extractPdfText(buffer);
+  const extracted = await extractPdfTextDetailed(buffer);
+  const text = extracted.text;
   if (!text.trim()) {
     return legacyResult(
       null,
@@ -212,13 +213,17 @@ async function extractLegacyPdf(
 
   const invoice = parseGibPdfText(text, name);
   warnings.push(...validateInvoice(invoice));
-  return legacyResult(
+  const result = legacyResult(
     invoice,
     "pdf-text",
     Math.round(performance.now() - started),
     warnings,
     text.slice(0, 2500),
   );
+  return {
+    ...result,
+    pipeline: [...(result.pipeline ?? []), extracted.source],
+  };
 }
 
 export async function extractInvoice(

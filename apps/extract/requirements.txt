@@ -2,6 +2,8 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 pydantic==2.11.7
 python-multipart==0.0.20
+# Digital PDF classify + text/markdown (CID-friendly); falls back to pdftotext
+pdf-inspector>=0.2.6
 # Optional: iPhone HEIC → JPEG (falls back to heif-convert/magick if missing)
 pillow-heif>=0.16.0; platform_system != "Windows"
 # Photo OCR: PP-OCRv6 Small→Medium (OpenVINO preferred, ONNX fallback)

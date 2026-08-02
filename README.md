@@ -16,9 +16,10 @@ Browser
 API (:8105)
   ├─ rate limit (IP)
   ├─ job queue (max inflight 6, max queue 500)
-  ├─ PDF fast-path: pdftotext/UBL (~ms–sn)
+  ├─ PDF fast-path: pdf-inspector → pdftotext / UBL (~ms–sn)
   └─ weak PDF / foto → Extract v2
 Extract (:8106, uvicorn workers=5 × 8 OCR threads)
+  ├─ pdf-inspector (text/CID) → pdftotext fallback
   ├─ FAST_PATH_PDF (text-layer güçlüyse OCR/Docling skip)
   ├─ Photo/raster OCR: PP-OCRv6 Small → (conf<0.90 / alan fail) → Medium
   │    backend: OpenVINO (auto) → ONNX Runtime fallback

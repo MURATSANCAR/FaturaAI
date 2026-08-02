@@ -32,6 +32,8 @@ FORCE_IMAGE_OCR = os.getenv("FORCE_IMAGE_OCR", "1") == "1"
 # Skip Docling when pdftotext already yields a strong invoice (metadata+totals).
 FAST_PATH_PDF = os.getenv("FAST_PATH_PDF", "1") == "1"
 FAST_PATH_MIN_CONF = float(os.getenv("FAST_PATH_MIN_CONF", "0.82"))
+# Firecrawl pdf-inspector before pdftotext (CID/markdown fallback).
+PDF_INSPECTOR_ENABLED = os.getenv("PDF_INSPECTOR_ENABLED", "1") == "1"
 # Photo path: PP-OCRv6 Small→Medium (OpenVINO auto / ONNX fallback).
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
@@ -1288,6 +1290,56 @@ def pdftotext(path: Path) -> str:
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "pdftotext failed")
     return r.stdout or ""
+
+
+def extract_pdf_plain_text(path: Path) -> tuple[str, list[str]]:
+    """Collect pdf-inspector + pdftotext (both when useful). Returns (text, tags).
+
+    Text is inspector-first, then pdftotext appended — callers that only parse once
+    still see both layouts. Prefer extract_pdf_texts + merge for best fields.
+    """
+    texts, tags = extract_pdf_texts(path)
+    if not texts:
+        return "", tags
+    # Prefer longer / richer blob for single-parse callers.
+    return "\n\n".join(texts), tags
+
+
+def extract_pdf_texts(path: Path) -> tuple[list[str], list[str]]:
+    """Return ([text...], pipeline tags) from pdf-inspector and/or pdftotext."""
+    tags: list[str] = []
+    texts: list[str] = []
+
+    if PDF_INSPECTOR_ENABLED:
+        try:
+            from pdf_inspector_text import available, extract_pdf_inspector
+
+            if available():
+                text, meta = extract_pdf_inspector(path)
+                src = meta.get("source") or "unknown"
+                tags.append(f"pdf-inspector:{src}")
+                if meta.get("pdfType"):
+                    tags.append(f"pdf-inspector-type:{meta['pdfType']}")
+                if text and not is_unusable_extract_text(text):
+                    texts.append(text)
+                elif text:
+                    tags.append("pdf-inspector-unusable")
+            else:
+                tags.append("pdf-inspector-unavailable")
+        except Exception as exc:  # noqa: BLE001
+            tags.append(f"pdf-inspector-error:{exc}")
+
+    try:
+        text = pdftotext(path)
+        tags.append("pdftotext")
+        if is_unusable_extract_text(text):
+            tags.append("pdftotext-unusable")
+        else:
+            texts.append(text)
+    except Exception as exc:  # noqa: BLE001
+        tags.append(f"pdftotext-error:{exc}")
+
+    return texts, tags
 
 
 def is_unusable_extract_text(text: str) -> bool:
@@ -3707,6 +3759,7 @@ def health() -> dict[str, Any]:
         "photoOcrMaxInflight": PHOTO_OCR_MAX_INFLIGHT,
         "photoOcrTimeoutS": PHOTO_OCR_TIMEOUT_S,
         "fastPathPdf": FAST_PATH_PDF,
+        "pdfInspector": PDF_INSPECTOR_ENABLED,
         "pdfRasterDpi": PDF_RASTER_DPI,
         "doclingMaxInflight": DOCLING_MAX_INFLIGHT,
         "doclingTimeoutS": DOCLING_TIMEOUT_S,
@@ -3909,16 +3962,18 @@ async def extract(
             if ubl and re.search(r"<(?:\w+:)?Invoice[\s>]", ubl, re.I):
                 pipeline.append("ubl")
 
-            try:
-                text = await asyncio.to_thread(pdftotext, path)
-                pipeline.append("pdftotext")
-                if is_unusable_extract_text(text):
-                    pipeline.append("pdftotext-unusable")
-                    text = ""
-            except Exception as exc:  # noqa: BLE001
-                pipeline.append(f"pdftotext-error:{exc}")
+            texts, text_tags = await asyncio.to_thread(extract_pdf_texts, path)
+            pipeline.extend(text_tags)
+            text = "\n\n".join(texts)
 
-            invoice = parse_text_invoice(text, name) if text.strip() else Invoice()
+            invoice = Invoice()
+            for blob in texts:
+                inv_part = parse_text_invoice(blob, name)
+                invoice = merge_invoice(invoice, inv_part)
+                if not invoice.lines and inv_part.lines:
+                    invoice.lines = inv_part.lines
+            if not texts:
+                invoice = Invoice()
             warnings_fp, validation_fp = validate_invoice(invoice)
 
             if FAST_PATH_PDF and strong_text_invoice(invoice, validation_fp):

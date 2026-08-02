@@ -1,0 +1,181 @@
+[
+  {
+    "file": "HAVA_SAVUNMA_SISTEMLERI_SANAYI_GIB2026000000059.pdf",
+    "ms": 10.8,
+    "meta": {
+      "pdfType": "text_based",
+      "source": "markdown",
+      "confidence": 1.0,
+      "charCount": 1372,
+      "hasEncodingIssues": false
+    },
+    "inspector": {
+      "invoiceNumber": "GIB2026000000059",
+      "issueDate": "2026-07-22",
+      "supplier": null,
+      "customer": "HAVA SAVUNMA SİSTEMLERİ SANAYİ TİCARET LİMİTED ŞİRKETİ Konut kent mah. Dumlupınar Bul. no399 Ankara No: Kapı No",
+      "payable": 18560.0,
+      "vat": 3200.0,
+      "lines": 0,
+      "line0": null
+    },
+    "inspectorWarnings": [
+      "Satıcı unvanı bulunamadı",
+      "Mal/hizmet kalemi bulunamadı"
+    ],
+    "golden": {
+      "from": "hava-savunma.pdftotext.txt",
+      "invoiceNumber": "GIB2026000000059",
+      "issueDate": "2026-07-22",
+      "supplier": "Bahattin yıldırım",
+      "customer": "HAVA SAVUNMA SİSTEMLERİ SANAYİ TİCARET LİMİTED ŞİRKETİ Konut kent mah. Dumlupınar Bul. no399 Ankara No: Kapı No",
+      "payable": 19200.0,
+      "vat": 3200.0,
+      "lines": 1,
+      "line0": "Oranı Tutarı Nedeni Tutarı",
+      "warnings": 1
+    }
+  },
+  {
+    "file": "MDA2022000002839.pdf",
+    "ms": 8.5,
+    "meta": {
+      "pdfType": "text_based",
+      "source": "extract_text",
+      "confidence": 1.0,
+      "charCount": 1344,
+      "hasEncodingIssues": false
+    },
+    "inspector": {
+      "invoiceNumber": "MDA2022000002839",
+      "issueDate": "2022-12-25",
+      "supplier": "TAŞ.SAN.VE TİC.LTD. ŞTİ.",
+      "customer": "SEVECEN MARKET SEVECEN\tMARKET MAMAK / ANKARA",
+      "payable": 5300.0,
+      "vat": 808.47,
+      "lines": 0,
+      "line0": null
+    },
+    "inspectorWarnings": [
+      "Mal/hizmet kalemi bulunamadı"
+    ],
+    "golden": {
+      "from": "mda.pdftotext.txt",
+      "invoiceNumber": "MDA2022000002839",
+      "issueDate": "2022-12-25",
+      "supplier": "TAŞ.SAN.VE TİC.LTD. ŞTİ.",
+      "customer": "SEVECEN MARKET                                                              Ozellestirme No: TR1.2 SEVECEN MARKET",
+      "payable": 5300.0,
+      "vat": 808.47,
+      "lines": 0,
+      "line0": null,
+      "warnings": 1
+    }
+  },
+  {
+    "file": "babymall-BBE2026000018085.pdf",
+    "ms": 5.7,
+    "meta": {
+      "pdfType": "text_based",
+      "source": "extract_text",
+      "confidence": 1.0,
+      "charCount": 1333,
+      "hasEncodingIssues": false
+    },
+    "inspector": {
+      "invoiceNumber": "BBE2026000018085",
+      "issueDate": "2026-07-19",
+      "supplier": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ",
+      "customer": "MURAT SANCAR ETİMESGUT / ANKARA",
+      "payable": 59.9,
+      "vat": 5.45,
+      "lines": 0,
+      "line0": null
+    },
+    "inspectorWarnings": [
+      "Mal/hizmet kalemi bulunamadı"
+    ],
+    "golden": {
+      "from": "babymall-1.pdftotext.txt",
+      "invoiceNumber": "BBE2026000018417",
+      "issueDate": "2026-07-22",
+      "supplier": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ",
+      "customer": "MURAT SANCAR",
+      "payable": 359.95,
+      "vat": 59.99,
+      "lines": 4,
+      "line0": "1 1,0",
+      "warnings": 0
+    }
+  },
+  {
+    "file": "babymall-BBE2026000018417.pdf",
+    "ms": 4.3,
+    "meta": {
+      "pdfType": "text_based",
+      "source": "extract_text",
+      "confidence": 1.0,
+      "charCount": 1543,
+      "hasEncodingIssues": false
+    },
+    "inspector": {
+      "invoiceNumber": "BBE2026000018417",
+      "issueDate": "2026-07-22",
+      "supplier": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ",
+      "customer": "MURAT SANCAR ETİMESGUT / ANKARA",
+      "payable": 359.95,
+      "vat": 59.99,
+      "lines": 4,
+      "line0": "Havlu 3x40lı"
+    },
+    "inspectorWarnings": [],
+    "golden": {
+      "from": "babymall-3.pdftotext.txt",
+      "invoiceNumber": "BBE2026000016055",
+      "issueDate": "2026-07-01",
+      "supplier": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ",
+      "customer": "MURAT SANCAR",
+      "payable": 2008.31,
+      "vat": 315.04,
+      "lines": 3,
+      "line0": "1 1,0",
+      "warnings": 0
+    }
+  },
+  {
+    "file": "earsiv_faturaKVI2026000009854.pdf",
+    "ms": 38.2,
+    "meta": {
+      "pdfType": "text_based",
+      "source": "extract_text",
+      "confidence": 1.0,
+      "charCount": 2123,
+      "hasEncodingIssues": false
+    },
+    "inspector": {
+      "invoiceNumber": "KVI2026000009854",
+      "issueDate": "2026-06-22",
+      "supplier": "KAMPVEÖTESİ SANAYİ VE TİCARET ANONİM ŞİRKETİ",
+      "customer": "MURAT SANCAR",
+      "payable": 5276.39,
+      "vat": 1758.8,
+      "lines": 0,
+      "line0": null
+    },
+    "inspectorWarnings": [
+      "Mal/hizmet kalemi bulunamadı"
+    ],
+    "golden": {
+      "from": "kvi.pdftotext.txt",
+      "invoiceNumber": "KVI2026000009854",
+      "issueDate": "2026-06-22",
+      "supplier": "KAMPVEÖTESİ SANAYİ VE TİCARET ANONİM ŞİRKETİ",
+      "customer": "Ozellestirme No: TR1.2 MURAT SANCAR",
+      "payable": 5276.39,
+      "vat": 879.4,
+      "lines": 0,
+      "line0": null,
+      "warnings": 1
+    }
+  }
+]

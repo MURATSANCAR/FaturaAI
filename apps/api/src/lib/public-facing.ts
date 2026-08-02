@@ -2,7 +2,7 @@ import type { ExtractResult } from "../types.js";
 
 /** Internal engine names that must never appear on portal / user-facing errors. */
 const TECH_RE =
-  /\b(?:docling|pdftotext|poppler|tesseract|photo-?ocr|rapidocr|paddle|pp-?ocr|onnx|uvicorn|fast-?path|pdf-text|ubl-fast|extract(?:\s*v2)?|legacy|pipeline|heic-jpeg|image-input)\b/i;
+  /\b(?:docling|pdftotext|poppler|tesseract|photo-?ocr|rapidocr|paddle|pp-?ocr|onnx|uvicorn|fast-?path|pdf-text|ubl-fast|pdf-?inspector|firecrawl|extract(?:\s*v2)?|legacy|pipeline|heic-jpeg|image-input)\b/i;
 
 const STACK_RE = /\b(?:Error:|Exception|Traceback|ECONNREFUSED|fetch failed|status code)\b/i;
 
