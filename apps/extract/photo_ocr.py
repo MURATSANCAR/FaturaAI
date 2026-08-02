@@ -30,15 +30,19 @@ PHOTO_OCR_COLUMNS = os.getenv("PHOTO_OCR_COLUMNS", "1") == "1"
 PHOTO_OCR_EARLY_STRUCT = int(os.getenv("PHOTO_OCR_EARLY_STRUCT", "8"))
 # Prefer OpenVINO; fall back to ONNX when init/infer fails (auto).
 PHOTO_OCR_ENGINE = os.getenv("PHOTO_OCR_ENGINE", "auto").strip().lower()
-PHOTO_OCR_THREADS = max(1, int(os.getenv("PHOTO_OCR_THREADS", "8")))
+# Keep threads modest under multi-worker; high values OOM OpenVINO.
+PHOTO_OCR_THREADS = max(1, int(os.getenv("PHOTO_OCR_THREADS", "4")))
 PHOTO_OCR_CONF_THRESHOLD = float(os.getenv("PHOTO_OCR_CONF_THRESHOLD", "0.90"))
 # Force Medium on every page (debug / quality A/B). Default: Small → Medium ladder.
 PHOTO_OCR_FORCE_MEDIUM = os.getenv("PHOTO_OCR_FORCE_MEDIUM", "0") == "1"
+# Serialize OCR inside a process — concurrent OpenVINO/ONNX in one worker OOMs.
+PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "1") == "1"
 
 _engine_small = None
 _engine_medium = None
 _engine_backend: str | None = None
 _engine_lock = threading.Lock()
+_infer_lock = threading.Lock()
 _engine_errors: list[str] = []
 
 _STRUCT_RE = re.compile(
@@ -171,8 +175,8 @@ def get_engines(*, need_medium: bool = False) -> tuple[Any, Any | None, str]:
         return _engine_small, _engine_medium, _engine_backend or "unknown"
 
 
-def warmup_engines(*, include_medium: bool = True) -> dict[str, Any]:
-    """Eager-load Small (+ Medium) so first request is not a cold download."""
+def warmup_engines(*, include_medium: bool = False) -> dict[str, Any]:
+    """Eager-load Small (Medium lazy) so workers stay RAM-light under load."""
     small, medium, backend = get_engines(need_medium=include_medium)
     return {
         "backend": backend,
@@ -194,6 +198,7 @@ def engine_status() -> dict[str, Any]:
         "threads": PHOTO_OCR_THREADS,
         "confThreshold": PHOTO_OCR_CONF_THRESHOLD,
         "forceMedium": PHOTO_OCR_FORCE_MEDIUM,
+        "serialize": PHOTO_OCR_SERIALIZE,
         "errors": list(_engine_errors[-5:]),
     }
 
@@ -490,7 +495,13 @@ def ocr_image(path: Path) -> tuple[str, dict[str, Any]]:
     """Return (text, meta). Small primary → Medium on low conf / field fail."""
     if not PHOTO_OCR_ENABLED:
         return "", {"engine": "disabled", "lineCount": 0, "elapsedMs": 0}
+    if PHOTO_OCR_SERIALIZE:
+        with _infer_lock:
+            return _ocr_image_unlocked(path)
+    return _ocr_image_unlocked(path)
 
+
+def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
     started = time.perf_counter()
     raw = _load_bgr(path)
     h0, w0 = raw.shape[:2]

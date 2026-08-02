@@ -9,41 +9,81 @@ const EXTRACT_V2_URL = process.env.EXTRACT_V2_URL ?? "http://127.0.0.1:8106";
 const EXTRACT_V2_ENABLED = process.env.EXTRACT_V2_ENABLED !== "0";
 /** Prefer fast local PDF parse before Docling (prod default on). */
 const PDF_FAST_PATH = process.env.PDF_FAST_PATH !== "0";
+const EXTRACT_V2_RETRIES = Math.max(1, Number(process.env.EXTRACT_V2_RETRIES ?? 3));
+const EXTRACT_V2_RETRY_MS = Math.max(200, Number(process.env.EXTRACT_V2_RETRY_MS ?? 1500));
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableExtractError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; message?: string; cause?: unknown };
+  const msg = `${e.name ?? ""} ${e.message ?? ""}`.toLowerCase();
+  if (
+    /abort|timeout|econnreset|econnrefused|fetch failed|socket|network|und_err|other side closed/.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  return isRetryableExtractError(e.cause);
+}
 
 async function extractViaV2(
   buffer: Buffer,
   fileName: string,
 ): Promise<ExtractResult | null> {
   if (!EXTRACT_V2_ENABLED) return null;
-  try {
-    const form = new FormData();
-    form.append("file", new Blob([new Uint8Array(buffer)]), fileName);
-    form.append("filename", fileName);
-    const res = await fetch(`${EXTRACT_V2_URL.replace(/\/$/, "")}/extract`, {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(180_000),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as ExtractResult & {
-      validation?: ExtractResult["validation"];
-      pipeline?: string[];
-    };
-    if (!data || typeof data.status !== "string") return null;
-    noteV2();
-    return {
-      status: data.status,
-      method: data.method || "nanobase-ai",
-      durationMs: data.durationMs ?? 0,
-      warnings: data.warnings ?? [],
-      invoice: data.invoice,
-      rawTextPreview: data.rawTextPreview ?? null,
-      validation: data.validation ?? null,
-      pipeline: data.pipeline ?? [],
-    };
-  } catch {
-    return null;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= EXTRACT_V2_RETRIES; attempt++) {
+    try {
+      const form = new FormData();
+      form.append("file", new Blob([new Uint8Array(buffer)]), fileName);
+      form.append("filename", fileName);
+      const res = await fetch(`${EXTRACT_V2_URL.replace(/\/$/, "")}/extract`, {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(180_000),
+      });
+      if (res.status === 503 || res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`extract HTTP ${res.status}`);
+        if (attempt < EXTRACT_V2_RETRIES) {
+          await sleep(EXTRACT_V2_RETRY_MS * attempt);
+          continue;
+        }
+        return null;
+      }
+      if (!res.ok) return null;
+      const data = (await res.json()) as ExtractResult & {
+        validation?: ExtractResult["validation"];
+        pipeline?: string[];
+      };
+      if (!data || typeof data.status !== "string") return null;
+      noteV2();
+      return {
+        status: data.status,
+        method: data.method || "nanobase-ai",
+        durationMs: data.durationMs ?? 0,
+        warnings: data.warnings ?? [],
+        invoice: data.invoice,
+        rawTextPreview: data.rawTextPreview ?? null,
+        validation: data.validation ?? null,
+        pipeline: data.pipeline ?? [],
+      };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < EXTRACT_V2_RETRIES && isRetryableExtractError(err)) {
+        await sleep(EXTRACT_V2_RETRY_MS * attempt);
+        continue;
+      }
+      break;
+    }
   }
+  if (lastErr && process.env.NODE_ENV !== "production") {
+    console.warn("extractViaV2 failed", lastErr);
+  }
+  return null;
 }
 
 function legacyResult(

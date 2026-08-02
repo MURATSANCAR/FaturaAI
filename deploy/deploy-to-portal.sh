@@ -89,17 +89,21 @@ Environment=FORCE_IMAGE_OCR=1
 Environment=FAST_PATH_PDF=1
 Environment=PHOTO_OCR_ENABLED=1
 Environment=PHOTO_OCR_ENGINE=auto
-Environment=PHOTO_OCR_THREADS=8
+Environment=PHOTO_OCR_THREADS=4
 Environment=PHOTO_OCR_CONF_THRESHOLD=0.90
 Environment=PHOTO_OCR_TARGET_SIDE=2000
 Environment=PHOTO_OCR_MAX_SIDE=2800
 Environment=PHOTO_OCR_WARMUP=1
+Environment=PHOTO_OCR_WARMUP_MEDIUM=0
+Environment=PHOTO_OCR_MAX_INFLIGHT=1
+Environment=PHOTO_OCR_SERIALIZE=1
+Environment=PHOTO_OCR_TIMEOUT_S=120
 Environment=PDF_RASTER_DPI=250
 Environment=IMAGE_OCR_SCALE=2.0
 Environment=DOCLING_MAX_INFLIGHT=1
 Environment=DOCLING_TIMEOUT_S=120
 Environment=EXTRACT_WORKERS=5
-Environment=OMP_NUM_THREADS=8
+Environment=OMP_NUM_THREADS=4
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=ALLOWED_ORIGINS=https://portal.nanobase.ai
@@ -108,7 +112,7 @@ ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
-MemoryMax=24G
+MemoryMax=64G
 
 [Install]
 WantedBy=multi-user.target

@@ -36,6 +36,11 @@ FAST_PATH_MIN_CONF = float(os.getenv("FAST_PATH_MIN_CONF", "0.82"))
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
 PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 PHOTO_OCR_WARMUP = os.getenv("PHOTO_OCR_WARMUP", "1") == "1"
+# Do not preload Medium on every worker — major RAM saver under parallel load.
+PHOTO_OCR_WARMUP_MEDIUM = os.getenv("PHOTO_OCR_WARMUP_MEDIUM", "0") == "1"
+# Cap concurrent OCR threads per uvicorn worker (1 = safest vs OOM).
+PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "1")))
+PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "120"))
 PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "250")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
@@ -64,6 +69,7 @@ app.add_middleware(
 
 _docling_converter = None
 _docling_sem: asyncio.Semaphore | None = None
+_photo_ocr_sem: asyncio.Semaphore | None = None
 _metrics = {
     "extract_total": 0,
     "extract_ok": 0,
@@ -73,6 +79,7 @@ _metrics = {
     "photo_ocr": 0,
     "docling_calls": 0,
     "inflight": 0,
+    "photo_ocr_inflight": 0,
 }
 
 
@@ -81,6 +88,47 @@ def get_docling_sem() -> asyncio.Semaphore:
     if _docling_sem is None:
         _docling_sem = asyncio.Semaphore(DOCLING_MAX_INFLIGHT)
     return _docling_sem
+
+
+def get_photo_ocr_sem() -> asyncio.Semaphore:
+    global _photo_ocr_sem
+    if _photo_ocr_sem is None:
+        _photo_ocr_sem = asyncio.Semaphore(PHOTO_OCR_MAX_INFLIGHT)
+    return _photo_ocr_sem
+
+
+async def run_photo_ocr(path: Path) -> tuple[str, dict[str, Any]]:
+    """Run photo OCR with per-worker concurrency + timeout (OOM-safe)."""
+    from photo_ocr import ocr_image
+
+    sem = get_photo_ocr_sem()
+    await sem.acquire()
+    _metrics["photo_ocr_inflight"] += 1
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(ocr_image, path),
+            timeout=PHOTO_OCR_TIMEOUT_S,
+        )
+    finally:
+        _metrics["photo_ocr_inflight"] = max(0, _metrics["photo_ocr_inflight"] - 1)
+        sem.release()
+
+
+async def run_pdf_raster_ocr(
+    path: Path, tmp: Path, max_pages: int = 2
+) -> tuple[str, dict[str, Any]]:
+    """Rasterize PDF pages + OCR under the same inflight cap as photo OCR."""
+    sem = get_photo_ocr_sem()
+    await sem.acquire()
+    _metrics["photo_ocr_inflight"] += 1
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(pdf_raster_ocr_text, path, tmp, max_pages),
+            timeout=max(PHOTO_OCR_TIMEOUT_S * max_pages, 180),
+        )
+    finally:
+        _metrics["photo_ocr_inflight"] = max(0, _metrics["photo_ocr_inflight"] - 1)
+        sem.release()
 
 
 async def run_docling(
@@ -3632,7 +3680,7 @@ def warmup() -> None:
         try:
             from photo_ocr import warmup_engines
 
-            status = warmup_engines(include_medium=True)
+            status = warmup_engines(include_medium=PHOTO_OCR_WARMUP_MEDIUM)
             print(f"photo OCR warmup: {status}")
         except Exception as exc:  # noqa: BLE001
             print(f"photo OCR warmup skipped: {exc}")
@@ -3656,11 +3704,14 @@ def health() -> dict[str, Any]:
         "forceImageOcr": FORCE_IMAGE_OCR,
         "photoOcr": PHOTO_OCR_ENABLED,
         "photoOcrStatus": photo_status,
+        "photoOcrMaxInflight": PHOTO_OCR_MAX_INFLIGHT,
+        "photoOcrTimeoutS": PHOTO_OCR_TIMEOUT_S,
         "fastPathPdf": FAST_PATH_PDF,
         "pdfRasterDpi": PDF_RASTER_DPI,
         "doclingMaxInflight": DOCLING_MAX_INFLIGHT,
         "doclingTimeoutS": DOCLING_TIMEOUT_S,
         "inflight": _metrics["inflight"],
+        "photoOcrInflight": _metrics["photo_ocr_inflight"],
         "metrics": dict(_metrics),
         "imageFormats": sorted(ext.lstrip(".") for ext in IMAGE_EXTENSIONS),
     }
@@ -3748,9 +3799,7 @@ async def extract(
             photo_meta: dict[str, Any] = {}
             if PHOTO_OCR_ENABLED:
                 try:
-                    from photo_ocr import ocr_image
-
-                    photo_text, photo_meta = await asyncio.to_thread(ocr_image, path)
+                    photo_text, photo_meta = await run_photo_ocr(path)
                     pipeline.append(
                         f"photo-ocr:{photo_meta.get('engine', '?')}:"
                         f"{photo_meta.get('elapsedMs', 0)}ms:"
@@ -3967,9 +4016,7 @@ async def extract(
         )
         if force_raster:
             try:
-                raster_txt, raster_meta = await asyncio.to_thread(
-                    pdf_raster_ocr_text, path, Path(tmp), 2
-                )
+                raster_txt, raster_meta = await run_pdf_raster_ocr(path, Path(tmp), 2)
                 if raster_txt.strip():
                     pipeline.append(
                         f"pdf-raster-ocr:{raster_meta.get('engine', '?')}:"
