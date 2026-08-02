@@ -8,3 +8,7 @@ apps/web/dist
 apps/api/dist
 
 fatura/
+
+# OCR CPU playground
+playground/ocr-bench/.venv/
+playground/ocr-bench/out/

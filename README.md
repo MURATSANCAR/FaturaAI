@@ -38,3 +38,14 @@ Extract (:8106, uvicorn workers=5 × 8 OCR threads)
 ```
 
 Servisler: `fatura-extract`, `fatura-api`
+
+## OCR CPU playground
+
+PP-StructureV3 / PaddleOCR-VL / RapidOCR karşılaştırması (CPU+RAM):
+
+```bash
+cd playground/ocr-bench && ./setup.sh
+./run.sh --all --limit 5
+```
+
+Detay: `playground/ocr-bench/README.md`

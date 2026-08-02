@@ -1,0 +1,14 @@
+# Shared deps for OCR playground (CPU).
+# PaddlePaddle itself is installed by setup.sh from the official CPU index.
+psutil>=5.9
+Pillow>=10.0
+numpy<2.3
+opencv-python-headless>=4.8
+
+# Prod baseline (RapidOCR PP-OCRv6)
+rapidocr>=3.9.0
+onnxruntime>=1.17
+openvino>=2024.0; platform_machine == "x86_64" or platform_machine == "AMD64"
+
+# PaddleOCR Structure + VL (doc-parser pulls layout/table deps)
+paddleocr[doc-parser]>=3.0.0
