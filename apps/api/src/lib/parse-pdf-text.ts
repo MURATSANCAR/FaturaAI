@@ -1,4 +1,5 @@
 import { parsePercent, parseTrMoney } from "./money.js";
+import { digitsOnly, isValidTaxId } from "./tax-id.js";
 import type { InvoiceLine, InvoiceParty, ParsedInvoice } from "../types.js";
 
 function rightField(text: string, label: string): string | null {
@@ -812,15 +813,53 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   return invoice;
 }
 
+function sanitizePartyTaxId(party: InvoiceParty, role: string): string[] {
+  const warnings: string[] = [];
+  const raw = digitsOnly(party.taxId);
+  if (!raw) {
+    party.taxId = null;
+    party.taxIdScheme = null;
+    return warnings;
+  }
+
+  let scheme = party.taxIdScheme;
+  if (!scheme) {
+    if (raw.length === 11) scheme = "TCKN";
+    else if (raw.length === 10) scheme = "VKN";
+  }
+
+  if (isValidTaxId(raw, scheme)) {
+    party.taxId = raw;
+    party.taxIdScheme = raw.length === 11 ? "TCKN" : "VKN";
+    return warnings;
+  }
+
+  const label =
+    scheme ?? (raw.length === 11 ? "TCKN" : raw.length === 10 ? "VKN" : "vergi kimlik");
+  warnings.push(`${role} ${label} geçersiz (doğrulama başarısız) — yok sayıldı`);
+  party.taxId = null;
+  party.taxIdScheme = null;
+  return warnings;
+}
+
 export function validateInvoice(invoice: ParsedInvoice): string[] {
   // Reconcile again in case caller mutated totals
   reconcileTotals(invoice);
   const warnings: string[] = [];
+  const supplierTaxWarnings = sanitizePartyTaxId(invoice.supplier, "Satıcı");
+  const customerTaxWarnings = sanitizePartyTaxId(invoice.customer, "Alıcı");
+  warnings.push(...supplierTaxWarnings, ...customerTaxWarnings);
   if (!invoice.invoiceNumber) warnings.push("Fatura numarası bulunamadı");
   if (!invoice.uuid) warnings.push("ETTN bulunamadı");
   if (!invoice.issueDate) warnings.push("Fatura tarihi bulunamadı");
   if (!invoice.supplier.name) warnings.push("Satıcı unvanı bulunamadı");
   if (!invoice.customer.name) warnings.push("Alıcı unvanı bulunamadı");
+  if (!supplierTaxWarnings.length && !invoice.supplier.taxId) {
+    warnings.push("Satıcı VKN/TCKN bulunamadı");
+  }
+  if (!customerTaxWarnings.length && !invoice.customer.taxId) {
+    warnings.push("Alıcı VKN/TCKN bulunamadı");
+  }
   if (!invoice.totals.payableAmount) warnings.push("Ödenecek tutar bulunamadı");
   if (invoice.lines.length === 0) warnings.push("Mal/hizmet kalemi bulunamadı");
 

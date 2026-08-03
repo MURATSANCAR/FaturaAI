@@ -15,6 +15,8 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from tax_id import digits_only, is_valid_tax_id
+
 PORT = int(os.getenv("PORT", "8106"))
 ALLOWED_ORIGINS = [
     o.strip()
@@ -1209,7 +1211,10 @@ def status_from(warnings: list[str], validation: Validation) -> Literal["ok", "p
     critical = [
         w
         for w in hard
-        if re.search(r"Fatura numarası|Ödenecek tutar|Satıcı|Alıcı|kalemi|tarihi", w)
+        if re.search(
+            r"Fatura numarası|Ödenecek tutar|Satıcı|Alıcı|kalemi|tarihi|VKN|TCKN",
+            w,
+        )
     ]
     if not hard and validation.confidence >= 0.8:
         return "ok"
@@ -3594,6 +3599,34 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
     return Invoice.model_validate(data)
 
 
+def _sanitize_party_tax_id(party: Party, role: str) -> list[str]:
+    """Clear checksum-invalid tax IDs so false positives are not reported as success."""
+    warnings: list[str] = []
+    raw = digits_only(party.taxId)
+    if not raw:
+        party.taxId = None
+        party.taxIdScheme = None
+        return warnings
+
+    scheme = party.taxIdScheme
+    if scheme is None:
+        if len(raw) == 11:
+            scheme = "TCKN"
+        elif len(raw) == 10:
+            scheme = "VKN"
+
+    if is_valid_tax_id(raw, scheme):
+        party.taxId = raw
+        party.taxIdScheme = "TCKN" if len(raw) == 11 else "VKN"
+        return warnings
+
+    label = scheme or ("TCKN" if len(raw) == 11 else "VKN" if len(raw) == 10 else "vergi kimlik")
+    warnings.append(f"{role} {label} geçersiz (doğrulama başarısız) — yok sayıldı")
+    party.taxId = None
+    party.taxIdScheme = None
+    return warnings
+
+
 def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
     warnings: list[str] = []
     checks: list[str] = []
@@ -3608,11 +3641,22 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
             checks.append(f"fail:{msg}")
             score -= weight
 
+    supplier_tax_warnings = _sanitize_party_tax_id(inv.supplier, "Satıcı")
+    customer_tax_warnings = _sanitize_party_tax_id(inv.customer, "Alıcı")
+    for w in supplier_tax_warnings + customer_tax_warnings:
+        warnings.append(w)
+        checks.append(f"fail:{w}")
+        score -= 0.1
+
     need(bool(inv.invoiceNumber), "Fatura numarası bulunamadı")
     need(bool(inv.uuid), "ETTN bulunamadı", 0.08)
     need(bool(inv.issueDate), "Fatura tarihi bulunamadı")
     need(bool(inv.supplier.name), "Satıcı unvanı bulunamadı")
     need(bool(inv.customer.name), "Alıcı unvanı bulunamadı")
+    if not supplier_tax_warnings:
+        need(bool(inv.supplier.taxId), "Satıcı VKN/TCKN bulunamadı", 0.1)
+    if not customer_tax_warnings:
+        need(bool(inv.customer.taxId), "Alıcı VKN/TCKN bulunamadı", 0.1)
     need(inv.totals.payableAmount is not None, "Ödenecek tutar bulunamadı")
     need(len(inv.lines) > 0, "Mal/hizmet kalemi bulunamadı", 0.18)
 
