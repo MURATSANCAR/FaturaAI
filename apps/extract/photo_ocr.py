@@ -443,6 +443,26 @@ def needs_medium_fallback(text: str, mean_score: float) -> bool:
     return False
 
 
+def looks_like_garbage_ocr(text: str) -> bool:
+    """Hopeless OCR — skip medium/extra passes (Vulkan/DeFacto junk photos)."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if structure_score(t) > 1:
+        return False
+    if _GIB_HINT_RE.search(t):
+        return False
+    if _AMOUNT_RE.search(t) and (_has_gib_serial(t) or _ettn_hex_count(t) >= 20):
+        return False
+    # Very short / no invoice vocabulary
+    if len(t) < 120 and not re.search(
+        r"(?i)fatura|ettn|vkn|tckn|ödenecek|sayin|kdv|toplam",
+        t,
+    ):
+        return True
+    return structure_score(t) <= 1 and not _GIB_HINT_RE.search(t)
+
+
 def _rank_key(c: tuple[str, str, float, int]) -> tuple:
     eng, text, mean, n = c
     struct = structure_score(text)
@@ -553,6 +573,10 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
         best = _best_of(candidates)
         if candidates and not needs_medium_fallback(best[1], best[2]):
             early = True
+        elif candidates and looks_like_garbage_ocr(best[1]):
+            # Don't burn 15–25s on medium for logo/junk screenshots
+            early = True
+            fallback_reason = "garbage-skip-medium"
         else:
             mean_score = best[2] if candidates else 0.0
             if not candidates or not best[1].strip():
@@ -568,6 +592,9 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
                 best = _best_of(candidates)
                 if candidates and _good_enough(best[1]):
                     early = True
+                elif candidates and looks_like_garbage_ocr(best[1]):
+                    early = True
+                    fallback_reason = (fallback_reason or "") + "+garbage-after-medium"
 
     if not early:
         # Extra preprocess only when structure is still very weak.

@@ -107,13 +107,70 @@ def is_valid_tax_id(value: str | None, scheme: str | None = None) -> bool:
     return False
 
 
+# Single-digit OCR confusions commonly seen on thermal / phone photos.
+_OCR_DIGIT_ALTS: dict[str, tuple[str, ...]] = {
+    "0": ("8",),
+    "8": ("0",),
+    "3": ("9",),
+    "9": ("3", "4"),
+    "1": ("7",),
+    "7": ("1", "2"),
+    "5": ("6",),
+    "6": ("5",),
+    "4": ("9",),
+    "2": ("7",),
+}
+
+
+def repair_tax_id(value: str | None, scheme: str | None = None) -> tuple[str, str] | None:
+    """If checksum fails, try single-digit OCR repairs; return unique valid candidate.
+
+    Does not rewrite an already-valid id (checksum alone cannot recover a wrong
+    but checksum-valid OCR read).
+    """
+    n = normalize_ocr_digits(value) or digits_only(value)
+    if not n or is_placeholder_tax_id(n):
+        return None
+    scheme_u = (scheme or "").upper()
+    if not scheme_u:
+        scheme_u = "TCKN" if len(n) == 11 else "VKN" if len(n) == 10 else ""
+    if scheme_u not in {"VKN", "TCKN"}:
+        return None
+    if is_valid_tax_id(n, scheme_u):
+        return n, scheme_u
+
+    found: list[str] = []
+    for i, ch in enumerate(n):
+        for alt in _OCR_DIGIT_ALTS.get(ch, ()):
+            cand = n[:i] + alt + n[i + 1 :]
+            if is_placeholder_tax_id(cand):
+                continue
+            if is_valid_tax_id(cand, scheme_u) and cand not in found:
+                found.append(cand)
+    if len(found) == 1:
+        return found[0], scheme_u
+    return None
+
+
 def coerce_tax_id(value: str | None) -> tuple[str, str] | None:
-    """Normalize OCR tax id → (digits, scheme) if length looks like VKN/TCKN."""
+    """Normalize OCR tax id → (digits, scheme) if length looks like VKN/TCKN.
+
+    Prefer checksum-valid values; auto-repair single-digit OCR mistakes when the
+    raw candidate fails GİB checksum and exactly one repair validates.
+    """
     n = normalize_ocr_digits(value)
     if not n or is_placeholder_tax_id(n):
         return None
     if len(n) == 11:
-        return n, "TCKN"
-    if len(n) == 10:
-        return n, "VKN"
-    return None
+        scheme = "TCKN"
+    elif len(n) == 10:
+        scheme = "VKN"
+    else:
+        return None
+    if is_valid_tax_id(n, scheme):
+        return n, scheme
+    repaired = repair_tax_id(n, scheme)
+    if repaired:
+        return repaired
+    # Length-only fallback (caller / sanitize may still drop on checksum)
+    return n, scheme

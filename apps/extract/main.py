@@ -15,7 +15,13 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from tax_id import coerce_tax_id, digits_only, is_valid_tax_id, normalize_ocr_digits
+from tax_id import (
+    coerce_tax_id,
+    digits_only,
+    is_valid_tax_id,
+    normalize_ocr_digits,
+    repair_tax_id,
+)
 
 PORT = int(os.getenv("PORT", "8106"))
 ALLOWED_ORIGINS = [
@@ -2648,6 +2654,25 @@ def is_probable_non_invoice_text(text: str) -> bool:
     )
 
 
+def is_garbage_photo_ocr(inv: Invoice, photo_meta: dict[str, Any] | None = None) -> bool:
+    """True when OCR structure is empty and no critical invoice fields bound.
+
+    Used to skip Docling/VL on Vulkan/DeFacto-style garbage photos (~15–25s waste).
+    """
+    struct = int((photo_meta or {}).get("structureScore") or 0)
+    if struct > 1:
+        return False
+    if inv.invoiceNumber:
+        return False
+    if inv.totals.payableAmount is not None or inv.totals.taxInclusiveAmount is not None:
+        return False
+    if inv.supplier.taxId or inv.customer.taxId:
+        return False
+    if inv.lines:
+        return False
+    return True
+
+
 def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
     """Fix supplier↔customer tax-id swaps and clear placeholders/phone false VKNs."""
     from tax_id import is_placeholder_tax_id
@@ -4750,6 +4775,11 @@ def _sanitize_party_tax_id(party: Party, role: str) -> list[str]:
         party.taxIdScheme = "TCKN" if len(raw) == 11 else "VKN"
         return warnings
 
+    repaired = repair_tax_id(raw, scheme)
+    if repaired:
+        party.taxId, party.taxIdScheme = repaired
+        return warnings
+
     label = scheme or ("TCKN" if len(raw) == 11 else "VKN" if len(raw) == 10 else "vergi kimlik")
     warnings.append(f"{role} {label} geçersiz (doğrulama başarısız) — yok sayıldı")
     party.taxId = None
@@ -5083,6 +5113,22 @@ async def extract(
                         warnings_ph, validation_ph = validate_invoice(invoice)
                         warnings, validation = warnings_ph, validation_ph
                         pipeline.append("ocr-field-binder")
+                        if is_garbage_photo_ocr(invoice, photo_meta):
+                            pipeline.append("garbage-ocr-reject")
+                            _metrics["extract_failed"] += 1
+                            return ExtractResponse(
+                                status="failed",
+                                method="garbage-ocr",
+                                durationMs=int((time.perf_counter() - started) * 1000),
+                                warnings=[
+                                    "OCR yapısal fatura sinyali üretmedi "
+                                    "(structureScore≤1, kritik alan yok) — "
+                                    "Docling/VL atlandı."
+                                ],
+                                invoice=Invoice(documentType="unknown"),
+                                rawTextPreview=photo_text[:2500],
+                                pipeline=pipeline,
+                            )
                         if strong_photo_invoice(invoice, validation_ph):
                             pipeline.append("photo-ocr-fast-path")
 
@@ -5115,6 +5161,9 @@ async def extract(
                 invoice, validate_invoice(invoice)[1]
             )
             photo_struct = int(photo_meta.get("structureScore") or 0)
+            if is_garbage_photo_ocr(invoice, photo_meta):
+                need_docling = False
+                pipeline.append("skip-docling:garbage-ocr")
             if ENABLE_DOCLING and need_docling:
                 try:
                     use_ocr = FORCE_IMAGE_OCR or ENABLE_DOCLING_OCR
