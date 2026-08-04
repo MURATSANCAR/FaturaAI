@@ -2264,6 +2264,10 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
         return False
     if not inv.lines:
         return False
+    # Missing supplier VKN/TCKN → keep Docling/tesseract in play (Teknosa header OCR gaps)
+    st = normalize_ocr_digits(inv.supplier.taxId) or digits_only(inv.supplier.taxId)
+    if not st or (len(st) == 10 and st.startswith("5")):
+        return False
     # GİB serial year must look real after OCR repair
     ym = re.match(r"^[A-Z]{2,5}(\d{4})", inv.invoiceNumber)
     if ym:
@@ -2684,23 +2688,18 @@ def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
         s.taxId = None
         s.taxIdScheme = None
         st = ""
-        if text:
-            sayin = re.search(r"\bSAYIN\b", text, re.I)
-            head = text[: sayin.start()] if sayin else text[:1600]
-            recovered = find_role_tax_id(text, "supplier") or find_tax_id_in_region(head)
-            if recovered and recovered[1] == "VKN" and recovered[0] != c.taxId:
-                s.taxId, s.taxIdScheme = recovered
-            else:
-                # Spaced V.D. pattern: "836 014 4393"
-                spaced = re.search(
-                    r"(?i)(?:V\.?\s*D\.?|Vergi\s*Dairesi|VKN)\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{0,40}?"
-                    r"(\d{3}\s+\d{3}\s+\d{4})",
-                    head,
-                )
-                if spaced:
-                    got = coerce_tax_id(spaced.group(1))
-                    if got and got[1] == "VKN" and got[0] != c.taxId:
-                        s.taxId, s.taxIdScheme = got
+
+    st = normalize_ocr_digits(s.taxId) or digits_only(s.taxId)
+    ct = normalize_ocr_digits(c.taxId) or digits_only(c.taxId)
+
+    # Supplier VKN missing → multi-layer header recovery (Teknosa / retail)
+    if text and (not st or (len(st) == 10 and st.startswith("5"))):
+        recovered = (
+            find_role_tax_id(text, "supplier")
+            or recover_supplier_vkn_from_header(text)
+        )
+        if recovered and recovered[1] == "VKN" and recovered[0] != ct:
+            s.taxId, s.taxIdScheme = recovered
 
     # Final placeholder sweep
     for party in (s, c):
@@ -2740,6 +2739,96 @@ def find_tax_id_in_region(text: str) -> tuple[str, str] | None:
             got = _match_tax_id_token(m.group(1))
             if got:
                 return got
+    return None
+
+
+def _ok_supplier_vkn(raw: str | None) -> tuple[str, str] | None:
+    """Accept clean company VKN; reject phones (5…) and placeholders."""
+    from tax_id import is_placeholder_tax_id
+
+    got = coerce_tax_id(raw)
+    if not got or got[1] != "VKN":
+        return None
+    n = got[0]
+    if n.startswith("5") or is_placeholder_tax_id(n):
+        return None
+    return got
+
+
+def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
+    """Multi-layer supplier VKN search in the SAYIN-before (header) region.
+
+    Layers: labeled VKN/VIN/Vergi No → VD/Vergi Dairesi/Mükellef nearby →
+    spaced 836 014 4393 → compact 10-digit → firm-line neighbor →
+    last-resort clean 10-digit in first 1200 chars (non-phone).
+    """
+    if not text:
+        return None
+    sayin = re.search(r"\bSAYIN\b", text, re.I)
+    head = text[: sayin.start()] if sayin else text[:1600]
+    if not head.strip():
+        head = text[:1600]
+
+    # 1) Explicit tax labels
+    for pat in (
+        rf"(?i){_TAX_LABEL}\s*:?[.\s]*([{_TAX_OCR}]{{10}})\b",
+        rf"(?i){_TAX_LABEL}\s*:?[.\s]*((?:[{_TAX_OCR}]{{3}}\s+){{2}}[{_TAX_OCR}]{{4}})\b",
+    ):
+        for m in re.finditer(pat, head):
+            got = _ok_supplier_vkn(m.group(1))
+            if got:
+                return got
+
+    # 2) VD / Vergi Dairesi / Mükellef / Büyük Mükellef vicinity
+    for pat in (
+        rf"(?i)(?:B[üu]y[üu]k\s*)?M[üu]kellef(?:ler)?(?:\s*V\.?\s*D\.?)?"
+        rf"[A-ZÇĞİÖŞÜa-zçğıöşü ./]{{0,48}}?"
+        rf"([{_TAX_OCR}]{{10}}|(?:[{_TAX_OCR}]{{3}}\s+){{2}}[{_TAX_OCR}]{{4}})\b",
+        rf"(?i)(?:V\.?\s*D\.?|Vergi\s*Dai(?:resi|resi|r[ae]s[il])|Mukellef\w*|M[üu]kellef\w*)"
+        rf"[A-ZÇĞİÖŞÜa-zçğıöşü ./:]{{0,48}}?"
+        rf"([{_TAX_OCR}]{{10}}|(?:[{_TAX_OCR}]{{3}}\s+){{2}}[{_TAX_OCR}]{{4}})\b",
+        rf"(?i)\bVD\s*[.:]?\s*([{_TAX_OCR}]{{10}})\b",
+    ):
+        for m in re.finditer(pat, head):
+            got = _ok_supplier_vkn(m.group(1))
+            if got:
+                return got
+
+    # 3) Spaced classic form anywhere in head
+    for m in re.finditer(r"(?<!\d)((?:\d{3}\s+){2}\d{4})(?!\d)", head):
+        got = _ok_supplier_vkn(m.group(1))
+        if got:
+            return got
+
+    # 4) Compact 10-digit near company / trade tokens
+    for m in re.finditer(
+        rf"(?i)(?:A\.?\s*[SŞ]\.?|LTD|ŞT[İI]|T[İI]CARET|SANAY[İI]|MA[ĞG]AZA)"
+        rf"[^\n]{{0,40}}?([{_TAX_OCR}]{{10}})\b",
+        head,
+    ):
+        got = _ok_supplier_vkn(m.group(1))
+        if got:
+            return got
+    for m in re.finditer(
+        rf"(?i)([{_TAX_OCR}]{{10}})\s*(?:A\.?\s*[SŞ]\.?|LTD|V\.?\s*D\.?)\b",
+        head,
+    ):
+        got = _ok_supplier_vkn(m.group(1))
+        if got:
+            return got
+
+    # 5) Last resort: first 1200 chars, first clean non-phone 10-digit
+    window = text[:1200]
+    for m in re.finditer(rf"(?<!\d)([{_TAX_OCR}]{{10}})(?!\d)", window):
+        # Skip ids glued to Tel/TCKN/Fax labels
+        start = m.start()
+        prefix = window[max(0, start - 24) : start]
+        if re.search(r"(?i)(?:Tel|Telefon|Fax|TCKN|M[üu][şs]teri)\s*:?\s*$", prefix):
+            continue
+        got = _ok_supplier_vkn(m.group(1))
+        if got:
+            return got
+
     return None
 
 
@@ -3173,15 +3262,16 @@ def extract_supplier(text: str) -> Party:
     if not party.taxId:
         role_tid = find_role_tax_id(text, "supplier")
         head_tid = find_tax_id_in_region(head)
+        header_vkn = recover_supplier_vkn_from_header(text)
         # Company suppliers: prefer 10-digit VKN over a TCKN that leaked into head
         companyish = bool(
             party.name
             and re.search(r"(?:A\.?\s*[SŞ]\.?|LTD|ŞT[İI]|T[İI]C(?:ARET)?)", party.name, re.I)
         )
-        chosen = role_tid or head_tid
+        chosen = role_tid or header_vkn or head_tid
         if companyish and chosen and chosen[1] == "TCKN":
             vkn_only = None
-            for cand in (role_tid, head_tid):
+            for cand in (role_tid, header_vkn, head_tid):
                 if cand and cand[1] == "VKN":
                     vkn_only = cand
                     break
@@ -4037,6 +4127,10 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         return v
 
     supplier_vkn = _ok_vkn(spaced_vkn) or _ok_vkn(vd_vkn) or _ok_vkn(district_vkn)
+    if not supplier_vkn:
+        recovered = recover_supplier_vkn_from_header(text)
+        if recovered and recovered[1] == "VKN":
+            supplier_vkn = recovered[0]
     if supplier_vkn and supplier_vkn != (musteri_vkn or "")[:10]:
         supplier.taxId = supplier_vkn
         supplier.taxIdScheme = "VKN"
@@ -4045,15 +4139,19 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         supplier.taxIdScheme = "VKN"
     # Spaced VKN in supplier head: "836 014 4393"
     if not supplier.taxId or (supplier.taxId and supplier.taxId.startswith("5")):
-        head_vkn = first_match(
-            text[:2000],
-            r"(?<!Tel\s)(?<!TCKN:\s)(?<!TCKN:\s)(\d{3}\s+\d{3}\s+\d{4})\b",
-        )
-        if head_vkn:
-            hv = re.sub(r"\s+", "", head_vkn)
-            if len(hv) == 10 and not hv.startswith("5"):
-                supplier.taxId = hv
-                supplier.taxIdScheme = "VKN"
+        recovered = recover_supplier_vkn_from_header(text)
+        if recovered and recovered[1] == "VKN":
+            supplier.taxId, supplier.taxIdScheme = recovered
+        else:
+            head_vkn = first_match(
+                text[:2000],
+                r"(?<!Tel\s)(?<!TCKN:\s)(?<!TCKN:\s)(\d{3}\s+\d{3}\s+\d{4})\b",
+            )
+            if head_vkn:
+                hv = re.sub(r"\s+", "", head_vkn)
+                if len(hv) == 10 and not hv.startswith("5"):
+                    supplier.taxId = hv
+                    supplier.taxIdScheme = "VKN"
 
     if supplier.name:
         supplier.name = normalize_company_legal_ocr(supplier.name)
@@ -5064,6 +5162,8 @@ async def extract(
                         if not _lines_useful(invoice.lines) and _lines_useful(inv_md.lines):
                             invoice.lines = inv_md.lines
                         md = (md + "\n\n" + md2).strip() if md else md2
+                        text = (text + "\n\n" + md2).strip() if text else md2
+                        rebalance_party_tax_ids(invoice, text)
                 except Exception as exc:  # noqa: BLE001
                     pipeline.append(f"docling-image-error:{exc}")
 
