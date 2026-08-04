@@ -4167,7 +4167,7 @@ async def extract(
         force_raster = (
             not as_image
             and "fast-path" not in pipeline
-            and PHOTO_OCR_ENABLED
+            and (PHOTO_OCR_ENABLED or VL_OCR_ENABLED)
             and (
                 is_unusable_extract_text(md or text)
                 or (
@@ -4182,6 +4182,8 @@ async def extract(
                     bool(invoice.supplier.name)
                     and sum(1 for c in (invoice.supplier.name or "") if ord(c) < 32) >= 2
                 )
+                # Generic retry: partial parses (missing tax id / weak fields) get VL/raster
+                or status_from(warnings, validation) == "partial"
             )
         )
         if force_raster:

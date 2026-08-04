@@ -32,6 +32,8 @@ Extract (:8106, uvicorn workers=5 × 8 OCR threads)
 - Fotoğraf — JPG/PNG/WEBP (+ HEIC best-effort); mobilde **Foto çek**
 - Sync `POST /extract` hâlâ var (script/load test)
 
+Zayıf / taranmış / bozuk metin PDF ve fotoğraflarda **PaddleOCR-VL-1.6** (layout-agnostic) kullanılır; RapidOCR PP-OCRv6 yedek yoldur. Temiz dijital/UBL PDF’ler fast-path’te kalır.
+
 ## Deploy
 
 ```bash

@@ -41,10 +41,15 @@ fi
 
 # Prefer linking Docling from QA venv to avoid multi-GB reinstall
 QA_PY=/data/nanobaseai/NanobaseAI-QA/.venv/bin/python
+PADDLE_VER="${PADDLE_VER:-3.3.0}"
+PADDLE_INDEX="${PADDLE_INDEX:-https://www.paddlepaddle.org.cn/packages/stable/cpu/}"
 if [ -x "$QA_PY" ] && "$QA_PY" -c "import docling" 2>/dev/null; then
   echo "Using QA venv python for Docling runtime"
   # Install thin deps into a venv that can see QA packages via PYTHONPATH
   .venv/bin/pip install -q -U pip
+  echo "Installing paddlepaddle==${PADDLE_VER} (CPU) for PaddleOCR-VL"
+  .venv/bin/pip install -q "paddlepaddle==${PADDLE_VER}" -i "$PADDLE_INDEX" || \
+    .venv/bin/pip install -q "paddlepaddle==${PADDLE_VER}"
   .venv/bin/pip install -q -r requirements.txt
   # Wrapper runner
   cat > "$EXTRACT/run.sh" <<'RUN'
@@ -53,14 +58,13 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 QA_SITE=$(/data/nanobaseai/NanobaseAI-QA/.venv/bin/python -c 'import site; print(":".join(site.getsitepackages()))')
 export PYTHONPATH="${DIR}:${QA_SITE}:${PYTHONPATH:-}"
-# 5 OCR workers × 8 threads; leave headroom for PDF/API
-export PHOTO_OCR_THREADS="${PHOTO_OCR_THREADS:-8}"
+export PHOTO_OCR_THREADS="${PHOTO_OCR_THREADS:-4}"
 export OMP_NUM_THREADS="${PHOTO_OCR_THREADS}"
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
-WORKERS="${EXTRACT_WORKERS:-5}"
+WORKERS="${EXTRACT_WORKERS:-2}"
 exec "$DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port "${PORT:-8106}" --workers "$WORKERS"
 RUN
   chmod +x "$EXTRACT/run.sh"
@@ -68,8 +72,11 @@ RUN
 else
   echo "Installing docling into extract venv (slow first time)"
   .venv/bin/pip install -q -U pip
+  echo "Installing paddlepaddle==${PADDLE_VER} (CPU) for PaddleOCR-VL"
+  .venv/bin/pip install -q "paddlepaddle==${PADDLE_VER}" -i "$PADDLE_INDEX" || \
+    .venv/bin/pip install -q "paddlepaddle==${PADDLE_VER}"
   .venv/bin/pip install -q -r requirements.txt docling
-  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers ${EXTRACT_WORKERS:-5}"
+  EXEC_START="$EXTRACT/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8106 --workers ${EXTRACT_WORKERS:-2}"
 fi
 
 # systemd extract
@@ -98,11 +105,18 @@ Environment=PHOTO_OCR_WARMUP_MEDIUM=0
 Environment=PHOTO_OCR_MAX_INFLIGHT=1
 Environment=PHOTO_OCR_SERIALIZE=1
 Environment=PHOTO_OCR_TIMEOUT_S=120
+Environment=VL_OCR_ENABLED=1
+Environment=VL_OCR_PIPELINE=v1.6
+Environment=VL_OCR_DEVICE=cpu
+Environment=VL_OCR_THREADS=4
+Environment=VL_OCR_SERIALIZE=1
+Environment=VL_OCR_TIMEOUT_S=300
+Environment=VL_OCR_WARMUP=0
 Environment=PDF_RASTER_DPI=250
 Environment=IMAGE_OCR_SCALE=2.0
 Environment=DOCLING_MAX_INFLIGHT=1
 Environment=DOCLING_TIMEOUT_S=120
-Environment=EXTRACT_WORKERS=5
+Environment=EXTRACT_WORKERS=2
 Environment=OMP_NUM_THREADS=4
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
@@ -111,8 +125,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5
-TimeoutStartSec=300
-MemoryMax=64G
+TimeoutStartSec=600
+MemoryMax=128G
 
 [Install]
 WantedBy=multi-user.target
