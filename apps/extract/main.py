@@ -42,7 +42,7 @@ PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 PHOTO_OCR_WARMUP = os.getenv("PHOTO_OCR_WARMUP", "1") == "1"
 # Do not preload Medium on every worker — major RAM saver under parallel load.
 PHOTO_OCR_WARMUP_MEDIUM = os.getenv("PHOTO_OCR_WARMUP_MEDIUM", "0") == "1"
-# Cap concurrent OCR per uvicorn worker (3 + SERIALIZE=0 = load-test trial).
+# Cap concurrent OCR per uvicorn worker (3; SERIALIZE=1 after race seen in load test).
 PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "3")))
 PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "90"))
 # PaddleOCR-VL: keep OFF on CPU prod (too slow). Opt-in for escalation experiments.

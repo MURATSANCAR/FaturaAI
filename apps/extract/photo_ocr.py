@@ -38,7 +38,7 @@ PHOTO_OCR_CONF_THRESHOLD = float(os.getenv("PHOTO_OCR_CONF_THRESHOLD", "0.78"))
 # Force Medium on every page (debug / quality A/B). Default: Small → Medium ladder.
 PHOTO_OCR_FORCE_MEDIUM = os.getenv("PHOTO_OCR_FORCE_MEDIUM", "0") == "1"
 # Serialize OCR inside a process — concurrent OpenVINO/ONNX in one worker OOMs.
-PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "0") == "1"
+PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "1") == "1"
 
 _engine_small = None
 _engine_medium = None
@@ -467,6 +467,14 @@ def _rank_key(c: tuple[str, str, float, int]) -> tuple:
     )
 
 
+def _best_of(
+    candidates: list[tuple[str, str, float, int]],
+) -> tuple[str, str, float, int]:
+    if not candidates:
+        return ("", "", 0.0, 0)
+    return max(candidates, key=_rank_key)
+
+
 def _tesseract_tur(path: Path) -> str:
     import subprocess
     import tempfile
@@ -537,12 +545,12 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             used_medium = True
         else:
             _run_engine(small, img, "ppocrv6-small", candidates)
-        best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+        best = _best_of(candidates)
         early = bool(candidates and _good_enough(best[1]))
         fallback_reason = "force-medium"
     else:
         _run_engine(small, img, "ppocrv6-small", candidates)
-        best = max(candidates, key=_rank_key) if candidates else ("", "", 0.0, 0)
+        best = _best_of(candidates)
         if candidates and not needs_medium_fallback(best[1], best[2]):
             early = True
         else:
@@ -557,7 +565,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             if medium is not None:
                 _run_engine(medium, img, "ppocrv6-medium", candidates)
                 used_medium = True
-                best = max(candidates, key=_rank_key)
+                best = _best_of(candidates)
                 if candidates and _good_enough(best[1]):
                     early = True
 
@@ -576,7 +584,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
         if screenshotish or struct < critical_struct:
             img_nd = preprocess_bgr(raw, strong=False, deskew=False)
             _run_engine(primary, img_nd, f"{primary_label}-nodeskew", candidates)
-            best = max(candidates, key=_rank_key)
+            best = _best_of(candidates)
             struct = structure_score(best[1])
             if (
                 medium is not None
@@ -585,13 +593,13 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             ):
                 _run_engine(medium, img_nd, "ppocrv6-medium-nodeskew", candidates)
                 used_medium = True
-                best = max(candidates, key=_rank_key)
+                best = _best_of(candidates)
                 struct = structure_score(best[1])
 
         if struct < max(4, PHOTO_OCR_EARLY_STRUCT - 1):
             img2 = preprocess_bgr(raw, strong=True, deskew=not screenshotish)
             _run_engine(primary, img2, f"{primary_label}-strong", candidates)
-            best = max(candidates, key=_rank_key)
+            best = _best_of(candidates)
             struct = structure_score(best[1])
             if (
                 medium is not None
@@ -600,13 +608,13 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             ):
                 _run_engine(medium, img2, "ppocrv6-medium-strong", candidates)
                 used_medium = True
-                best = max(candidates, key=_rank_key)
+                best = _best_of(candidates)
                 struct = structure_score(best[1])
 
         if tiny or struct < critical_struct:
             img_bin = preprocess_bgr(raw, strong=True, deskew=False, binary=True)
             _run_engine(primary, img_bin, f"{primary_label}-binary", candidates)
-            best = max(candidates, key=_rank_key)
+            best = _best_of(candidates)
             struct = structure_score(best[1])
             if (
                 medium is not None
@@ -626,7 +634,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             "fallbackReason": fallback_reason,
         }
 
-    best = max(candidates, key=_rank_key)
+    best = _best_of(candidates)
 
     # GİB screenshot: right-panel metadata crop
     panel_note = ""
@@ -656,7 +664,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
             tess = _tesseract_tur(path)
             if tess.strip():
                 candidates.append(("tesseract-tur", tess, 0.55, tess.count("\n") + 1))
-                best = max(candidates, key=_rank_key)
+                best = _best_of(candidates)
         except Exception:
             pass
 
