@@ -38,7 +38,7 @@ PHOTO_OCR_CONF_THRESHOLD = float(os.getenv("PHOTO_OCR_CONF_THRESHOLD", "0.78"))
 # Force Medium on every page (debug / quality A/B). Default: Small → Medium ladder.
 PHOTO_OCR_FORCE_MEDIUM = os.getenv("PHOTO_OCR_FORCE_MEDIUM", "0") == "1"
 # Serialize OCR inside a process — concurrent OpenVINO/ONNX in one worker OOMs.
-PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "1") == "1"
+PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "0") == "1"
 
 _engine_small = None
 _engine_medium = None

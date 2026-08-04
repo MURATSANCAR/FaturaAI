@@ -24,7 +24,7 @@ Extract (:8106, uvicorn workers=5 × PHOTO_OCR_THREADS=6)
   ├─ Photo/raster OCR (prod-tuned):
   │    PP-OCRv6 Small → (conf<0.78 / alan fail) → Medium
   │    variants (nodeskew/strong/binary) sadece çok zayıf structure’ta
-  │    target≈1800 / max≈2400 / raster DPI=180 / inflight=2
+  │    target≈1800 / max≈2400 / raster DPI=180 / inflight=3
   │    backend: OpenVINO (auto) → ONNX Runtime fallback
   └─ Docling structure (+ optional OCR; VL_OCR_ENABLED=0 on CPU prod)
 ```
@@ -38,8 +38,8 @@ Extract (:8106, uvicorn workers=5 × PHOTO_OCR_THREADS=6)
 | `PHOTO_OCR_MIN_SIDE` | 1200 | upscale eşiği |
 | `PHOTO_OCR_CONF_THRESHOLD` | 0.78 | Medium tetik eşiği |
 | `PHOTO_OCR_EARLY_STRUCT` | 6 | early-exit structure skoru |
-| `PHOTO_OCR_MAX_INFLIGHT` | 2 | worker başına eşzamanlı OCR |
-| `PHOTO_OCR_SERIALIZE` | 1 | OOM güvenliği (load test sonrası 0 denenebilir) |
+| `PHOTO_OCR_MAX_INFLIGHT` | 3 | worker başına eşzamanlı OCR |
+| `PHOTO_OCR_SERIALIZE` | 0 | load-test denemesi (OOM izle) |
 | `PHOTO_OCR_TIMEOUT_S` | 90 | |
 | `PDF_RASTER_DPI` | 180 | taranmış PDF raster |
 | `VL_OCR_ENABLED` | 0 | CPU prod’da kapalı |

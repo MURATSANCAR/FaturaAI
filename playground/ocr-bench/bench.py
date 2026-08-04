@@ -244,8 +244,11 @@ def _preprocess_for_rapid(path: str) -> Any:
 
     h, w = img.shape[:2]
     long_side = max(h, w)
-    target = 2200
-    if long_side < 1400 or long_side > 2800:
+    # Prod-tuned defaults (photo_ocr.py): target 1800, max 2400, min 1200
+    target = int(__import__("os").environ.get("PHOTO_OCR_TARGET_SIDE", "1800"))
+    max_side = int(__import__("os").environ.get("PHOTO_OCR_MAX_SIDE", "2400"))
+    min_side = int(__import__("os").environ.get("PHOTO_OCR_MIN_SIDE", "1200"))
+    if long_side < min_side or long_side > max_side:
         scale = target / long_side
         interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=interp)
