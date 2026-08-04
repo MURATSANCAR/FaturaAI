@@ -981,6 +981,107 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
+    # Glued classic GİB amount row (Yılmaz-style):
+    # "1,0Adet14.583,33TL %20,002.916,67TL14.583,33TL"
+    glued_gib = re.compile(
+        rf"(?P<qty>\d{{1,3}}(?:[.,]\d+)?)\s*(?P<unit>Adet|adet|AD|kg|NIU|C62)?\s*"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL\s*"
+        rf"%\s*(?P<vat>\d{{1,2}})(?:[.,]\d{{2}})?"
+        rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL\s*"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL?",
+        re.I,
+    )
+    for i, m in enumerate(glued_gib.finditer(text), start=1):
+        total = parse_tr_money(m.group("total"))
+        if total is None or total < 1:
+            continue
+        # Prefer a product-ish name from nearby lines (skip headers/totals)
+        name = _nearby_product_name(text, m.start()) or f"Kalem {i}"
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=parse_tr_money(m.group("qty"))
+                or float(m.group("qty").replace(",", ".")),
+                unit=(m.group("unit") or "Adet"),
+                unitPrice=parse_tr_money(m.group("unitPrice")),
+                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
+                vatAmount=parse_tr_money(m.group("vatAmt")),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
+    # Retail/scanned row: name + unitPrice + qty + KDV(no %) + total
+    # e.g. "APPLE IPHONE 15 128 BLACK 49.166,67 1 20 49.166,67"
+    retail_row = re.compile(
+        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}).{{6,140}}?)\s+"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s+"
+        rf"(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s+"
+        rf"(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+        rf"(?P<total>{_MONEY_TOKEN})\s*$"
+    )
+    skip_retail = re.compile(
+        r"(?i)^(?:S[ıi]ra|Mal\s*Hizmet|Birim\s*Fiyat|Miktar|A[çc][ıi]klama|"
+        r"TOPLAM|KDV|ÖDEN|ODEN|Vergi|Not:|YALNIZ|ETTN|Fatura)",
+    )
+    for i, m in enumerate(retail_row.finditer(text), start=1):
+        name = re.sub(r"\s+", " ", m.group("name")).strip(" -|")
+        if skip_retail.search(name) or _is_registry_or_chrome_line(name):
+            continue
+        if re.search(r"(?i)Toplam|Iskonto|[İI]skonto|Ödenecek|Matrah", name):
+            continue
+        total = parse_tr_money(m.group("total"))
+        if total is None or total < 1:
+            continue
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=parse_tr_money(m.group("qty"))
+                or float(m.group("qty").replace(",", ".")),
+                unit="Adet",
+                unitPrice=parse_tr_money(m.group("unitPrice")),
+                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
+    # Amounts-only row with product name on previous lines (Gürkan-style):
+    # "BIRIM FIYAT MIKTAR KDV TUTAR" / "49.166,67 1 20 49.166,67"
+    amounts_only = re.compile(
+        rf"(?m)^(?P<unitPrice>{_MONEY_TOKEN})\s+"
+        rf"(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s+"
+        rf"(?P<vat>\d{{1,2}})\s+"
+        rf"(?P<total>{_MONEY_TOKEN})\s*$"
+    )
+    for i, m in enumerate(amounts_only.finditer(text), start=1):
+        total = parse_tr_money(m.group("total"))
+        unit_price = parse_tr_money(m.group("unitPrice"))
+        if total is None or total < 1 or unit_price is None:
+            continue
+        # Same unit+total often means net (ex-VAT) line extension
+        name = _nearby_product_name(text, m.start()) or f"Kalem {i}"
+        if skip_retail.search(name):
+            continue
+        out.append(
+            Line(
+                id=str(i),
+                name=name[:240],
+                quantity=parse_tr_money(m.group("qty"))
+                or float(m.group("qty").replace(",", ".")),
+                unit="Adet",
+                unitPrice=unit_price,
+                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
+                lineTotal=total,
+            )
+        )
+    if out:
+        return out
+
     # Photo OCR: product name line + amount line (qty via N Ade[t] or total÷unit)
     photo_lines = parse_photo_amount_lines(text)
     if photo_lines:
@@ -1623,12 +1724,76 @@ def _is_registry_or_chrome_line(ln: str) -> bool:
     return bool(
         re.search(
             r"(?:T[İI]CARET\s*S[İI]C[İI]L|TICARETSICIL|MERS[İI]S\s*NO|MERSISNO|"
-            r"e-?Ar[sş]iv\s+Fatura|Detay\s*Ekran|Nolu\s+\w+\s+Fatura|"
-            r"^Sayfa\s+\d+|^\d{1,2}:\d{2}\b|KB/s|isteerp\.com|https?://)",
+            r"e-?Ar[sş]iv\s+Fatura|e-?Belge|Detay\s*Ekran|Nolu\s+\w+\s+Fatura|"
+            r"^Sayfa\s+\d+|^\d{1,2}:\d{2}\b|KB/s|isteerp\.com|https?://|file://|"
+            r"Özelleştirme\s*No|Ozellestirme\s*No|UBL\s*Versiyon|ERP\s*Fatura|"
+            r"^Nihai\s*T|^table$|^image$|^text$|^header$|"
+            r"YALNIZ\b|ÜçBin|ElliDokuzBin|onyedi|beşyüz)",
             ln,
             re.I,
         )
     )
+
+
+def _is_amount_in_words_name(name: str | None) -> bool:
+    """True when a party/product name is actually tutar-yazısı (YALNIZ … TL)."""
+    if not name:
+        return False
+    return bool(
+        re.search(
+            r"(?i)^YALNIZ\b|YALNIZCA\b|"
+            r"(?:Üç|Uc|Bir|İki|Iki|Dört|Dort|Beş|Bes|Altı|Alti|Yedi|Sekiz|Dokuz|On)"
+            r"\w*(?:Bin|Yüz|Yuz|Milyon)\w*TL|"
+            r"\b(?:Bin|Yüz|Yuz)[A-Za-zÇĞİÖŞÜçğıöşü]*TL\b|"
+            r"ElliDokuz|onyedi|beşyüz|dort\s*y[uü]z",
+            name,
+        )
+    )
+
+
+def _nearby_product_name(text: str, pos: int, *, lookback: int = 500) -> str | None:
+    """Pick a product description line just above an amount row."""
+    chunk = text[max(0, pos - lookback) : pos]
+    lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+    skip = re.compile(
+        r"(?i)^(?:S[ıi]ra|Mal\s*Hizmet|Birim\s*Fiyat|Miktar|A[çc][ıi]klama|AÇIKLAMA|"
+        r"TOPLAM|KDV|ÖDEN|ODEN|Vergi|Not:|YALNIZ|ETTN|Fatura|Seri\s*No|"
+        r"BIRIM\s*FIYAT|MIKTAR|TUTAR|İrsaliye|Ozellestirme|Özelleştirme|"
+        r"e-?Ar[sş]iv|SAYIN|VKN|TCKN|Tel:|E-?Posta)",
+    )
+    # Prefer multi-word product-ish lines closest to the amount row
+    for ln in reversed(lines[-12:]):
+        if skip.search(ln) or _is_registry_or_chrome_line(ln):
+            continue
+        if re.fullmatch(rf"{_MONEY_TOKEN}", ln):
+            continue
+        if re.search(rf"{_MONEY_TOKEN}", ln) and not re.search(
+            r"[A-Za-zÇĞİÖŞÜçğıöşü]{3,}", ln
+        ):
+            continue
+        letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", ln)
+        if len(letters) < 4:
+            continue
+        # Join wrapped product lines (PROFILO … / 1 DVBS2 … / TV)
+        idx = lines.index(ln) if ln in lines else -1
+        parts = [ln]
+        if idx >= 0:
+            for nxt in lines[idx + 1 :]:
+                if skip.search(nxt) or _is_registry_or_chrome_line(nxt):
+                    break
+                if re.search(rf"{_MONEY_TOKEN}", nxt):
+                    break
+                if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", nxt)) < 2:
+                    break
+                parts.append(nxt)
+                if len(" ".join(parts)) > 120:
+                    break
+        name = re.sub(r"\s+", " ", " ".join(parts)).strip(" -|")
+        # Drop leading sıra no glued into description
+        name = re.sub(r"^\d{1,3}\s+", "", name).strip()
+        if len(name) >= 4:
+            return name[:240]
+    return None
 
 
 def _fix_gib_year_digits(digits: str) -> str:
@@ -3417,6 +3582,42 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         if near_card and not re.search(r"KART|CHIP|ONAY|AID|BANKA", near_card, re.I):
             customer.name = near_card.strip()[:120]
         else:
+            customer.name = "Nihai Tüketici"
+
+    # Strip tutar-yazısı / chrome mistaken for customer name
+    if customer.name and (
+        _is_amount_in_words_name(customer.name)
+        or _is_registry_or_chrome_line(customer.name)
+        or re.match(
+            r"(?i)^(?:Özelleştirme|Ozellestirme|UBL|ERP\s*Fatura|e-Belge|table|image)\b",
+            customer.name,
+        )
+    ):
+        customer.name = None
+    from tax_id import is_placeholder_tax_id, is_valid_tax_id
+
+    if customer.taxId and (
+        is_placeholder_tax_id(customer.taxId)
+        or not is_valid_tax_id(customer.taxId, customer.taxIdScheme)
+    ):
+        customer.taxId = None
+        customer.taxIdScheme = None
+    if not customer.name:
+        # Prefer unlabeled person name above placeholder TCKN/VKN (Media Markt)
+        m = re.search(
+            r"(?m)^([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü'. -]{4,60})\s*\n+"
+            r"(?:TCKN\s*/\s*VKN|VKN\s*/\s*TCKN|TCKN|VKN)\s*:?\s*\d{10,11}",
+            text,
+        )
+        if m:
+            cand = m.group(1).strip()
+            if (
+                not _is_amount_in_words_name(cand)
+                and not _is_registry_or_chrome_line(cand)
+                and not re.search(r"(?i)ANON[İI]M|Ş[İI]RKET|LTD|MA[ĞG]AZA|MARKET", cand)
+            ):
+                customer.name = cand[:80]
+        if not customer.name:
             customer.name = "Nihai Tüketici"
 
     # Drop OCR junk lines when totals clearly don't match payable — but first

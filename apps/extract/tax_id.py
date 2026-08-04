@@ -18,10 +18,23 @@ def is_placeholder_tckn(value: str | None) -> bool:
     return digits_only(value) == PLACEHOLDER_TCKN
 
 
+def is_placeholder_tax_id(value: str | None) -> bool:
+    """Reject GİB anonymous / all-same-digit / zero tax ids (not real parties)."""
+    n = digits_only(value)
+    if not n:
+        return False
+    if n in {PLACEHOLDER_TCKN, "0000000000", "00000000000"}:
+        return True
+    if len(n) in (10, 11) and len(set(n)) == 1:
+        return True
+    return False
+
+
 def is_valid_tckn(value: str | None) -> bool:
     n = digits_only(value)
-    if is_placeholder_tckn(n):
-        return True
+    # Placeholder is known, but not a real identity — treat as invalid for binding.
+    if is_placeholder_tax_id(n):
+        return False
     if len(n) != 11 or not n.isdigit() or n[0] == "0":
         return False
     d = [int(c) for c in n]
@@ -34,6 +47,8 @@ def is_valid_tckn(value: str | None) -> bool:
 
 def is_valid_vkn(value: str | None) -> bool:
     n = digits_only(value)
+    if is_placeholder_tax_id(n):
+        return False
     if len(n) != 10 or not n.isdigit():
         return False
     total = 0
@@ -49,7 +64,7 @@ def is_valid_vkn(value: str | None) -> bool:
 
 def is_valid_tax_id(value: str | None, scheme: str | None = None) -> bool:
     n = digits_only(value)
-    if not n:
+    if not n or is_placeholder_tax_id(n):
         return False
     scheme_u = (scheme or "").upper()
     if scheme_u == "TCKN" or (not scheme_u and len(n) == 11):
