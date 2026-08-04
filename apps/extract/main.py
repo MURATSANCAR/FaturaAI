@@ -1417,10 +1417,13 @@ def needs_ocr_escalation(
         return True
     if not (inv.supplier.taxId or inv.customer.taxId):
         return True
-    if validation.confidence < 0.8:
+    if validation.confidence < 0.85:
         return True
     st = status_from(warnings, validation)
     if st in ("partial", "failed"):
+        return True
+    # Totals / tax warnings mean RapidOCR may be self-consistent but wrong
+    if any(re.search(r"(?i)uyu[sş]muyor|bulunamad[ıi]|eksik", w) for w in warnings):
         return True
     pay = float(inv.totals.payableAmount or 0)
     line_sum = sum(float(l.lineTotal or 0) for l in inv.lines if l.lineTotal is not None)
@@ -1436,11 +1439,17 @@ def needs_ocr_escalation(
         expected = float(le) + float(vat)
         if expected >= 50 and abs(pay - expected) / expected > 0.15:
             return True
+    ti = inv.totals.taxInclusiveAmount
+    if ti is not None and pay > 0 and float(ti) >= 50:
+        if abs(pay - float(ti)) / float(ti) > 0.15 and (inv.totals.withholdingVatAmount or 0) == 0:
+            return True
     # junk party names that slipped through
     for nm in (inv.supplier.name, inv.customer.name):
-        if nm and re.match(r"(?i)^(?:e-Belge|table|image|text|Nihai\s*T|ERP\s*Fatura)\b", nm):
-            if not inv.supplier.taxId or not inv.customer.taxId:
-                return True
+        if nm and re.match(
+            r"(?i)^(?:e-Belge|table|image|text|Nihai\s*T|ERP\s*Fatura|Özelleştirme|UBL)\b",
+            nm,
+        ):
+            return True
     return False
 
 

@@ -640,8 +640,13 @@ def parse_vl_markdown(text: str, file_name: str = ""):
     ):
         s_name = _party_name_from_block(head)
 
-    if s_name and not (_PATH_LINE.match(s_name) or s_name.startswith("/")):
+    if s_name and not (_PATH_LINE.match(s_name) or s_name.startswith("/") or "|" in s_name):
         inv.supplier.name = s_name
+    elif inv.supplier.name and (
+        "|" in inv.supplier.name
+        or re.match(r"(?i)^(?:e-Belge|FAX|TEL|WEB|V\.?\s*D\.?)\b", inv.supplier.name)
+    ):
+        inv.supplier.name = None
     if s_tax:
         inv.supplier.taxId = s_tax
         inv.supplier.taxIdScheme = s_scheme  # type: ignore[assignment]
@@ -649,7 +654,12 @@ def parse_vl_markdown(text: str, file_name: str = ""):
         inv.supplier.taxOffice = s_office
 
     if c_name and not (_PATH_LINE.match(c_name) or c_name.startswith("/")):
-        inv.customer.name = c_name
+        inv.customer.name = _unglue_repeated_name(c_name)
+    elif inv.customer.name and re.match(
+        r"(?i)^(?:Özelleştirme|Ozellestirme|UBL|Tasima|Ta[sş][ıi]ma|Fatura)\b",
+        inv.customer.name,
+    ):
+        inv.customer.name = None
     if c_tax:
         inv.customer.taxId = c_tax
         inv.customer.taxIdScheme = c_scheme  # type: ignore[assignment]
