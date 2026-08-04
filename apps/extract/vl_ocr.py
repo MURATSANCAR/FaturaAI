@@ -23,7 +23,7 @@ VL_OCR_DEVICE = os.getenv("VL_OCR_DEVICE", "cpu").strip()
 VL_OCR_THREADS = max(1, int(os.getenv("VL_OCR_THREADS", "4")))
 VL_OCR_SERIALIZE = os.getenv("VL_OCR_SERIALIZE", "1") == "1"
 VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
-VL_OCR_TIMEOUT_HINT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "300"))
+VL_OCR_TIMEOUT_HINT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "900"))
 VL_OCR_SUBPROCESS = os.getenv("VL_OCR_SUBPROCESS", "1") == "1"
 
 _infer_lock = threading.Lock()

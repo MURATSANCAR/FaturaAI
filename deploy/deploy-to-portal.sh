@@ -110,8 +110,9 @@ Environment=VL_OCR_PIPELINE=v1.6
 Environment=VL_OCR_DEVICE=cpu
 Environment=VL_OCR_THREADS=4
 Environment=VL_OCR_SERIALIZE=1
-Environment=VL_OCR_TIMEOUT_S=300
+Environment=VL_OCR_TIMEOUT_S=900
 Environment=VL_OCR_WARMUP=0
+Environment=VL_OCR_SUBPROCESS=1
 Environment=PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 Environment=PDF_RASTER_DPI=250
 Environment=IMAGE_OCR_SCALE=2.0

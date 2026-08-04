@@ -47,7 +47,7 @@ PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "1")))
 PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "120"))
 # Layout-agnostic VL document parse (PaddleOCR-VL-1.6); RapidOCR remains fallback.
 VL_OCR_ENABLED = os.getenv("VL_OCR_ENABLED", "0") == "1"
-VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "300"))
+VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "900"))
 VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
 PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "250")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
