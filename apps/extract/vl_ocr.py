@@ -85,28 +85,19 @@ def _init_pipe() -> Any:
         try:
             from paddleocr import PaddleOCRVL
 
-            kwargs: dict[str, Any] = {
-                "device": VL_OCR_DEVICE,
-            }
-            # Prefer 1.6 pipeline when API supports it
-            for extra in (
-                {"pipeline_version": VL_OCR_PIPELINE},
-                {"pipeline_version": VL_OCR_PIPELINE, "cpu_threads": VL_OCR_THREADS},
-                {
-                    "device": VL_OCR_DEVICE,
-                    "cpu_threads": VL_OCR_THREADS,
-                    "use_doc_orientation_classify": False,
-                    "use_doc_unwarping": False,
-                    "pipeline_version": VL_OCR_PIPELINE,
-                },
-            ):
-                try:
-                    _pipe = PaddleOCRVL(**{**kwargs, **extra})
-                    break
-                except TypeError:
-                    continue
-            if _pipe is None:
-                _pipe = PaddleOCRVL(device=VL_OCR_DEVICE)
+            # paddleocr>=3.2: pipeline_version defaults to v1.6 (PaddleOCR-VL-1.6-0.9B)
+            try:
+                _pipe = PaddleOCRVL(
+                    pipeline_version=VL_OCR_PIPELINE,
+                    device=VL_OCR_DEVICE,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                )
+            except TypeError:
+                _pipe = PaddleOCRVL(
+                    pipeline_version=VL_OCR_PIPELINE,
+                    device=VL_OCR_DEVICE,
+                )
         except Exception as exc:  # noqa: BLE001
             _pipe_error = f"PaddleOCRVL init failed: {exc}"
             raise RuntimeError(_pipe_error) from exc
