@@ -4042,6 +4042,22 @@ def _party_name_quality(name: str | None) -> int:
     return score
 
 
+def scrub_invoice_lines(inv: Invoice) -> None:
+    """Drop payment/IBAN/bank rows that should never be product lines."""
+    if not inv.lines:
+        return
+    inv.lines = [
+        ln
+        for ln in inv.lines
+        if ln.name
+        and not _is_bank_or_iban_line(ln.name)
+        and not re.search(
+            r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bTR\d{2}\b|Net\s*Mal\s*De[gğ]eri",
+            ln.name or "",
+        )
+    ]
+
+
 def _lines_useful(lines: list[Line] | list[dict] | None) -> bool:
     if not lines:
         return False
@@ -4818,6 +4834,9 @@ async def extract(
                 warnings, validation = validate_invoice(invoice)
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"docling-ocr-error:{exc}")
+
+        scrub_invoice_lines(invoice)
+        warnings, validation = validate_invoice(invoice)
 
         method = "+".join(
             p
