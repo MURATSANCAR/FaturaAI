@@ -78,6 +78,10 @@ locations = """
         proxy_read_timeout 180s;
         proxy_send_timeout 180s;
         client_max_body_size 25M;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+        add_header Pragma "no-cache" always;
         proxy_pass http://fatura_api/;
     }
 
@@ -88,6 +92,7 @@ locations = """
     location /fatura/ {
         alias /data/nanobaseai/fatura/apps/web/dist/;
         index index.html;
+        add_header Cache-Control "no-cache" always;
     }
 
 """

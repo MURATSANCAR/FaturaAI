@@ -105,6 +105,7 @@ async function runJob(job: InternalJob): Promise<void> {
 }
 
 export async function enqueueJob(buffer: Buffer, fileName: string): Promise<JobRecord> {
+  // Always a new job id — never keyed by file hash/content. Re-uploads always re-run extract.
   purgeExpired();
   if (queue.length + inflight >= MAX_QUEUE) {
     const err = new Error(`Kuyruk dolu (max ${MAX_QUEUE}). Lütfen biraz sonra tekrar deneyin.`);

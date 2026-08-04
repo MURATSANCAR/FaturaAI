@@ -22,6 +22,14 @@ app.use(
   }),
 );
 
+/** Never cache extract/job responses — every upload is processed fresh. */
+app.use("*", async (c, next) => {
+  await next();
+  c.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  c.header("Pragma", "no-cache");
+  c.header("Expires", "0");
+});
+
 const ALLOWED_EXT =
   /\.(pdf|jpe?g|png|webp|heic|heif|tif|tiff|bmp)$/i;
 const ALLOWED_MIME = new Set([

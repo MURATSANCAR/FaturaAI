@@ -446,6 +446,8 @@ export default function App() {
   const postJob = useCallback(async (file: File): Promise<Response> => {
     const form = new FormData();
     form.append("file", file);
+    // Bust any intermediate HTTP cache; each upload must create a fresh job.
+    form.append("clientRequestId", `${Date.now()}-${Math.random().toString(36).slice(2)}`);
     const prev = createLockRef.current;
     let release!: () => void;
     createLockRef.current = new Promise<void>((r) => {
@@ -456,7 +458,11 @@ export default function App() {
       const wait = Math.max(0, lastCreateAtRef.current + CREATE_MIN_INTERVAL_MS - Date.now());
       if (wait > 0) await sleep(wait);
       lastCreateAtRef.current = Date.now();
-      return await fetch(`${API_BASE}/jobs`, { method: "POST", body: form });
+      return await fetch(`${API_BASE}/jobs?t=${Date.now()}`, {
+        method: "POST",
+        body: form,
+        cache: "no-store",
+      });
     } finally {
       release();
     }
@@ -562,7 +568,9 @@ export default function App() {
                 });
                 return;
               }
-              const res = await fetch(`${API_BASE}/jobs/${job.jobId}`);
+              const res = await fetch(`${API_BASE}/jobs/${job.jobId}?t=${Date.now()}`, {
+                cache: "no-store",
+              });
               const body = (await res.json()) as {
                 status: string;
                 queuePosition?: number | null;
@@ -659,6 +667,15 @@ export default function App() {
     (files: FileList | null) => {
       if (!files || files.length === 0) return;
       const batch = Array.from(files);
+      // Same filename re-upload: drop prior cards so UI looks like a first upload.
+      const incomingNames = new Set(batch.map((f) => f.name));
+      for (const [id, item] of [...itemsRef.current.entries()]) {
+        if (!incomingNames.has(item.fileName)) continue;
+        itemsRef.current.delete(id);
+        itemOrderRef.current = itemOrderRef.current.filter((x) => x !== id);
+        pendingRef.current = pendingRef.current.filter((p) => p.id !== id);
+        activeJobsRef.current.delete(id);
+      }
       for (const file of batch) {
         const id = createItemId();
         const item: UploadItem = {
