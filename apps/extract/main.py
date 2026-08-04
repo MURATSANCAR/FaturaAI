@@ -993,7 +993,9 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         r"e-?Ar[sş]iv|SAYIN|VKN|TCKN|Tel:|E-?Posta|Fiyat\s*Oran|"
         r"Oranı\s*Tutarı|Hizmet\s*Mal|D[ÜU]ZENLEME|F[İI]L[İI]\s*SEVK|"
         r"Tarih[iı]?|Saat|Senaryo|Tipi|No\s*:|Kredi\s*Kart|Banka\s*Kart|"
-        r"Ara\s*Toplam|Genel\s*Toplam|Toplam\s*[İI]skonto|Matrah)",
+        r"Ara\s*Toplam|Genel\s*Toplam|Toplam\s*[İI]skonto|Matrah|"
+        r"IBAN|TR\d{2}|Banka\s*Hesap|Hesap\s*No|"
+        r"Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Ziraat|Akbank|Vak[ıi]fbank)",
     )
 
     def _wide_append(
@@ -1013,6 +1015,8 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         if not nm or len(nm) < 2:
             nm = f"Kalem {len(out) + 1}"
         if _wide_skip_name.search(nm) or _is_registry_or_chrome_line(nm):
+            return
+        if _is_bank_or_iban_line(nm):
             return
         if _is_amount_in_words_name(nm):
             return
@@ -1872,13 +1876,28 @@ def _is_registry_or_chrome_line(ln: str) -> bool:
     return bool(
         re.search(
             r"(?:T[İI]CARET\s*S[İI]C[İI]L|TICARETSICIL|MERS[İI]S\s*NO|MERSISNO|"
-            r"e-?Ar[sş]iv\s+Fatura|e-?Belge|Detay\s*Ekran|Nolu\s+\w+\s+Fatura|"
+            r"e-?Ar[sş]iv\s+Fatura|e-?Belge\b|Detay\s*Ekran|Nolu\s+\w+\s+Fatura|"
             r"^Sayfa\s+\d+|^\d{1,2}:\d{2}\b|KB/s|isteerp\.com|https?://|file://|"
             r"Özelleştirme\s*No|Ozellestirme\s*No|UBL\s*Versiyon|ERP\s*Fatura|"
             r"^Nihai\s*T|^table$|^image$|^text$|^header$|"
-            r"YALNIZ\b|ÜçBin|ElliDokuzBin|onyedi|beşyüz)",
+            r"\b(?:table|image|header|footer|paragraph_title|figure_title)\b|"
+            r"YALNIZ\b|ÜçBin|ElliDokuzBin|onyedi|beşyüz|"
+            r"Rar\$EX|AppData\\Local\\Temp)",
             ln,
             re.I,
+        )
+    )
+
+
+def _is_bank_or_iban_line(ln: str) -> bool:
+    """Reject bank/IBAN rows mistaken for product line items."""
+    return bool(
+        re.search(
+            r"(?i)\bIBAN\b|\bTR\d{2}\s*\d{4}|\bHesap\s*No\b|\bBanka\s*Hesap|"
+            r"\b(?:Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Is\s*Bank|"
+            r"Ziraat|Akbank|Vak[ıi]fbank|Vakifbank|Halkbank|Denizbank|"
+            r"QNB|Finansbank|TEB|Şekerbank|Sekerbank)\b",
+            ln,
         )
     )
 
@@ -2802,6 +2821,15 @@ def extract_supplier(text: str) -> Party:
                 best = cand
         if best:
             party.name = best[:180]
+    # Final purge: strip residual viewer/chrome fragments from supplier name
+    if party.name and (
+        _is_registry_or_chrome_line(party.name)
+        or _is_amount_in_words_name(party.name)
+        or re.search(r"(?i)\be-?Belge\b|file://|Rar\$EX|AppData\\Local", party.name)
+        or re.match(r"(?i)^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", party.name)
+        or re.match(r"(?i)^\d{1,2}:\d{2}\b", party.name)
+    ):
+        party.name = None
     return party
 
 
