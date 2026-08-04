@@ -786,6 +786,9 @@ def parse_vl_markdown(text: str, file_name: str = ""):
     elif re.search(r"(?i)e-?Fatura", cleaned):
         inv.documentType = "efatura"
 
+    from main import rebalance_party_tax_ids
+
+    rebalance_party_tax_ids(inv, cleaned)
     return inv
 
 

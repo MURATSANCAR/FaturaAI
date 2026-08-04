@@ -2318,7 +2318,11 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
 
 
 def normalize_ocr_uuid(raw: str) -> str | None:
-    """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, R→F, …)."""
+    """Fix common OCR confusions in ETTN (O→0, I/l→1, S→5, R→F, …).
+
+    Also tolerates a short leading group (6–7 hex instead of 8), common in
+    ExBilişim-style OCR: a88b302-4db9-… → 0a88b302-4db9-…
+    """
     cleaned = raw.strip().upper().replace("‑", "-")
     cleaned = cleaned.replace("\\_", "").replace("_", "").replace("{", "").replace("}", "")
     cleaned = cleaned.replace("–", "-").replace("—", "-")
@@ -2345,6 +2349,11 @@ def normalize_ocr_uuid(raw: str) -> str | None:
     )
     loose = cleaned.translate(safe_trans)
     hex_all = re.sub(r"[^0-9A-F]", "", loose)
+    # 31/30 hex: pad left (dropped leading nibble/char)
+    if len(hex_all) == 31:
+        hex_all = "0" + hex_all
+    elif len(hex_all) == 30:
+        hex_all = "00" + hex_all
     if len(hex_all) == 32:
         cleaned = (
             f"{hex_all[0:8]}-{hex_all[8:12]}-{hex_all[12:16]}-"
@@ -2360,8 +2369,20 @@ def normalize_ocr_uuid(raw: str) -> str | None:
                 p = re.sub(r"[^0-9A-F]", "", p)
                 if len(p) > n:
                     p = p[:n]
+                elif 0 < len(p) < n and (n - len(p)) <= 2:
+                    # Short leading/middle group — left-pad with zeros
+                    p = p.zfill(n)
                 fixed_parts.append(p)
             cleaned = "-".join(fixed_parts)
+            # If still short overall, pad first group from concatenated hex
+            hex2 = re.sub(r"[^0-9A-F]", "", cleaned)
+            if len(hex2) in (30, 31):
+                hex2 = hex2.zfill(32)
+            if len(hex2) == 32:
+                cleaned = (
+                    f"{hex2[0:8]}-{hex2[8:12]}-{hex2[12:16]}-"
+                    f"{hex2[16:20]}-{hex2[20:32]}"
+                )
         else:
             cleaned = loose
             cleaned = re.sub(r"[^0-9A-F-]", "", cleaned)
@@ -2540,9 +2561,9 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
 def extract_ettn_candidate(text: str) -> str | None:
     """Find ETTN even when OCR glues/truncates label (ETN…, ETTNe…) or mangles hex."""
     hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqzRrTtHhNnUuYyWwMm"
-    # Labeled; tolerate OCR junk labels (ETTı{ / ETİN / ETT N / UUID) and underscore escapes
+    # Labeled; tolerate ETT N / ETT: / ETİN / UUID and short leading group (6–8)
     m = re.search(
-        rf"(?i)(?:ETT\s*N|ETT[İIıiNnNne\{{]{{0,4}}|UUID)\s*[:\-]?\s*"
+        rf"(?i)(?:ETT\s*N|ETT\s*:|ETT[İIıiNnNne\{{]{{0,4}}|UUID)\s*[:\-]?\s*"
         rf"([{hexish}_\\]{{6,12}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?"
         rf"[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{10,16}})",
         text,
@@ -2551,7 +2572,7 @@ def extract_ettn_candidate(text: str) -> str | None:
         got = format_uuid_hex(m.group(1).replace("‑", "-"))
         if got:
             return got
-    # Glued label+uuid: ETNa89b302-...
+    # Glued label+uuid: ETNa89b302-... / ETTa88b302-...
     m = re.search(
         rf"(?i)ETT?Ne?([{hexish}]{{6,10}}[-‑][{hexish}]{{3,5}}[-‑]"
         rf"[{hexish}]{{3,5}}[-‑][{hexish}]{{3,5}}[-‑][{hexish}]{{10,14}})",
@@ -2559,6 +2580,16 @@ def extract_ettn_candidate(text: str) -> str | None:
     )
     if m:
         got = format_uuid_hex(m.group(1).replace("‑", "-"))
+        if got:
+            return got
+    # Broken leading group 6–7 (not only perfect 8)
+    m = re.search(
+        rf"\b([{hexish}]{{6,8}}-[{hexish}]{{4}}-[{hexish}]{{4}}-[{hexish}]{{4}}-[{hexish}]{{12}})\b",
+        text,
+        re.I,
+    )
+    if m:
+        got = format_uuid_hex(m.group(1))
         if got:
             return got
     m = re.search(
@@ -2581,18 +2612,102 @@ def extract_ettn_candidate(text: str) -> str | None:
         got = format_uuid_hex(m.group(1).replace("‑", "-"))
         if got:
             return got
-    # Compact 32-hex (labeled or bare)
-    m = re.search(rf"(?i)(?:ETT\s*N|ETT?Ne?|UUID)\s*[:\-]?\s*([{hexish}]{{30,40}})\b", text)
+    # Compact 32-hex (labeled or bare); also 30–32 with pad
+    m = re.search(
+        rf"(?i)(?:ETT\s*N|ETT\s*:|ETT?Ne?|UUID)\s*[:\-]?\s*([{hexish}]{{30,40}})\b",
+        text,
+    )
     if m:
         got = format_uuid_hex(m.group(1))
         if got:
             return got
-    m = re.search(rf"(?i)\b([{hexish}]{{32}})\b", text)
+    m = re.search(rf"(?i)\b([{hexish}]{{30,32}})\b", text)
     if m:
         got = format_uuid_hex(m.group(1))
         if got:
             return got
     return None
+
+
+def is_probable_non_invoice_text(text: str) -> bool:
+    """True when short OCR text lacks any e-invoice markers (logo/ad screenshots)."""
+    t = (text or "").strip()
+    if len(t) >= 800:
+        return False
+    return not bool(
+        re.search(
+            r"(?i)e-?Ar[sş]iv|e-?Fatura|\bETTN\b|\bÖdenecek\b|\bOdenecek\b|"
+            r"\bSAYIN\b|\bVKN\b|\bTCKN\b|Fatura\s*No|Mal\s*/?\s*Hizmet|"
+            r"\bKDV\b|\bGIB\b|\bGİB\b|Özelleştirme|Senaryo",
+            t,
+        )
+    )
+
+
+def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
+    """Fix supplier↔customer tax-id swaps and clear placeholders/phone false VKNs."""
+    from tax_id import is_placeholder_tax_id
+
+    s, c = inv.supplier, inv.customer
+    st = normalize_ocr_digits(s.taxId) or digits_only(s.taxId)
+    ct = normalize_ocr_digits(c.taxId) or digits_only(c.taxId)
+
+    if st and is_placeholder_tax_id(st):
+        s.taxId = None
+        s.taxIdScheme = None
+        st = ""
+    if ct and is_placeholder_tax_id(ct):
+        c.taxId = None
+        c.taxIdScheme = None
+        ct = ""
+
+    # Same id on both sides
+    if st and ct and st == ct:
+        if len(st) == 11:
+            # Person TCKN belongs to customer
+            s.taxId = None
+            s.taxIdScheme = None
+            st = ""
+            c.taxId, c.taxIdScheme = ct, "TCKN"
+        elif len(st) == 10 and st.startswith("5"):
+            # Likely phone fragment, not company VKN
+            s.taxId = None
+            s.taxIdScheme = None
+            st = ""
+
+    st = normalize_ocr_digits(s.taxId) or digits_only(s.taxId)
+    ct = normalize_ocr_digits(c.taxId) or digits_only(c.taxId)
+
+    # Supplier has TCKN, customer empty → move to customer, try recover VKN
+    if st and len(st) == 11 and not ct:
+        c.taxId, c.taxIdScheme = st, "TCKN"
+        s.taxId = None
+        s.taxIdScheme = None
+        st = ""
+        if text:
+            sayin = re.search(r"\bSAYIN\b", text, re.I)
+            head = text[: sayin.start()] if sayin else text[:1600]
+            recovered = find_role_tax_id(text, "supplier") or find_tax_id_in_region(head)
+            if recovered and recovered[1] == "VKN" and recovered[0] != c.taxId:
+                s.taxId, s.taxIdScheme = recovered
+            else:
+                # Spaced V.D. pattern: "836 014 4393"
+                spaced = re.search(
+                    r"(?i)(?:V\.?\s*D\.?|Vergi\s*Dairesi|VKN)\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{0,40}?"
+                    r"(\d{3}\s+\d{3}\s+\d{4})",
+                    head,
+                )
+                if spaced:
+                    got = coerce_tax_id(spaced.group(1))
+                    if got and got[1] == "VKN" and got[0] != c.taxId:
+                        s.taxId, s.taxIdScheme = got
+
+    # Final placeholder sweep
+    for party in (s, c):
+        raw = normalize_ocr_digits(party.taxId) or digits_only(party.taxId)
+        if raw and is_placeholder_tax_id(raw):
+            party.taxId = None
+            party.taxIdScheme = None
 
 
 _TAX_OCR = r"0-9OoОİIiılLSsBbGgZz"
@@ -4242,7 +4357,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         customization = re.sub(r"\s+", "", customization.upper())
         customization = re.sub(r"^TR([12])(\d)$", r"TR\1.\2", customization)
 
-    return Invoice(
+    inv = Invoice(
         documentType=doc_type,
         profileId=profile,
         customizationId=customization,
@@ -4268,6 +4383,8 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         bankName=(bank.strip() if bank else None) or bank_name_pay,
         bankBranch=None,
     )
+    rebalance_party_tax_ids(inv, text)
+    return inv
 
 
 def _looks_like_address_party_line(name: str) -> bool:
@@ -4556,6 +4673,8 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
             checks.append(f"fail:{msg}")
             score -= weight
 
+    # Safety net when binder/merge skipped parse_text_invoice rebalance
+    rebalance_party_tax_ids(inv)
     supplier_tax_warnings = _sanitize_party_tax_id(inv.supplier, "Satıcı")
     customer_tax_warnings = _sanitize_party_tax_id(inv.customer, "Alıcı")
     for w in supplier_tax_warnings + customer_tax_warnings:
@@ -4839,6 +4958,21 @@ async def extract(
                     if photo_text.strip():
                         text = photo_text
                         md = photo_text
+                        if is_probable_non_invoice_text(photo_text):
+                            pipeline.append("non-invoice-reject")
+                            _metrics["extract_failed"] += 1
+                            return ExtractResponse(
+                                status="failed",
+                                method="non-invoice",
+                                durationMs=int((time.perf_counter() - started) * 1000),
+                                warnings=[
+                                    "Belge e-fatura/e-arşiv olarak tanınmadı "
+                                    "(logo/reklam veya yetersiz metin)."
+                                ],
+                                invoice=Invoice(documentType="unknown"),
+                                rawTextPreview=photo_text[:2500],
+                                pipeline=pipeline,
+                            )
                         from parse_vl_markdown import invoice_from_ocr_text
 
                         inv_photo = invoice_from_ocr_text(
@@ -4847,6 +4981,7 @@ async def extract(
                         invoice = merge_invoice(invoice, inv_photo)
                         if not invoice.lines and inv_photo.lines:
                             invoice.lines = inv_photo.lines
+                        rebalance_party_tax_ids(invoice, photo_text)
                         warnings_ph, validation_ph = validate_invoice(invoice)
                         warnings, validation = warnings_ph, validation_ph
                         pipeline.append("ocr-field-binder")
