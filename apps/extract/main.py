@@ -45,6 +45,10 @@ PHOTO_OCR_WARMUP_MEDIUM = os.getenv("PHOTO_OCR_WARMUP_MEDIUM", "0") == "1"
 # Cap concurrent OCR threads per uvicorn worker (1 = safest vs OOM).
 PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "1")))
 PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "120"))
+# Layout-agnostic VL document parse (PaddleOCR-VL-1.6); RapidOCR remains fallback.
+VL_OCR_ENABLED = os.getenv("VL_OCR_ENABLED", "0") == "1"
+VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "300"))
+VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
 PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "250")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
@@ -78,6 +82,7 @@ _metrics = {
     "extract_total": 0,
     "extract_ok": 0,
     "extract_partial": 0,
+    "vl_ocr": 0,
     "extract_failed": 0,
     "fast_path": 0,
     "photo_ocr": 0,
@@ -102,13 +107,38 @@ def get_photo_ocr_sem() -> asyncio.Semaphore:
 
 
 async def run_photo_ocr(path: Path) -> tuple[str, dict[str, Any]]:
-    """Run photo OCR with per-worker concurrency + timeout (OOM-safe)."""
-    from photo_ocr import ocr_image
+    """Run photo OCR with per-worker concurrency + timeout (OOM-safe).
 
+    Prefers PaddleOCR-VL when enabled; falls back to RapidOCR PP-OCRv6.
+    """
     sem = get_photo_ocr_sem()
     await sem.acquire()
     _metrics["photo_ocr_inflight"] += 1
     try:
+        if VL_OCR_ENABLED:
+            try:
+                from vl_ocr import ocr_document
+
+                text, meta = await asyncio.wait_for(
+                    asyncio.to_thread(ocr_document, path),
+                    timeout=VL_OCR_TIMEOUT_S,
+                )
+                _metrics["vl_ocr"] += 1
+                return text, meta
+            except Exception as exc:  # noqa: BLE001
+                # Fall through to RapidOCR
+                meta_err = {"engine": "vl-fallback", "vlError": str(exc)}
+                from photo_ocr import ocr_image
+
+                text, meta = await asyncio.wait_for(
+                    asyncio.to_thread(ocr_image, path),
+                    timeout=PHOTO_OCR_TIMEOUT_S,
+                )
+                meta = {**meta, **meta_err, "fallbackFrom": "vl"}
+                return text, meta
+
+        from photo_ocr import ocr_image
+
         return await asyncio.wait_for(
             asyncio.to_thread(ocr_image, path),
             timeout=PHOTO_OCR_TIMEOUT_S,
@@ -126,9 +156,14 @@ async def run_pdf_raster_ocr(
     await sem.acquire()
     _metrics["photo_ocr_inflight"] += 1
     try:
+        timeout = (
+            max(VL_OCR_TIMEOUT_S * max_pages, 180)
+            if VL_OCR_ENABLED
+            else max(PHOTO_OCR_TIMEOUT_S * max_pages, 180)
+        )
         return await asyncio.wait_for(
             asyncio.to_thread(pdf_raster_ocr_text, path, tmp, max_pages),
-            timeout=max(PHOTO_OCR_TIMEOUT_S * max_pages, 180),
+            timeout=timeout,
         )
     finally:
         _metrics["photo_ocr_inflight"] = max(0, _metrics["photo_ocr_inflight"] - 1)
@@ -1366,7 +1401,7 @@ def is_unusable_extract_text(text: str) -> bool:
 
 
 def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[str, dict[str, Any]]:
-    """Render PDF pages and run photo OCR (for scanned / broken-text PDFs)."""
+    """Render PDF pages and run VL (preferred) or photo OCR for scanned/broken PDFs."""
     out_prefix = tmp / "raster"
     r = subprocess.run(
         [
@@ -1389,7 +1424,6 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
     pages = sorted(tmp.glob("raster*.png"))
     if not pages:
         raise RuntimeError(r.stderr.strip() or "pdftoppm produced no pages")
-    from photo_ocr import ocr_image
 
     chunks: list[str] = []
     meta: dict[str, Any] = {
@@ -1398,15 +1432,34 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
         "elapsedMs": 0,
         "dpi": PDF_RASTER_DPI,
     }
+
+    use_vl = VL_OCR_ENABLED
     for page in pages[:max_pages]:
-        txt, page_meta = ocr_image(page)
-        if txt.strip():
-            chunks.append(txt.strip())
+        page_text = ""
+        page_meta: dict[str, Any] = {}
+        if use_vl:
+            try:
+                from vl_ocr import ocr_document
+
+                page_text, page_meta = ocr_document(page)
+                _metrics["vl_ocr"] += 1
+            except Exception as exc:  # noqa: BLE001
+                use_vl = False
+                page_meta = {"vlError": str(exc)}
+        if not page_text.strip():
+            from photo_ocr import ocr_image
+
+            page_text, rapid_meta = ocr_image(page)
+            page_meta = {**page_meta, **rapid_meta, "fallbackFrom": "vl" if VL_OCR_ENABLED else None}
+        if page_text.strip():
+            chunks.append(page_text.strip())
         meta["pages"] = int(meta["pages"]) + 1
         meta["engine"] = page_meta.get("engine") or meta.get("engine")
         meta["elapsedMs"] = int(meta.get("elapsedMs") or 0) + int(
             page_meta.get("elapsedMs") or 0
         )
+        if page_meta.get("vlError"):
+            meta["vlError"] = page_meta["vlError"]
     return "\n\n".join(chunks), meta
 
 
@@ -3772,6 +3825,13 @@ def warmup() -> None:
             get_docling_converter(ocr=False, for_image=False)
         except Exception as exc:  # noqa: BLE001
             print(f"docling warmup skipped: {exc}")
+    if VL_OCR_ENABLED and VL_OCR_WARMUP:
+        try:
+            from vl_ocr import warmup as vl_warmup
+
+            print(f"VL OCR warmup: {vl_warmup()}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"VL OCR warmup skipped: {exc}")
     if PHOTO_OCR_ENABLED and PHOTO_OCR_WARMUP:
         try:
             from photo_ocr import warmup_engines
@@ -3792,6 +3852,14 @@ def health() -> dict[str, Any]:
             photo_status = engine_status()
         except Exception as exc:  # noqa: BLE001
             photo_status = {"enabled": True, "error": str(exc)}
+    vl_status: dict[str, Any] = {"enabled": VL_OCR_ENABLED}
+    if VL_OCR_ENABLED:
+        try:
+            from vl_ocr import engine_status as vl_engine_status
+
+            vl_status = vl_engine_status()
+        except Exception as exc:  # noqa: BLE001
+            vl_status = {"enabled": True, "error": str(exc)}
     return {
         "ok": True,
         "service": "fatura-ai-extract",
@@ -3800,8 +3868,11 @@ def health() -> dict[str, Any]:
         "forceImageOcr": FORCE_IMAGE_OCR,
         "photoOcr": PHOTO_OCR_ENABLED,
         "photoOcrStatus": photo_status,
+        "vlOcr": VL_OCR_ENABLED,
+        "vlOcrStatus": vl_status,
         "photoOcrMaxInflight": PHOTO_OCR_MAX_INFLIGHT,
         "photoOcrTimeoutS": PHOTO_OCR_TIMEOUT_S,
+        "vlOcrTimeoutS": VL_OCR_TIMEOUT_S,
         "fastPathPdf": FAST_PATH_PDF,
         "pdfInspector": PDF_INSPECTOR_ENABLED,
         "pdfRasterDpi": PDF_RASTER_DPI,
