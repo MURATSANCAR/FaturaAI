@@ -1046,8 +1046,15 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     )
     for m in p1.finditer(text):
         name = (m.group("name") or "").strip()
-        if not name or _wide_skip_name.search(name):
+        if (
+            not name
+            or _wide_skip_name.search(name)
+            or name.count("|") >= 1
+            or re.fullmatch(r"[\d\s.,|AdetadetTL%-]+", name)
+        ):
             name = _nearby_product_name(text, m.start()) or name
+        if name.count("|") >= 1:
+            continue
         _wide_append(
             name=name,
             qty=parse_tr_money(m.group("qty"))
@@ -1157,10 +1164,12 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     )
     for m in p5.finditer(text):
         name = m.group("name")
-        if re.search(r"(?i)%\d|\bKDV\b|\bAdet\b", name):
+        if name.rstrip().endswith(":"):
+            continue
+        if re.search(r"(?i)%\d|\bKDV\b|\bAdet\b|\||Net\s*Mal|Değeri|Toplam|Kart", name):
             continue
         total = parse_tr_money(m.group("total"))
-        if total is None or total < 5:
+        if total is None or total < 20:
             continue
         _wide_append(
             name=name,
@@ -1173,13 +1182,14 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
-    # Pattern 6 — Serbest güvenlik ağı: satırda ≥2 money token, isim solda
+    # Pattern 6 — Serbest güvenlik ağı: satırda money token, isim solda
     for ln in text.splitlines():
         s = ln.strip()
-        if not s or len(s) < 8:
+        if not s or len(s) < 8 or s.count("|") >= 2:
             continue
         if _wide_skip_name.search(s) or re.search(
-            r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s*KDV|Vergiler\s*Dahil",
+            r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s*KDV|Vergiler\s*Dahil|"
+            r"Net\s*Mal|Kredi\s*Kart|Banka\s*Kart|KDV\s*Toplam|KDV\s*Oran",
             s,
         ):
             continue
@@ -1187,12 +1197,11 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         if len(money_hits) < 1:
             continue
         total = parse_tr_money(money_hits[-1].group(1))
-        if total is None or total < 5:
+        if total is None or total < 20:
             continue
         name = s[: money_hits[0].start()].strip(" -|")
         name = re.sub(r"\s+", " ", name)
-        if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 4:
-            # Try previous-line name when this line is mostly numbers
+        if name.endswith(":") or len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 6:
             continue
         unit_price = (
             parse_tr_money(money_hits[0].group(1)) if len(money_hits) >= 2 else total
@@ -1216,7 +1225,7 @@ def parse_ocr_line_items(text: str) -> list[Line]:
             vat_amt=None,
             total=total,
         )
-        if len(out) > before and len(out) >= 12:
+        if len(out) > before and len(out) >= 8:
             break
     if out:
         return out
