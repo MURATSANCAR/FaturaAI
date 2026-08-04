@@ -337,6 +337,20 @@ _MONEY_TOKEN = (
 )
 
 
+def _line_money_hits(s: str) -> list[re.Match[str]]:
+    """Money tokens on a line, skipping leading SKU-like codes (e.g. 5007.1234605 APPLE)."""
+    hits = list(re.finditer(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", s, re.I))
+    while hits:
+        m = hits[0]
+        after = s[m.end() :]
+        # Product / PLU code at line start followed by letters is not an amount
+        if m.start() <= 2 and re.match(r"\s*[A-Za-zÇĞİÖŞÜçğıöşü]", after):
+            hits = hits[1:]
+            continue
+        break
+    return hits
+
+
 def normalize_ocr_text(text: str) -> str:
     """Generic OCR label/typo normalization for Turkish e-invoice layouts."""
     if not text:
@@ -995,6 +1009,7 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         r"Tarih[iı]?|Saat|Senaryo|Tipi|No\s*:|Kredi\s*Kart|Banka\s*Kart|"
         r"Ara\s*Toplam|Genel\s*Toplam|Toplam\s*[İI]skonto|Matrah|"
         r"IBAN|TR\d{2}|Banka\s*Hesap|Hesap\s*No|"
+        r"Ma[gğ]aza|Kasa(?:\s*No)?|Kasiyer|Sistem\s*No|Çekmece|"
         r"Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Ziraat|Akbank|Vak[ıi]fbank)",
     )
 
@@ -1160,6 +1175,39 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
+    # Pattern 4b — Retail e-ticaret: name %vat total (Media Markt)
+    # "5007.1234605 APPLE KALEM & AKSESUARLARI  % 20  3.869,00"
+    p4b = re.compile(
+        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{8,200}}?)\s+"
+        rf"%\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+        rf"(?P<total>{_MONEY_TOKEN})\s*(?:TL|TRY)?\s*$",
+        re.I,
+    )
+    rows_p4b = text.splitlines()
+    for m in p4b.finditer(text):
+        name = m.group("name")
+        # Append SKU/model continuation on the next non-empty line
+        line_idx = text[: m.start()].count("\n")
+        for j in range(line_idx + 1, min(line_idx + 4, len(rows_p4b))):
+            nxt = rows_p4b[j].strip()
+            if not nxt:
+                continue
+            if re.search(rf"{_MONEY_TOKEN}|%\s*\d|KDV|Toplam|Kart", nxt, re.I):
+                break
+            if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü0-9]{3,}", nxt) and len(nxt) < 80:
+                name = f"{name} {nxt}".strip()
+            break
+        _wide_append(
+            name=name,
+            qty=1.0,
+            unit_price=parse_tr_money(m.group("total")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=None,
+            total=parse_tr_money(m.group("total")),
+        )
+    if out:
+        return out
+
     # Pattern 5 — Sadece isim + tutar (tek tutarlı satır)
     p5 = re.compile(
         rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,160}}?)\s+"
@@ -1186,6 +1234,69 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
+    # Pattern 5b — İsim / %KDV / tutar ayrı satırlarda (Docling/markdown)
+    rows5b = [ln.rstrip() for ln in text.splitlines()]
+    for i, raw in enumerate(rows5b):
+        s = raw.strip()
+        if not s or len(s) < 8:
+            continue
+        if _wide_skip_name.search(s) or _is_bank_or_iban_line(s):
+            continue
+        # SKU-like leading codes (5007.1234605) are OK; real amounts are not
+        if _line_money_hits(s) or re.search(r"%\s*\d", s):
+            continue
+        if not re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{3,}", s):
+            continue
+        if re.search(
+            r"(?i)Toplam|KDV|Ödenecek|Matrah|Kart|IBAN|Net\s*Mal|Fatura\s*No|ETTN",
+            s,
+        ):
+            continue
+        name = s
+        vat_rate = None
+        total = None
+        for j in range(i + 1, min(i + 6, len(rows5b))):
+            nxt = rows5b[j].strip()
+            if not nxt:
+                continue
+            vm = re.fullmatch(r"%\s*(\d{1,2}(?:[.,]\d+)?)", nxt)
+            if vm:
+                vat_rate = normalize_vat_rate(parse_percent(vm.group(1)))
+                continue
+            amt_m = re.fullmatch(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", nxt, re.I)
+            if amt_m:
+                total = parse_tr_money(amt_m.group(1))
+                break
+            # Don't glue header values (T601) or new product rows onto a label name
+            if s.rstrip().endswith(":") or _wide_skip_name.search(s):
+                break
+            # Model/SKU continuation before amounts
+            if (
+                not _line_money_hits(nxt)
+                and not re.search(r"%\s*\d|KDV|Toplam|Kart", nxt, re.I)
+                and not _wide_skip_name.search(nxt)
+                and re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü0-9]{3,}", nxt)
+                and len(nxt) < 80
+                and len(name) < 160
+            ):
+                name = f"{name} {nxt}".strip()
+                continue
+            break
+        if total is None or total < 20:
+            continue
+        if s.rstrip().endswith(":") or _wide_skip_name.search(name):
+            continue
+        _wide_append(
+            name=name,
+            qty=1.0,
+            unit_price=total,
+            vat_rate=vat_rate,
+            vat_amt=None,
+            total=total,
+        )
+    if out:
+        return out
+
     # Pattern 6 — Serbest güvenlik ağı: satırda money token, isim solda
     for ln in text.splitlines():
         s = ln.strip()
@@ -1199,13 +1310,22 @@ def parse_ocr_line_items(text: str) -> list[Line]:
             continue
         if _is_bank_or_iban_line(s):
             continue
-        money_hits = list(re.finditer(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", s, re.I))
+        money_hits = _line_money_hits(s)
         if len(money_hits) < 1:
             continue
         total = parse_tr_money(money_hits[-1].group(1))
         if total is None or total < 20:
             continue
-        name = s[: money_hits[0].start()].strip(" -|")
+        # Keep SKU prefix in name when first raw money was a product code
+        name_end = money_hits[0].start()
+        raw_first = next(re.finditer(rf"({_MONEY_TOKEN})", s), None)
+        if raw_first and raw_first.start() < money_hits[0].start():
+            name_end = 0  # include leading SKU in name; amount is later
+            # Prefer text before the *amount* money (last hit), stripping %vat noise
+            name = s[: money_hits[-1].start()]
+            name = re.sub(r"%\s*\d{1,2}(?:[.,]\d+)?\s*$", "", name).strip(" -|")
+        else:
+            name = s[:name_end].strip(" -|")
         name = re.sub(r"\s+", " ", name)
         if name.endswith(":") or len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 6:
             continue
@@ -4043,14 +4163,19 @@ def _party_name_quality(name: str | None) -> int:
 
 
 def scrub_invoice_lines(inv: Invoice) -> None:
-    """Drop payment/IBAN/bank rows that should never be product lines."""
+    """Drop payment/IBAN/bank/meta rows that should never be product lines."""
     if not inv.lines:
         return
+    meta_name = re.compile(
+        r"(?i)^(?:Ma[gğ]aza|Kasa(?:\s*No)?|Kasiyer|Sistem\s*No|Çekmece|Saat|Tarih|"
+        r"Fatura\s*Tipi|Online\s*Sipari[sş]|Club\s*Kart)\s*:?\s*\S{0,20}$"
+    )
     inv.lines = [
         ln
         for ln in inv.lines
         if ln.name
         and not _is_bank_or_iban_line(ln.name)
+        and not meta_name.search(ln.name.strip())
         and not re.search(
             r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bTR\d{2}\b|Net\s*Mal\s*De[gğ]eri",
             ln.name or "",
@@ -4780,12 +4905,26 @@ async def extract(
                         raster_txt, name, engine=str(raster_meta.get("engine") or "")
                     )
                     pipeline.append("ocr-field-binder")
+                    scrub_invoice_lines(inv_r)
                     if invoice.supplier and invoice.supplier.name:
                         if sum(1 for c in invoice.supplier.name if ord(c) < 32) >= 2:
                             invoice.supplier.name = None
+                    scrub_invoice_lines(invoice)
                     invoice = merge_invoice(invoice, inv_r)
+                    scrub_invoice_lines(invoice)
                     if not _lines_useful(invoice.lines) and _lines_useful(inv_r.lines):
                         invoice.lines = inv_r.lines
+                    # Prefer binder product rows over header/meta false positives
+                    elif _lines_useful(inv_r.lines) and invoice.lines:
+                        base_meta = all(
+                            re.search(
+                                r"(?i)^(?:Ma[gğ]aza|Kasa|Kasiyer|Sistem|Kredi\s*Kart)",
+                                (ln.name or ""),
+                            )
+                            for ln in invoice.lines
+                        )
+                        if base_meta:
+                            invoice.lines = inv_r.lines
                     text = (text + "\n\n" + raster_txt).strip() if text else raster_txt
                     md = (md + "\n\n" + raster_txt).strip() if md else raster_txt
                     warnings, validation = validate_invoice(invoice)
