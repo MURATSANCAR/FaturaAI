@@ -1008,9 +1008,11 @@ def parse_ocr_line_items(text: str) -> list[Line]:
         r"Oranı\s*Tutarı|Hizmet\s*Mal|D[ÜU]ZENLEME|F[İI]L[İI]\s*SEVK|"
         r"Tarih[iı]?|Saat|Senaryo|Tipi|No\s*:|Kredi\s*Kart|Banka\s*Kart|"
         r"Ara\s*Toplam|Genel\s*Toplam|Toplam\s*[İI]skonto|Matrah|"
-        r"IBAN|TR\d{2}|Banka\s*Hesap|Hesap\s*No|"
+        r"IBAN|İBAN|TR\d{2}|Banka\s*Hesap|Hesap\s*No|Hesap\s*Ad|"
         r"Ma[gğ]aza|Kasa(?:\s*No)?|Kasiyer|Sistem\s*No|Çekmece|"
-        r"Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Ziraat|Akbank|Vak[ıi]fbank)",
+        r"[ŞS]ube\s*Kod|[ŞS]ube\s*Ad|Swift|BIC|"
+        r"Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Ziraat|Akbank|"
+        r"Vak[ıi]fbank|Halkbank|Denizbank|QNB|Finansbank|TEB|ING)",
     )
 
     def _wide_append(
@@ -2011,15 +2013,48 @@ def _is_registry_or_chrome_line(ln: str) -> bool:
     )
 
 
+# IBAN: spaced / compact / loosely-split TR + foreign (DE, …)
+# Examples:
+#   TR86 0001 0000 0000 0000 0000 00
+#   TR860001000000000000000000
+#   TR 86 00010 0 0000000000000000
+#   TR08 0006 2000 3820 0006 2966 83
+#   DE89 3704 0044 0532 0130 00
+_IBAN_RE = re.compile(
+    r"(?ix)"
+    r"(?:^|[^\w])"  # avoid matching inside longer alphanumerics
+    r"(?:"
+    # Spaced TR: TR86 0001 0000 … (groups of 4, optional trailing 00)
+    r"TR\s*\d{2}(?:\s+\d{4}){5}\s*\d{0,4}"
+    r"|"
+    # Compact TR: TR + 24 digits
+    r"TR\d{24}"
+    r"|"
+    # Split / OCR-noisy TR: TR + check + remaining digits with arbitrary spaces
+    r"TR\s*\d{2}(?:\s*\d){20,24}"
+    r"|"
+    # Foreign IBAN (2-letter country ≠ TR): CC + check + 11–30 alnum/spaces
+    r"(?!TR)[A-Z]{2}\s*\d{2}(?:[\s]*[A-Z0-9]){11,30}"
+    r")"
+)
+
+
 def _is_bank_or_iban_line(ln: str) -> bool:
     """Reject bank/IBAN/payment rows mistaken for product line items."""
+    if not ln:
+        return False
+    if _IBAN_RE.search(ln):
+        return True
     return bool(
         re.search(
-            r"(?i)\bIBAN\b|\bTR\d{2}\s*\d{4}|\bHesap\s*No\b|\bBanka\s*Hesap|"
+            r"(?i)"
+            r"\bIBAN\b|\bİBAN\b|"
+            r"\bBanka\s*Hesap|\bHesap\s*No\b|\bHesap\s*Ad[ıi]\b|"
+            r"\b[ŞS]ube\s*Kod|\b[ŞS]ube\s*Ad|\bSwift\b|\bBIC\b|"
             r"Kredi\s*Kart[ıi]?|Banka\s*Kart[ıi]?|Kart[ıi]/\s*Banka|"
             r"\b(?:Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Is\s*Bank|"
             r"Ziraat|Akbank|Vak[ıi]fbank|Vakifbank|Halkbank|Denizbank|"
-            r"QNB|Finansbank|TEB|Şekerbank|Sekerbank)\b",
+            r"QNB|Finansbank|TEB|ING|Şekerbank|Sekerbank)\b",
             ln,
         )
     )
@@ -4177,7 +4212,8 @@ def scrub_invoice_lines(inv: Invoice) -> None:
         and not _is_bank_or_iban_line(ln.name)
         and not meta_name.search(ln.name.strip())
         and not re.search(
-            r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bTR\d{2}\b|Net\s*Mal\s*De[gğ]eri",
+            r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bİBAN\b|"
+            r"Net\s*Mal\s*De[gğ]eri|Hesap\s*Ad|[ŞS]ube\s*(?:Kod|Ad)|Swift|\bBIC\b",
             ln.name or "",
         )
     ]
