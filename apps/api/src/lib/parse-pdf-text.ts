@@ -261,7 +261,7 @@ function extractSupplier(text: string): InvoiceParty {
   party.address = addrParts.join(", ").replace(/\s+/g, " ").trim() || null;
 
   party.phone = firstMatch(head, /Tel\s*:\s*([0-9\s()]+?)(?:\s+Fax|$|\n)/i)?.replace(/\s+/g, "") || null;
-  party.email = firstMatch(head, /E-?Posta\s*:\s*([^\s]+)/i);
+  party.email = sanitizeEmail(firstMatch(head, /E-?Posta\s*:\s*([^\s]+)/i));
   party.website = firstMatch(head, /Web\s*Sitesi\s*:\s*([^\s]+)/i);
   if (party.website && /Özelleştirme/i.test(party.website)) party.website = null;
 
@@ -374,8 +374,10 @@ function extractCustomer(text: string): InvoiceParty {
     party.taxIdScheme = chosen.scheme;
   }
 
-  party.email = firstMatch(near, /E-?Posta\s*:\s*([^\s]+)/i);
-  if (party.email && /Özelleştirme|Senaryo/i.test(party.email)) party.email = null;
+  party.email = sanitizeEmail(firstMatch(near, /E-?Posta\s*:\s*([^\s]+)/i));
+  if (party.name) {
+    party.name = sanitizePartyName(party.name, { customer: true }) ?? party.name;
+  }
 
   return party;
 }
@@ -629,6 +631,10 @@ function sumLabeledAmounts(text: string, label: string): number | null {
  * Does not include KDV Matrahı / Tevkifat.
  */
 function extractVatAmount(text: string): number | null {
+  // Prefer explicit "Beyan Edilecek KDV" when present (avoids OCR grabbing wrong totals)
+  const beyan = labeledAmount(text, "Beyan\\s*Edilecek\\s*KD[Vv]");
+  if (beyan != null && beyan > 0) return beyan;
+
   const rateLineRe =
     /(?:Hesaplanan\s+)?KDV(?!\s*(?:TEVK|Tevkifat|Matrah[ıi]?))(?:\s*\(\s*%?\s*[\d.,]+\s*%?\s*\))\s*:?\s*([\d.\s]+,\d{2,})/gi;
   const rateAmounts = [...text.matchAll(rateLineRe)]
@@ -738,10 +744,78 @@ function normalizeCustomizationId(raw: string | null | undefined): string | null
   const s = asciiUpper(raw).replace(/\s+/g, "");
   const m = s.match(/^(TR[12](?:\.\d)?)/);
   if (m) {
-    return m[1].replace(/^TR([12])(\d)$/, "TR$1.$2");
+    let got = m[1].replace(/^TR([12])(\d)$/, "TR$1.$2");
+    // Bare TR1 / TR2 on e-Arşiv almost always means TR1.2
+    if (/^TR[12]$/.test(got)) got = `${got}.2`;
+    return got;
   }
   const m2 = s.match(/^TR([12])(\d)/);
   return m2 ? `TR${m2[1]}.${m2[2]}` : null;
+}
+
+function sanitizeEmail(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = raw.trim().replace(/^[\s:.\-|,/]+|[\s:.\-|,/]+$/g, "");
+  if (!s.includes("@") || !s.split("@").pop()?.includes(".")) return null;
+  if (s.length < 6 || s.length > 80) return null;
+  if (/[\\{§*]|Vergi|FAx|Fax|Özelleştirme|Senaryo|ETTN|VKN|TCKN|^https?:\/\//i.test(s)) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(s)) return null;
+  return s;
+}
+
+function sanitizePartyName(
+  raw: string | null | undefined,
+  opts?: { customer?: boolean },
+): string | null {
+  if (!raw) return null;
+  let s = raw.replace(/\s+/g, " ").trim().replace(/^[\s:.\-|,/]+|[\s:.\-|,/]+$/g, "");
+  s =
+    s.split(
+      /\s+(?:VKN|TCKN|Vergi\s*Dairesi|Tel\s*:|E-?Posta|ETTN|Fatura\s*No)\b/i,
+    )[0]?.trim() ?? s;
+  if (opts?.customer) {
+    s = s.replace(/\s+\S+\s+No\s*:?\s*$/i, "").replace(/^[\s:.\-]+|[\s:.\-]+$/g, "");
+    s = s.replace(/\s+(?:Kap[ıi]\s*)?No\s*:?\s*$/i, "").trim();
+  }
+  if (s.length < 3) return null;
+  if (/^(?:Nihai\s*T|Vergi|table|image|ADRES)\b/i.test(s) && !/^Nihai\s+T/i.test(s)) {
+    return null;
+  }
+  return s.slice(0, 180);
+}
+
+function scrubLineName(name: string | null | undefined): string | null {
+  if (!name) return null;
+  let s = name.replace(/\s+/g, " ").trim();
+  for (let i = 0; i < 6; i++) {
+    const nxt = s.replace(
+      /^(?:Oran[ıi]|Tutar[ıi]|Neden[ıi]|A[cç][ıi]klama|Mal\s*Hizmet|Miktar|Birim(?:\s*Fiyat)?|KDV(?:\s*Tutar[ıi]?)?|İskonto)\s+/i,
+      "",
+    );
+    if (nxt === s) break;
+    s = nxt;
+  }
+  s = s.replace(/^(?:Oran[ıi]\s+Tutar[ıi]\s+(?:Neden[ıi]\s+)?Tutar[ıi]\s+)+/i, "");
+  s = s.replace(/\s+\d+(?:[.,]\d+)?\s*Adet\s*$/i, "").trim();
+  s = s.replace(/(.{10,}?)\s+\1\b/i, "$1").trim();
+  if (s.length < 3) return null;
+  return s.slice(0, 240);
+}
+
+function scrubInvoiceFields(invoice: ParsedInvoice): void {
+  invoice.supplier.email = sanitizeEmail(invoice.supplier.email);
+  invoice.customer.email = sanitizeEmail(invoice.customer.email);
+  const sn = sanitizePartyName(invoice.supplier.name);
+  if (sn) invoice.supplier.name = sn;
+  const cn = sanitizePartyName(invoice.customer.name, { customer: true });
+  if (cn) invoice.customer.name = cn;
+  for (const ln of invoice.lines) {
+    const cleaned = scrubLineName(ln.name);
+    if (cleaned) ln.name = cleaned;
+  }
+  invoice.lines = invoice.lines.filter((ln) => Boolean(ln.name));
 }
 
 function sanitizeTaxOffice(raw: string | null | undefined): string | null {
@@ -882,16 +956,41 @@ export function reconcileTotals(invoice: ParsedInvoice): void {
     }
   }
 
-  // If payable + withholding ≈ taxInclusive but withholding null, leave as-is
+  // Real tevkifat only: invent withholding when gap is ≥ 1 TL (not kuruş OCR drift)
   if (
     t.taxInclusiveAmount != null &&
     t.payableAmount != null &&
     t.withholdingVatAmount == null &&
-    t.taxInclusiveAmount > t.payableAmount + 0.05
+    t.taxInclusiveAmount > t.payableAmount + 1.0
   ) {
     t.withholdingVatAmount = Number(
       (t.taxInclusiveAmount - t.payableAmount).toFixed(2),
     );
+  }
+
+  // Ödenecek ≈ dahil → drop bogus tevkifat (OCR grabbed wrong total)
+  if (
+    t.withholdingVatAmount != null &&
+    t.taxInclusiveAmount != null &&
+    t.payableAmount != null &&
+    near(t.payableAmount, t.taxInclusiveAmount, 1.0)
+  ) {
+    if (
+      t.withholdingVatAmount >= Math.min(t.payableAmount, t.taxInclusiveAmount) * 0.45
+    ) {
+      t.withholdingVatAmount = null;
+    }
+  }
+
+  // Kuruş / 1 TL OCR drift: snap ödenecek → dahil when no tevkifat
+  if (
+    t.payableAmount != null &&
+    t.taxInclusiveAmount != null &&
+    t.withholdingVatAmount == null &&
+    Math.abs(t.payableAmount - t.taxInclusiveAmount) > 0 &&
+    Math.abs(t.payableAmount - t.taxInclusiveAmount) <= 1.0
+  ) {
+    t.payableAmount = t.taxInclusiveAmount;
   }
 
   // Fill matrah from payable - vat when missing
@@ -1051,6 +1150,7 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   };
   invoice.supplier.taxOffice = sanitizeTaxOffice(invoice.supplier.taxOffice);
   invoice.customer.taxOffice = sanitizeTaxOffice(invoice.customer.taxOffice);
+  scrubInvoiceFields(invoice);
   reconcileTotals(invoice);
   return invoice;
 }
@@ -1086,6 +1186,7 @@ function sanitizePartyTaxId(party: InvoiceParty, role: string): string[] {
 
 export function validateInvoice(invoice: ParsedInvoice): string[] {
   // Reconcile again in case caller mutated totals
+  scrubInvoiceFields(invoice);
   reconcileTotals(invoice);
   const warnings: string[] = [];
   const supplierTaxWarnings = sanitizePartyTaxId(invoice.supplier, "Satıcı");

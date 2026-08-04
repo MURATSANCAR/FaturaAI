@@ -1639,7 +1639,11 @@ def normalize_customization_id(raw: str | None) -> str | None:
             return f"TR{m.group(1)}.{m.group(2)}"
         return None
     got = m.group(1)
-    return re.sub(r"^TR([12])(\d)$", r"TR\1.\2", got)
+    got = re.sub(r"^TR([12])(\d)$", r"TR\1.\2", got)
+    # Bare TR1 / TR2 on e-Arşiv almost always means TR1.2
+    if re.fullmatch(r"TR[12]", got):
+        return f"{got}.2"
+    return got
 
 
 def sanitize_tax_office(raw: str | None) -> str | None:
@@ -2052,6 +2056,17 @@ def sum_labeled_amounts(text: str, label: str) -> float | None:
 
 def extract_vat_amount(text: str) -> float | None:
     """Sum multi-rate KDV rows: KDV (%10) + KDV (%20). Prefer footnotes when present."""
+    # Explicit totals-box labels (OCR-tolerant)
+    for lab in (
+        r"Beyan\s*Edilecek\s*KDv",
+        r"Beyan\s*Edilecek\s*KDV",
+        r"Hesaplanan\s*KDV(?!\s*Tevkifat)",
+        r"Toplam\s*KDV",
+    ):
+        amt = labeled_amount(text, lab)
+        if amt is not None and amt > 0:
+            return amt
+
     footnote_re = re.compile(
         rf"Kdv\s*Tutar[ıian]?\s*:?\s*({_MONEY_TOKEN})",
         re.I,
@@ -3425,7 +3440,9 @@ def extract_supplier(text: str) -> Party:
             chosen = vkn_only or (None if companyish else chosen)
         if chosen:
             party.taxId, party.taxIdScheme = chosen
-    party.email = first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
+    party.email = sanitize_email(
+        first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
+    )
     party.website = first_match(head, r"Web\s*Sitesi\s*:?\s*([^\s]+)")
     phone_raw = first_match(head, r"(?:Tel|Telefon)\s*:?\s*([0-9\s()\-]{10,})")
     party.phone = re.sub(r"\s+", "", phone_raw) if phone_raw else None
@@ -3627,7 +3644,9 @@ def extract_customer(text: str) -> Party:
     party.taxOffice = (first_match(near, r"Vergi\s*Dairesi\s*:?\s*([^\n]+)") or "").split("  ")[0].strip() or None
     if party.taxOffice:
         party.taxOffice = sanitize_tax_office(party.taxOffice)
-    party.email = first_match(near, r"E-?Posta\s*:?\s*([^\s]+)")
+    party.email = sanitize_email(first_match(near, r"E-?Posta\s*:?\s*([^\s]+)"))
+    if party.name:
+        party.name = sanitize_party_name(party.name, customer=True) or party.name
     return party
 
 
@@ -4198,8 +4217,16 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         elif vat is None:
             vat = implied
         elif abs((line_ext + vat) - tax_inclusive) > 0.05:
+            # Arithmetic matrah+dahil implies a clean VAT — prefer it over OCR junk
+            # (Nurtekin: matrah 38520 + dahil 46224 → KDV 7704, not 28876)
+            if (
+                implied > 0.5
+                and abs(implied - vat) > max(1.0, tax_inclusive * 0.03)
+                and (payable is None or nearly_equal(payable, tax_inclusive, 1.0))
+            ):
+                vat = implied
             # Don't overwrite labeled multi-rate KDV with bad implied (incomplete lines)
-            if not multi_rate_kdv or abs(implied - vat) <= 1.0:
+            elif not multi_rate_kdv or abs(implied - vat) <= 1.0:
                 if implied > 0.5 or vat < 0.5:
                     vat = implied
             elif matrah is not None and abs((matrah + vat) - tax_inclusive) <= 1.0:
@@ -4217,6 +4244,19 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         and tax_inclusive > payable + 0.05
     ):
         withholding = round(tax_inclusive - payable, 2)
+
+    # Fake tevkifat: ödenecek ≈ vergiler dahil → tevkifat yok; huge withholding is OCR noise
+    if (
+        withholding is not None
+        and tax_inclusive is not None
+        and payable is not None
+        and nearly_equal(payable, tax_inclusive, 1.0)
+    ):
+        has_tevk_label = bool(
+            re.search(r"(?i)KDV\s*Tevkifat|Hesaplanan\s+KDV\s*Tevkifat", text)
+        )
+        if not has_tevk_label or withholding >= min(payable, tax_inclusive) * 0.45:
+            withholding = None
 
     # Soft 0.01 reconcile: prefer taxInclusive as payable when off by 1 kuruş vs bank
     if (
@@ -4718,6 +4758,85 @@ def _party_name_quality(name: str | None) -> int:
     return score
 
 
+def sanitize_email(raw: str | None) -> str | None:
+    """Drop OCR garbage mistaken for e-mail (Fax crumbs, 'Vergi', etc.)."""
+    if not raw:
+        return None
+    s = raw.strip().strip(" :.-|,/")
+    if "@" not in s or "." not in s.split("@")[-1]:
+        return None
+    if len(s) < 6 or len(s) > 80:
+        return None
+    if re.search(
+        r"(?i)[\\{§*]|Vergi|FAx|Fax|Özelleştirme|Senaryo|ETTN|VKN|TCKN|^https?://",
+        s,
+    ):
+        return None
+    if not re.match(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", s):
+        return None
+    return s
+
+
+def sanitize_party_name(raw: str | None, *, customer: bool = False) -> str | None:
+    """Trim OCR tails like 'DİNAR No:' / glued metadata from party titles."""
+    if not raw:
+        return None
+    s = re.sub(r"\s+", " ", raw).strip(" :.-|,/")
+    s = re.split(
+        r"\s+(?:VKN|TCKN|Vergi\s*Dairesi|Tel\s*:|E-?Posta|ETTN|Fatura\s*No)\b",
+        s,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    if customer:
+        # "MAHMUT SALMAN DİNAR No:" → drop city+No: OCR tails first
+        s = re.sub(r"(?i)\s+\S+\s+No\s*:?\s*$", "", s).strip(" :.-")
+        s = re.sub(r"(?i)\s+(?:Kap[ıi]\s*)?No\s*:?\s*$", "", s).strip(" :.-")
+        s = re.sub(r"(?i)\s+No\s*:?\s*$", "", s).strip()
+    if len(s) < 3:
+        return None
+    if re.match(r"(?i)^(?:Nihai\s*T|Vergi|table|image|ADRES)\b", s):
+        return None
+    return s[:180]
+
+
+def scrub_line_name(name: str | None) -> str | None:
+    """Remove table-header crumbs glued onto product descriptions."""
+    if not name:
+        return None
+    s = re.sub(r"\s+", " ", name).strip()
+    # "Oranı Tutarı Nedeni Tutarı SAMSUNG S24…"
+    for _ in range(6):
+        nxt = re.sub(
+            r"(?i)^(?:Oran[ıi]|Tutar[ıi]|Neden[ıi]|A[cç][ıi]klama|Mal\s*Hizmet|"
+            r"Miktar|Birim(?:\s*Fiyat)?|KDV(?:\s*Tutar[ıi]?)?|İskonto)\s+",
+            "",
+            s,
+        )
+        if nxt == s:
+            break
+        s = nxt
+    s = re.sub(
+        r"(?i)^(?:Oran[ıi]\s+Tutar[ıi]\s+(?:Neden[ıi]\s+)?Tutar[ıi]\s+)+",
+        "",
+        s,
+    )
+    # Trailing qty crumbs: "… 1,0 Adet"
+    s = re.sub(r"(?i)\s+\d+(?:[.,]\d+)?\s*Adet\s*$", "", s).strip()
+    # Dedup consecutive repeated phrase: "HP KLİMA … HP KLİMA …"
+    s = re.sub(r"(.{10,}?)\s+\1\b", r"\1", s, count=1, flags=re.I).strip()
+    # Dedup exact word-halves
+    halves = s.split()
+    if len(halves) >= 6:
+        mid = len(halves) // 2
+        a, b = " ".join(halves[:mid]), " ".join(halves[mid:])
+        if a == b:
+            s = a
+    if len(s) < 3:
+        return None
+    return s[:240]
+
+
 def scrub_invoice_lines(inv: Invoice) -> None:
     """Drop payment/IBAN/bank/meta rows that should never be product lines."""
     if not inv.lines:
@@ -4726,18 +4845,38 @@ def scrub_invoice_lines(inv: Invoice) -> None:
         r"(?i)^(?:Ma[gğ]aza|Kasa(?:\s*No)?|Kasiyer|Sistem\s*No|Çekmece|Saat|Tarih|"
         r"Fatura\s*Tipi|Online\s*Sipari[sş]|Club\s*Kart)\s*:?\s*\S{0,20}$"
     )
-    inv.lines = [
-        ln
-        for ln in inv.lines
-        if ln.name
-        and not _is_bank_or_iban_line(ln.name)
-        and not meta_name.search(ln.name.strip())
-        and not re.search(
+    cleaned: list[Line] = []
+    for ln in inv.lines:
+        if not ln.name:
+            continue
+        name = scrub_line_name(ln.name)
+        if not name:
+            continue
+        if _is_bank_or_iban_line(name):
+            continue
+        if meta_name.search(name.strip()):
+            continue
+        if re.search(
             r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bİBAN\b|"
             r"Net\s*Mal\s*De[gğ]eri|Hesap\s*Ad|[ŞS]ube\s*(?:Kod|Ad)|Swift|\bBIC\b",
-            ln.name or "",
-        )
-    ]
+            name,
+        ):
+            continue
+        ln.name = name
+        cleaned.append(ln)
+    inv.lines = cleaned
+
+
+def sanitize_party_fields(inv: Invoice) -> None:
+    """Clean garbage emails / glued party names after OCR merge."""
+    if inv.supplier:
+        inv.supplier.email = sanitize_email(inv.supplier.email)
+        inv.supplier.name = sanitize_party_name(inv.supplier.name) or inv.supplier.name
+    if inv.customer:
+        inv.customer.email = sanitize_email(inv.customer.email)
+        cleaned = sanitize_party_name(inv.customer.name, customer=True)
+        if cleaned:
+            inv.customer.name = cleaned
 
 
 def _lines_useful(lines: list[Line] | list[dict] | None) -> bool:
@@ -4917,6 +5056,69 @@ def _sanitize_party_tax_id(party: Party, role: str) -> list[str]:
     return warnings
 
 
+def heal_invoice_totals(inv: Invoice, text: str = "") -> None:
+    """Fix OCR junk VAT/tevkifat that break matrah+KDV==dahil (Nurtekin-class)."""
+    t = inv.totals
+    le, vat, ti, pay, wh = (
+        t.lineExtensionAmount,
+        t.vatAmount,
+        t.taxInclusiveAmount,
+        t.payableAmount,
+        t.withholdingVatAmount,
+    )
+    # Prefer explicit "Beyan Edilecek KDV" from source text when present
+    if text:
+        beyan = labeled_amount(text, r"Beyan\s*Edilecek\s*KD[Vv]")
+        if beyan is not None and beyan > 0:
+            if vat is None or (
+                ti is not None
+                and le is not None
+                and abs((le + (vat or 0)) - ti) > 1.0
+                and abs((le + beyan) - ti) <= 1.0
+            ):
+                vat = beyan
+                t.vatAmount = beyan
+
+    # Matrah + dahil → implied KDV
+    if le is not None and ti is not None and ti >= le:
+        implied = round(ti - le, 2)
+        if implied > 0.5 and (
+            vat is None or abs((le + vat) - ti) > max(1.0, ti * 0.02)
+        ):
+            if pay is None or nearly_equal(pay, ti, 1.0):
+                t.vatAmount = implied
+                vat = implied
+
+    # Ödenecek ≈ vergiler dahil → drop bogus tevkifat (e.g. 46201 on 46224)
+    pay = t.payableAmount
+    ti = t.taxInclusiveAmount
+    wh = t.withholdingVatAmount
+    if (
+        wh is not None
+        and ti is not None
+        and pay is not None
+        and nearly_equal(pay, ti, 1.0)
+    ):
+        has_label = bool(
+            text
+            and re.search(r"(?i)KDV\s*Tevkifat|Hesaplanan\s+KDV\s*Tevkifat", text)
+        )
+        if not has_label or wh >= min(pay, ti) * 0.45:
+            t.withholdingVatAmount = None
+            wh = None
+
+    # Kuruş / 1 TL OCR drift: snap ödenecek → dahil when no tevkifat
+    pay = t.payableAmount
+    ti = t.taxInclusiveAmount
+    if (
+        pay is not None
+        and ti is not None
+        and t.withholdingVatAmount is None
+        and 0 < abs(pay - ti) <= 1.0
+    ):
+        t.payableAmount = ti
+
+
 def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
     warnings: list[str] = []
     checks: list[str] = []
@@ -4933,6 +5135,9 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
 
     # Safety net when binder/merge skipped parse_text_invoice rebalance
     rebalance_party_tax_ids(inv)
+    scrub_invoice_lines(inv)
+    sanitize_party_fields(inv)
+    heal_invoice_totals(inv)
     supplier_tax_warnings = _sanitize_party_tax_id(inv.supplier, "Satıcı")
     customer_tax_warnings = _sanitize_party_tax_id(inv.customer, "Alıcı")
     for w in supplier_tax_warnings + customer_tax_warnings:
