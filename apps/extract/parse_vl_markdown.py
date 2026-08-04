@@ -155,21 +155,25 @@ def _label_alt(labels: list[str]) -> str:
     return "(?:" + "|".join(labels) + ")"
 
 
-def _find_amounts_near_label(text: str, labels: list[str], window: int = 80) -> list[float]:
+def _money_tokens(chunk: str) -> list[float]:
     from main import parse_tr_money
 
+    out: list[float] = []
+    for tok in re.findall(
+        r"(?<![\d.,])(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d{4,})(?![\d])",
+        chunk,
+    ):
+        val = parse_tr_money(tok)
+        if val is not None and val >= 0:
+            out.append(val)
+    return out
+
+
+def _find_amounts_near_label(text: str, labels: list[str], window: int = 160) -> list[float]:
     alt = _label_alt(labels)
     amounts: list[float] = []
-    for m in re.finditer(rf"(?is){alt}\s*:?\s*([^\n]{{0,{window}}})", text):
-        chunk = m.group(1)
-        # Prefer last money-like token in the window
-        for tok in re.findall(
-            r"(?<![\d.,])(\d{1,3}(?:[.\s]\d{3})*[.,]\d{2}|\d+[.,]\d{2}|\d{4,})(?![\d])",
-            chunk,
-        ):
-            val = parse_tr_money(tok)
-            if val is not None and val >= 0:
-                amounts.append(val)
+    for m in re.finditer(rf"(?is){alt}[\s|:.-]*([^\n]{{0,{window}}})", text):
+        amounts.extend(_money_tokens(m.group(1)))
     return amounts
 
 
@@ -179,6 +183,66 @@ def _best_amount(text: str, labels: list[str]) -> float | None:
         return None
     # Prefer the largest plausible total for payable/genel toplam style labels
     return max(vals)
+
+
+def _parallel_totals_from_lines(text: str) -> dict[str, float]:
+    """Bind stacked label rows to amount lists (common VL table collapse).
+
+    Example:
+      Mal Hizmet … Ödenecek Tutar | 49.166,67 … 59.000,00 59.000,00
+    Maps left→right labels to amounts without supplier-specific rules.
+    """
+    # Ordered field keys; first match wins per position
+    specs: list[tuple[str, list[str]]] = [
+        ("lineExtensionAmount", [r"Mal\s*/?\s*Hizmet\s*Toplam(?:\s*Tutarı|\s*Tutari)?", r"Net\s*Toplam", r"Ara\s*Toplam"]),
+        ("discountTotal", [r"Toplam\s*[İI]skonto", r"[İI]skonto\s*Toplam"]),
+        ("lineExtensionAmount", [r"KDV\s*Matrah[ıih]?", r"Matrah"]),
+        ("vatAmount", [r"Hesaplanan\s*KDV(?:\s*\([^)]*\))?", r"Toplam\s*KDV", r"KDV\s*Tutarı", r"KDV\s*Tutari"]),
+        ("taxInclusiveAmount", [r"Vergiler\s*Dah[il]+\s*Toplam(?:\s*Tutar)?", r"Vergiler\s*Dahil"]),
+        ("payableAmount", [r"Ödenecek\s*Tutar", r"Odenecek\s*Tutar", r"Ödenecek", r"Odenecek", r"Genel\s*Toplam", r"FATURA\s*TUTARI", r"Fatura\s*Tutarı", r"Fatura\s*Tutari"]),
+    ]
+    found: dict[str, float] = {}
+    for ln in text.splitlines():
+        if not re.search(r"\d+[.,]\d{2}", ln):
+            continue
+        hits: list[tuple[int, str]] = []
+        for field, labs in specs:
+            for lab in labs:
+                for m in re.finditer(lab, ln, flags=re.I):
+                    hits.append((m.start(), field))
+        if len(hits) < 2:
+            continue
+        hits.sort(key=lambda x: x[0])
+        # Drop overlapping / duplicate positions (keep earliest unique field run)
+        ordered: list[str] = []
+        last_pos = -1
+        for pos, field in hits:
+            if pos < last_pos:
+                continue
+            # skip if same field consecutively (Matrah after Mal Hizmet both lineExt)
+            ordered.append(field)
+            last_pos = pos + 1
+        # Amounts usually after the last label / pipe
+        amt_region = ln
+        pipe = ln.rfind("|")
+        if pipe >= 0 and pipe > len(ln) * 0.2:
+            amt_region = ln[pipe + 1 :]
+        amounts = _money_tokens(amt_region)
+        if len(amounts) < 2:
+            continue
+        # Align from the right when counts differ (trailing ödenecek/vergi dahil)
+        if len(ordered) == len(amounts):
+            pairs = list(zip(ordered, amounts))
+        elif len(amounts) > len(ordered):
+            pairs = list(zip(ordered, amounts[-len(ordered) :]))
+        else:
+            pairs = list(zip(ordered[-len(amounts) :], amounts))
+        for field, val in pairs:
+            if field == "discountTotal" and val > 0 and 0.0 in amounts:
+                val = 0.0
+            # Prefer later (rightmost) binding for same field — ödenecek over matrah
+            found[field] = val
+    return found
 
 
 def _first_labeled_value(text: str, labels: list[str], value_re: str) -> str | None:
@@ -191,26 +255,49 @@ def _first_labeled_value(text: str, labels: list[str], value_re: str) -> str | N
 def _section_split(text: str) -> tuple[str, str, str]:
     """Rough sections: head (supplier), mid (customer after SAYIN), tail (totals)."""
     sayin = re.search(r"(?im)\bSAYIN\b", text)
+    head: str
+    rest: str
     if sayin:
         head = text[: sayin.start()]
         rest = text[sayin.start() :]
     else:
-        # Without SAYIN: first third supplier-ish, rest customer+totals
+        # Buyer-first retail layouts (no SAYIN): person/TCKN before supplier/VKN
+        tckn_m = re.search(r"(?im)\bTCKN\b|\b\d{11}\b", text)
+        vkn_m = re.search(r"(?im)\bVKN\b|\bVergi\s*No\b", text)
+        if tckn_m and vkn_m and tckn_m.start() < vkn_m.start():
+            pre = text[: vkn_m.start()]
+            lines = pre.splitlines()
+            cut_line = max(0, len(lines) - 6)
+            companyish = re.compile(
+                r"(?i)(?:LTD|A\.?\s*Ş|AŞ|SAN\.|T[İI]C\.|Ş[İI]RKET|İLET[İI]Ş[İI]M|ELEKT)"
+            )
+            for i, ln in enumerate(lines):
+                if companyish.search(ln):
+                    cut_line = i
+                    break
+            cut_pos = sum(len(x) + 1 for x in lines[:cut_line])
+            mid = text[:cut_pos]
+            head = text[cut_pos:]
+            totals_m = re.search(
+                r"(?im)(?:Mal\s*/?\s*Hizmet\s*Toplam|Net\s*Toplam|Ara\s*Toplam|"
+                r"Hesaplanan\s*KDV|Ödenecek|Odenecek|Genel\s*Toplam|Vergiler\s*Dah)",
+                text,
+            )
+            tail = text[totals_m.start() :] if totals_m else text[int(len(text) * 0.65) :]
+            return head, mid, tail
         cut = max(len(text) // 3, 1)
         head, rest = text[:cut], text[cut:]
 
     # Totals usually in last part after line table keywords
     totals_m = re.search(
         r"(?im)(?:Mal\s*/?\s*Hizmet\s*Toplam|Net\s*Toplam|Ara\s*Toplam|"
-        r"Hesaplanan\s*KDV|Ödenecek|Odenecek|Genel\s*Toplam|Vergiler\s*Dahil)",
+        r"Hesaplanan\s*KDV|Ödenecek|Odenecek|Genel\s*Toplam|Vergiler\s*Dah[il]*)",
         rest,
     )
     if totals_m:
         mid = rest[: totals_m.start()]
         tail = rest[totals_m.start() :]
     else:
-        mid = rest
-        # last 35% as totals fallback
         tcut = int(len(rest) * 0.65)
         mid, tail = rest[:tcut], rest[tcut:]
         if not tail.strip():
@@ -236,6 +323,8 @@ def _party_name_from_block(block: str) -> str | None:
             continue
         if "|" in s and not companyish.search(s):
             continue
+        if "|" in s:
+            continue
         if re.fullmatch(r"[\d\s./:+-]+", s):
             continue
         if re.search(r"https?://|@|\.com\b", s, re.I):
@@ -252,30 +341,52 @@ def _party_name_from_block(block: str) -> str | None:
     return candidates[0][:160]
 
 
+def _unglue_repeated_name(s: str) -> str:
+    """Collapse VL-glued duplicates: 'ALI VELIALI VELI' / 'ALİ VELİALİ VELİ'."""
+    words = s.split()
+    if len(words) >= 4 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if [w.casefold() for w in words[:half]] == [w.casefold() for w in words[half:]]:
+            return " ".join(words[:half])
+    compact = re.sub(r"\s+", "", s)
+    for i in range(len(compact) // 2, 4, -1):
+        if compact[:i].casefold() == compact[i : 2 * i].casefold():
+            seen = 0
+            for j, ch in enumerate(s):
+                if not ch.isspace():
+                    seen += 1
+                if seen >= i:
+                    return s[: j + 1].strip()
+    return s
+
+
 def _person_name_from_block(block: str) -> str | None:
     junk = re.compile(
         r"(?i)^(?:Tel|Fax|Web|E-?Posta|Vergi|VKN|TCKN|Adres|SAYIN|Kap[ıi]|"
         r"Mah\.|Cad\.|Sok\.|No:|Türkiye|Web\s*Sitesi|paragraph_title|"
         r"Ürün\s*Kodu|Miktar|Birim|KDV|table|text|image|ERP\s*Fatura|"
-        r"Nihai\s*T[uü]ketici|e-Belge)\b"
+        r"Nihai\s*T[uü]ketici|e-Belge|Özelleştirme|Ozellestirme|UBL|"
+        r"Fatura\s*Tipi|Fatura\s*No|Senaryo|İrsaliye|Irsaliye)\b"
     )
+    addr = re.compile(r"(?i)\b(?:Mah\.?|Mahallesi|Cad\.?|Sok\.?|Bulvar|No:|/\s*[A-ZÇĞİÖŞÜ])")
     for ln in block.splitlines()[:15]:
         s = re.sub(r"(?i)\b(?:paragraph_title|text|image|table)\b", " ", ln)
         s = re.sub(r"(?i)^SAYIN\s+", "", s)
         s = re.sub(r"\s+", " ", s).strip(" :|-")
+        if "|" in s:
+            continue
         if len(s) < 5 or junk.match(s):
             continue
         if re.search(r"\d{6,}", s):
             continue
         if re.search(r"(?i)LTD|A\.?\s*Ş|SAN\.|T[İI]C\.", s):
             continue
-        # VL often glues the name twice: "ALI VELIALI VELI"
+        # Cut address tail glued into the same cell
+        am = addr.search(s)
+        if am and am.start() >= 6:
+            s = s[: am.start()].strip(" -/")
+        s = _unglue_repeated_name(s)
         words = s.split()
-        if len(words) >= 4 and len(words) % 2 == 0:
-            half = len(words) // 2
-            if [w.casefold() for w in words[:half]] == [w.casefold() for w in words[half:]]:
-                s = " ".join(words[:half])
-                words = s.split()
         if 2 <= len(words) <= 6 and all(re.match(r"(?i)^[A-ZÇĞİÖŞÜa-zçğıöşü'.-]+$", w) for w in words):
             return s[:120]
         if 1 <= len(words) <= 4 and re.match(r"(?i)^[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü'. -]+$", s):
@@ -453,10 +564,22 @@ def parse_vl_markdown(text: str, file_name: str = ""):
         inv.uuid = ettn.lower()
 
     # --- Totals via synonyms ---
-    payable = _best_amount(totals_zone, PAYABLE_LABELS) or _best_amount(cleaned, PAYABLE_LABELS)
-    line_ext = _best_amount(totals_zone, LINE_EXT_LABELS) or _best_amount(cleaned, LINE_EXT_LABELS)
-    vat = _best_amount(totals_zone, VAT_LABELS) or _best_amount(cleaned, VAT_LABELS)
-    discount = _best_amount(totals_zone, DISCOUNT_LABELS)
+    parallel = _parallel_totals_from_lines(totals_zone) or _parallel_totals_from_lines(cleaned)
+    payable = parallel.get("payableAmount")
+    line_ext = parallel.get("lineExtensionAmount")
+    vat = parallel.get("vatAmount")
+    discount = parallel.get("discountTotal")
+    withhold = None
+    tax_incl = parallel.get("taxInclusiveAmount")
+
+    if payable is None:
+        payable = _best_amount(totals_zone, PAYABLE_LABELS) or _best_amount(cleaned, PAYABLE_LABELS)
+    if line_ext is None:
+        line_ext = _best_amount(totals_zone, LINE_EXT_LABELS) or _best_amount(cleaned, LINE_EXT_LABELS)
+    if vat is None:
+        vat = _best_amount(totals_zone, VAT_LABELS) or _best_amount(cleaned, VAT_LABELS)
+    if discount is None:
+        discount = _best_amount(totals_zone, DISCOUNT_LABELS)
     withhold = _best_amount(totals_zone, WITHHOLD_LABELS)
 
     if payable is not None:
@@ -471,10 +594,11 @@ def parse_vl_markdown(text: str, file_name: str = ""):
         inv.totals.withholdingVatAmount = withhold
 
     # "Vergiler Dahil" synonym often equals payable when no withhold
-    tax_incl = _best_amount(
-        totals_zone,
-        [r"Vergiler\s*Dahil\s*Toplam\s*Tutar", r"Vergiler\s*Dahil\s*Toplam"],
-    )
+    if tax_incl is None:
+        tax_incl = _best_amount(
+            totals_zone,
+            [r"Vergiler\s*Dah[il]+\s*Toplam\s*Tutar", r"Vergiler\s*Dah[il]+\s*Toplam", r"Vergiler\s*Dahil"],
+        )
     if tax_incl is not None:
         inv.totals.taxInclusiveAmount = tax_incl
         if inv.totals.payableAmount is None:
