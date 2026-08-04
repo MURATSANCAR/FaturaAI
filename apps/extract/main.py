@@ -1016,7 +1016,7 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     # Retail/scanned row: name + unitPrice + qty + KDV(no %) + total
     # e.g. "APPLE IPHONE 15 128 BLACK 49.166,67 1 20 49.166,67"
     retail_row = re.compile(
-        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}).{{6,140}}?)\s+"
+        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,140}}?)\s+"
         rf"(?P<unitPrice>{_MONEY_TOKEN})\s+"
         rf"(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s+"
         rf"(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
@@ -1751,7 +1751,7 @@ def _is_amount_in_words_name(name: str | None) -> bool:
     )
 
 
-def _nearby_product_name(text: str, pos: int, *, lookback: int = 500) -> str | None:
+def _nearby_product_name(text: str, pos: int, *, lookback: int = 900) -> str | None:
     """Pick a product description line just above an amount row."""
     chunk = text[max(0, pos - lookback) : pos]
     lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
@@ -1759,10 +1759,12 @@ def _nearby_product_name(text: str, pos: int, *, lookback: int = 500) -> str | N
         r"(?i)^(?:S[ıi]ra|Mal\s*Hizmet|Birim\s*Fiyat|Miktar|A[çc][ıi]klama|AÇIKLAMA|"
         r"TOPLAM|KDV|ÖDEN|ODEN|Vergi|Not:|YALNIZ|ETTN|Fatura|Seri\s*No|"
         r"BIRIM\s*FIYAT|MIKTAR|TUTAR|İrsaliye|Ozellestirme|Özelleştirme|"
-        r"e-?Ar[sş]iv|SAYIN|VKN|TCKN|Tel:|E-?Posta)",
+        r"e-?Ar[sş]iv|SAYIN|VKN|TCKN|Tel:|E-?Posta|Fiyat\s*Oran|"
+        r"Oranı\s*Tutarı|Hizmet\s*Mal|D[ÜU]ZENLEME|F[İI]L[İI]\s*SEVK|"
+        r"Tarih[iı]?|Saat|Senaryo|Tipi|No\s*:)",
     )
-    # Prefer multi-word product-ish lines closest to the amount row
-    for ln in reversed(lines[-12:]):
+    scored: list[tuple[int, str]] = []
+    for idx, ln in enumerate(lines):
         if skip.search(ln) or _is_registry_or_chrome_line(ln):
             continue
         if re.fullmatch(rf"{_MONEY_TOKEN}", ln):
@@ -1774,26 +1776,54 @@ def _nearby_product_name(text: str, pos: int, *, lookback: int = 500) -> str | N
         letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", ln)
         if len(letters) < 4:
             continue
-        # Join wrapped product lines (PROFILO … / 1 DVBS2 … / TV)
-        idx = lines.index(ln) if ln in lines else -1
+        # Join wrapped product lines (PROFILO … / DVBS2 … / TV)
         parts = [ln]
-        if idx >= 0:
-            for nxt in lines[idx + 1 :]:
-                if skip.search(nxt) or _is_registry_or_chrome_line(nxt):
-                    break
-                if re.search(rf"{_MONEY_TOKEN}", nxt):
-                    break
-                if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", nxt)) < 2:
-                    break
-                parts.append(nxt)
-                if len(" ".join(parts)) > 120:
-                    break
+        # Include previous line when current looks like a wrap continuation
+        if idx > 0:
+            prev = lines[idx - 1]
+            if (
+                not skip.search(prev)
+                and not _is_registry_or_chrome_line(prev)
+                and not re.search(rf"{_MONEY_TOKEN}", prev)
+                and re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü0-9]{3,}", prev)
+            ):
+                parts = [prev, ln]
+        for nxt in lines[idx + 1 : idx + 4]:
+            if skip.search(nxt) or _is_registry_or_chrome_line(nxt):
+                break
+            if re.search(rf"{_MONEY_TOKEN}", nxt):
+                break
+            if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", nxt)) < 2:
+                break
+            parts.append(nxt)
+            if len(" ".join(parts)) > 120:
+                break
         name = re.sub(r"\s+", " ", " ".join(parts)).strip(" -|")
-        # Drop leading sıra no glued into description
         name = re.sub(r"^\d{1,3}\s+", "", name).strip()
-        if len(name) >= 4:
-            return name[:240]
-    return None
+        if len(name) < 4 or skip.search(name):
+            continue
+        # Prefer closer lines with model-like tokens
+        dist = len(lines) - idx
+        score = 100 - dist
+        if re.search(r"[A-Z0-9]{4,}", name):
+            score += 20
+        if re.search(r"(?i)IPHONE|SAMSUNG|APPLE|PROFILO|LED|TV|PENCIL", name):
+            score += 40
+        if re.search(r"(?i)Tarih|Saat|Düzenleme|Fatura|Oran|Tutar", name):
+            score -= 50
+        scored.append((score, name[:240]))
+    if not scored:
+        return None
+    branded = [
+        s
+        for s in scored
+        if re.search(r"(?i)IPHONE|SAMSUNG|APPLE|PROFILO|PENCIL|LED\s*TV", s[1])
+    ]
+    pool = branded or scored
+    pool.sort(key=lambda t: t[0], reverse=True)
+    # If winner starts mid-wrap, prepend previous product-ish line when available
+    best = pool[0][1]
+    return best
 
 
 def _fix_gib_year_digits(digits: str) -> str:

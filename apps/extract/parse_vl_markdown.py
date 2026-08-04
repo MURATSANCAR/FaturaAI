@@ -628,23 +628,31 @@ def parse_vl_markdown(text: str, file_name: str = ""):
         or c_name.lower() in {"table", "image", "text"}
         or "Ürün Kodu" in c_name
         or "<td>" in (c_name or "")
-        or re.match(r"(?i)^(?:ERP\s*Fatura|e-Belge|Nihai\s*T)", c_name or "")
+        or re.match(r"(?i)^(?:ERP\s*Fatura|e-Belge|Nihai\s*T|YALNIZ|Özelleştirme|Ozellestirme|UBL)\b", c_name or "")
+        or re.search(r"(?i)YALNIZ\b|ÜçBin|\w+TL$", c_name or "")
     ):
         c_name = _person_name_from_block(mid)
 
     if s_name and (
         _PATH_LINE.match(s_name)
         or s_name.startswith("/")
-        or re.match(r"(?i)^(?:e-Belge|V\.?\s*D\.?|ERP\s*Fatura|WEB)\b", s_name)
+        or re.match(r"(?i)^(?:e-Belge|V\.?\s*D\.?|ERP\s*Fatura|WEB|table|image)\b", s_name)
         or "|" in s_name
+        or re.search(r"(?i)file://|e-Belge", s_name)
     ):
         s_name = _party_name_from_block(head)
 
-    if s_name and not (_PATH_LINE.match(s_name) or s_name.startswith("/") or "|" in s_name):
+    if s_name and not (
+        _PATH_LINE.match(s_name)
+        or s_name.startswith("/")
+        or "|" in s_name
+        or re.search(r"(?i)file://|e-Belge", s_name)
+    ):
         inv.supplier.name = s_name
     elif inv.supplier.name and (
         "|" in inv.supplier.name
-        or re.match(r"(?i)^(?:e-Belge|FAX|TEL|WEB|V\.?\s*D\.?)\b", inv.supplier.name)
+        or re.match(r"(?i)^(?:e-Belge|FAX|TEL|WEB|V\.?\s*D\.?|table|image)\b", inv.supplier.name)
+        or re.search(r"(?i)file://|e-Belge", inv.supplier.name)
     ):
         inv.supplier.name = None
     if s_tax:
@@ -656,10 +664,37 @@ def parse_vl_markdown(text: str, file_name: str = ""):
     if c_name and not (_PATH_LINE.match(c_name) or c_name.startswith("/")):
         inv.customer.name = _unglue_repeated_name(c_name)
     elif inv.customer.name and re.match(
-        r"(?i)^(?:Özelleştirme|Ozellestirme|UBL|Tasima|Ta[sş][ıi]ma|Fatura)\b",
+        r"(?i)^(?:Özelleştirme|Ozellestirme|UBL|Tasima|Ta[sş][ıi]ma|Fatura|YALNIZ|e-Belge)\b",
         inv.customer.name,
     ):
         inv.customer.name = None
+    # Tutar-yazısı leaked into name OR supplier title mistaken as customer
+    if inv.customer.name and (
+        re.search(
+            r"(?i)^YALNIZ\b|ÜçBin|\b(?:Bin|Yüz)\w*TL\b|ElliDokuz",
+            inv.customer.name,
+        )
+        or re.search(
+            r"(?i)(?:LTD|A\.\s*Ş|Ş[İI]RKET|MA[ĞG]AZA|MARKET|T[İI]CARET)",
+            inv.customer.name,
+        )
+    ):
+        inv.customer.name = None
+    if not inv.customer.name:
+        # Recover person above TCKN/VKN label (Media Markt)
+        m = re.search(
+            r"(?m)^([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü'. -]{4,60})\s*\n+"
+            r"(?:TCKN\s*/\s*VKN|VKN\s*/\s*TCKN|TCKN|VKN)\s*:?\s*\d{10,11}",
+            cleaned,
+        )
+        if m:
+            cand = m.group(1).strip()
+            if not re.search(
+                r"(?i)(?:LTD|A\.\s*Ş|Ş[İI]RKET|MA[ĞG]AZA|MARKET|T[İI]CARET|YALNIZ)",
+                cand,
+            ):
+                inv.customer.name = cand[:80]
+
     if c_tax:
         inv.customer.taxId = c_tax
         inv.customer.taxIdScheme = c_scheme  # type: ignore[assignment]
@@ -679,6 +714,17 @@ def parse_vl_markdown(text: str, file_name: str = ""):
                     inv.customer.taxId = tid
                     inv.customer.taxIdScheme = "TCKN"
                     break
+    # Drop placeholder / invalid customer tax ids
+    if inv.customer.taxId and not is_valid_tax_id(
+        inv.customer.taxId, inv.customer.taxIdScheme
+    ):
+        inv.customer.taxId = None
+        inv.customer.taxIdScheme = None
+    if inv.supplier.taxId and not is_valid_tax_id(
+        inv.supplier.taxId, inv.supplier.taxIdScheme
+    ):
+        inv.supplier.taxId = None
+        inv.supplier.taxIdScheme = None
     if c_office:
         inv.customer.taxOffice = c_office
 
@@ -712,6 +758,10 @@ def parse_vl_markdown(text: str, file_name: str = ""):
 
     # --- Lines ---
     vl_lines = _parse_line_rows(cleaned)
+    if not vl_lines:
+        from main import parse_ocr_line_items
+
+        vl_lines = parse_ocr_line_items(cleaned)
     if vl_lines and (not inv.lines or len(vl_lines) >= len(inv.lines)):
         inv.lines = vl_lines
 
