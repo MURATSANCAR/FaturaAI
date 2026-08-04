@@ -424,24 +424,27 @@ def _extract_tax_ids(block: str) -> tuple[str | None, str | None, str | None]:
 
 
 def _parse_line_rows(text: str) -> list:
-    from main import Line, parse_tr_money
+    from main import Line, parse_tr_money, _is_bank_or_iban_line
 
     lines: list = []
     # Pipe / HTML-flattened rows with qty + money
     for ln in text.splitlines():
         if not re.search(r"\d+[.,]\d{2}", ln):
             continue
+        if _is_bank_or_iban_line(ln):
+            continue
         if re.search(
             r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Odenecek|Hesaplanan\s*KDV|"
             r"Vergiler\s*Dahil|Genel\s*Toplam|Ara\s*Toplam|Net\s*Toplam|"
-            r"Birim\s*Fiyat|Miktar\s*\|\s*Birim",
+            r"Birim\s*Fiyat|Miktar\s*\|\s*Birim|Kredi\s*Kart|Banka\s*Kart",
             ln,
         ):
-            # skip header / totals rows
+            # skip header / totals / payment rows
             if re.search(r"(?i)^(?:Sıra|Mal\s*Hizmet|Ürün\s*Kodu|Açıklama)\b", ln):
                 continue
             if re.search(
-                r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s*KDV|Vergiler\s*Dahil|Genel\s*Toplam",
+                r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s*KDV|Vergiler\s*Dahil|"
+                r"Genel\s*Toplam|Kredi\s*Kart|Banka\s*Kart",
                 ln,
             ):
                 continue
@@ -465,7 +468,9 @@ def _parse_line_rows(text: str) -> list:
                 break
         if not name:
             continue
-        if re.search(r"(?i)^KDV\s*\(|Hesaplanan\s*KDV|İskonto|Iskonto|Toplam\b", name):
+        if _is_bank_or_iban_line(name):
+            continue
+        if re.search(r"(?i)^KDV\s*\(|Hesaplanan\s*KDV|İskonto|Iskonto|Toplam\b|Kredi\s*Kart", name):
             continue
         line_total = money_vals[-1]
         unit_price = money_vals[-2] if len(money_vals) >= 2 else None

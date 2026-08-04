@@ -58,6 +58,20 @@ function parseIssueDateTime(raw: string | null): { date: string | null; time: st
   return { date, time };
 }
 
+function isRegistryOrChromeLine(line: string): boolean {
+  return (
+    /e-?Belge\b/i.test(line) ||
+    /e-?Ar[sş]iv\s+Fatura/i.test(line) ||
+    /Özelleştirme\s*No|UBL\s*Versiyon|ERP\s*Fatura/i.test(line) ||
+    /file:\/\/|https?:\/\//i.test(line) ||
+    /Rar\$EX|AppData\\Local\\Temp/i.test(line) ||
+    /^(?:table|image|text|header|footer)$/i.test(line) ||
+    /^\d{1,2}:\d{2}\b/.test(line) ||
+    /^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(line) ||
+    /T[İI]CARET\s*S[İI]C[İI]L|MERS[İI]S\s*NO/i.test(line)
+  );
+}
+
 function extractSupplier(text: string): InvoiceParty {
   const party = emptyParty();
   const sayinIdx = text.search(/\bSAYIN\b/i);
@@ -68,18 +82,41 @@ function extractSupplier(text: string): InvoiceParty {
     .map((l) => l.replace(/^#+\s*/, "").trim())
     .filter(Boolean)
     .filter((l) => !/^e-?Ar[sş]iv\s+Fatura$/i.test(l))
-    .filter((l) => !/^Sayfa\s+\d+/i.test(l));
+    .filter((l) => !/^Sayfa\s+\d+/i.test(l))
+    .filter((l) => !isRegistryOrChromeLine(l));
 
-  if (
+  // Prefer a company-like line over the first (often chrome) line
+  const companyIdx = lines.findIndex(
+    (l) =>
+      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SANAY[İI]|SAN\.?\s*T[İI]C|T[İI]C(?:ARET)?\b|ANON[İI]M|MA[ĞG]AZA)/i.test(
+        l,
+      ) &&
+      !/^(?:Tel|Web|E-?Posta|Vergi|TCKN|VKN|Adres)/i.test(l) &&
+      !isRegistryOrChromeLine(l),
+  );
+
+  if (companyIdx >= 0) {
+    let name = lines[companyIdx];
+    const nxt = lines[companyIdx + 1];
+    if (
+      nxt &&
+      /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M|VE\s+SAN)/i.test(nxt) &&
+      !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE)/i.test(nxt) &&
+      (nxt.length < 40 || /^(VE\s+)?(?:SAN|T[İI]C|LTD|TA[ŞS])/i.test(nxt))
+    ) {
+      name = `${name} ${nxt}`;
+    }
+    party.name = name.slice(0, 180);
+  } else if (
     lines[0] &&
-    !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Kurumsal\s+Ofis)/i.test(lines[0])
+    !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|Kap[ıi]|Kurumsal\s+Ofis)/i.test(lines[0]) &&
+    !isRegistryOrChromeLine(lines[0])
   ) {
     let name = lines[0];
     if (
       lines[1] &&
       /(?:LTD|ŞT[İI]|A\.?\s*Ş\.?|SAN\.|T[İI]C\.|ANON[İI]M|VE\s+SAN)/i.test(lines[1]) &&
       !/^(Tel|Web|E-?Posta|Vergi|TCKN|VKN|ŞUBE|Kurumsal\s+Ofis)/i.test(lines[1]) &&
-      // continuation legal-form line, not a full second company
       (lines[1].length < 40 || /^(VE\s+)?(?:SAN|T[İI]C|LTD|TA[ŞS])/i.test(lines[1]))
     ) {
       name = `${lines[0]} ${lines[1]}`;
@@ -87,8 +124,13 @@ function extractSupplier(text: string): InvoiceParty {
     party.name = name.slice(0, 180);
   }
 
+  // Final purge for residual chrome
+  if (party.name && isRegistryOrChromeLine(party.name)) {
+    party.name = null;
+  }
+
   const addrParts: string[] = [];
-  for (const line of lines.slice(1)) {
+  for (const line of lines.slice(companyIdx >= 0 ? companyIdx + 1 : 1)) {
     if (/^(Tel|Web|E-Posta|Vergi|TCKN|VKN)\b/i.test(line)) break;
     if (
       /^Kurumsal\s+Ofis/i.test(line) ||

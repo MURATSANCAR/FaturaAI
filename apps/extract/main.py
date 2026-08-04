@@ -1197,6 +1197,8 @@ def parse_ocr_line_items(text: str) -> list[Line]:
             s,
         ):
             continue
+        if _is_bank_or_iban_line(s):
+            continue
         money_hits = list(re.finditer(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", s, re.I))
         if len(money_hits) < 1:
             continue
@@ -1890,10 +1892,11 @@ def _is_registry_or_chrome_line(ln: str) -> bool:
 
 
 def _is_bank_or_iban_line(ln: str) -> bool:
-    """Reject bank/IBAN rows mistaken for product line items."""
+    """Reject bank/IBAN/payment rows mistaken for product line items."""
     return bool(
         re.search(
             r"(?i)\bIBAN\b|\bTR\d{2}\s*\d{4}|\bHesap\s*No\b|\bBanka\s*Hesap|"
+            r"Kredi\s*Kart[ıi]?|Banka\s*Kart[ıi]?|Kart[ıi]/\s*Banka|"
             r"\b(?:Garanti|Albaraka|Yap[ıi]\s*Kredi|İş\s*Bank|Is\s*Bank|"
             r"Ziraat|Akbank|Vak[ıi]fbank|Vakifbank|Halkbank|Denizbank|"
             r"QNB|Finansbank|TEB|Şekerbank|Sekerbank)\b",
@@ -1932,7 +1935,7 @@ def _nearby_product_name(text: str, pos: int, *, lookback: int = 900) -> str | N
     )
     scored: list[tuple[int, str]] = []
     for idx, ln in enumerate(lines):
-        if skip.search(ln) or _is_registry_or_chrome_line(ln):
+        if skip.search(ln) or _is_registry_or_chrome_line(ln) or _is_bank_or_iban_line(ln):
             continue
         if re.fullmatch(rf"{_MONEY_TOKEN}", ln):
             continue
