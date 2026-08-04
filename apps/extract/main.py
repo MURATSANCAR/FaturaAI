@@ -19,6 +19,7 @@ from tax_id import (
     coerce_tax_id,
     digits_only,
     is_valid_tax_id,
+    is_valid_vkn,
     normalize_ocr_digits,
     repair_tax_id,
 )
@@ -2293,7 +2294,10 @@ def strong_photo_invoice(inv: Invoice, validation: Validation) -> bool:
         return False
     # Missing supplier VKN/TCKN → keep Docling/tesseract in play (Teknosa header OCR gaps)
     st = normalize_ocr_digits(inv.supplier.taxId) or digits_only(inv.supplier.taxId)
-    if not st or (len(st) == 10 and st.startswith("5")):
+    if not st:
+        return False
+    # Phone-looking 5… only blocks when checksum fails (valid 5020… VKNs are OK)
+    if len(st) == 10 and st.startswith("5") and not is_valid_vkn(st):
         return False
     # GİB serial year must look real after OCR repair
     ym = re.match(r"^[A-Z]{2,5}(\d{4})", inv.invoiceNumber)
@@ -2719,7 +2723,7 @@ def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
             s.taxIdScheme = None
             st = ""
             c.taxId, c.taxIdScheme = ct, "TCKN"
-        elif len(st) == 10 and st.startswith("5"):
+        elif len(st) == 10 and st.startswith("5") and not is_valid_vkn(st):
             # Likely phone fragment, not company VKN
             s.taxId = None
             s.taxIdScheme = None
@@ -2738,8 +2742,9 @@ def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
     st = normalize_ocr_digits(s.taxId) or digits_only(s.taxId)
     ct = normalize_ocr_digits(c.taxId) or digits_only(c.taxId)
 
-    # Supplier VKN missing → multi-layer header recovery (Teknosa / retail)
-    if text and (not st or (len(st) == 10 and st.startswith("5"))):
+    # Supplier VKN missing / phone-like → multi-layer header recovery
+    phoneish = bool(st and len(st) == 10 and st.startswith("5") and not is_valid_vkn(st))
+    if text and (not st or phoneish):
         recovered = (
             find_role_tax_id(text, "supplier")
             or recover_supplier_vkn_from_header(text)
@@ -2788,17 +2793,28 @@ def find_tax_id_in_region(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _ok_supplier_vkn(raw: str | None) -> tuple[str, str] | None:
-    """Accept clean company VKN; reject phones (5…) and placeholders."""
-    from tax_id import is_placeholder_tax_id
+def _ok_supplier_vkn(raw: str | None, *, labeled: bool = False) -> tuple[str, str] | None:
+    """Accept company VKN; phone-risk only for unlabeled invalid 5-start ids.
 
-    got = coerce_tax_id(raw)
-    if not got or got[1] != "VKN":
+    Checksum-valid VKNs are kept even when they start with 5 (e.g. 5020056347).
+    Unlabeled 5-start without a valid GİB checksum is treated as a phone fragment.
+    Single-digit OCR repair is only applied for labeled Vergi No/VKN candidates.
+    """
+    from tax_id import is_placeholder_tax_id, is_valid_vkn, repair_tax_id
+
+    n = normalize_ocr_digits(raw) or digits_only(raw)
+    if len(n) != 10 or is_placeholder_tax_id(n):
         return None
-    n = got[0]
-    if n.startswith("5") or is_placeholder_tax_id(n):
+    if is_valid_vkn(n):
+        return n, "VKN"
+    if labeled:
+        repaired = repair_tax_id(n, "VKN")
+        if repaired:
+            return repaired
+    # Checksum failed: unlabeled 5… → phone risk (do not OCR-repair into another VKN)
+    if n.startswith("5"):
         return None
-    return got
+    return None
 
 
 def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
@@ -2815,13 +2831,13 @@ def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
     if not head.strip():
         head = text[:1600]
 
-    # 1) Explicit tax labels
+    # 1) Explicit tax labels (Vergi No / VKN / VIN) — prefer these; 5-start OK if checksum valid
     for pat in (
         rf"(?i){_TAX_LABEL}\s*:?[.\s]*([{_TAX_OCR}]{{10}})\b",
         rf"(?i){_TAX_LABEL}\s*:?[.\s]*((?:[{_TAX_OCR}]{{3}}\s+){{2}}[{_TAX_OCR}]{{4}})\b",
     ):
         for m in re.finditer(pat, head):
-            got = _ok_supplier_vkn(m.group(1))
+            got = _ok_supplier_vkn(m.group(1), labeled=True)
             if got:
                 return got
 
@@ -2836,13 +2852,13 @@ def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
         rf"(?i)\bVD\s*[.:]?\s*([{_TAX_OCR}]{{10}})\b",
     ):
         for m in re.finditer(pat, head):
-            got = _ok_supplier_vkn(m.group(1))
+            got = _ok_supplier_vkn(m.group(1), labeled=True)
             if got:
                 return got
 
     # 3) Spaced classic form anywhere in head
     for m in re.finditer(r"(?<!\d)((?:\d{3}\s+){2}\d{4})(?!\d)", head):
-        got = _ok_supplier_vkn(m.group(1))
+        got = _ok_supplier_vkn(m.group(1), labeled=False)
         if got:
             return got
 
@@ -2852,14 +2868,14 @@ def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
         rf"[^\n]{{0,40}}?([{_TAX_OCR}]{{10}})\b",
         head,
     ):
-        got = _ok_supplier_vkn(m.group(1))
+        got = _ok_supplier_vkn(m.group(1), labeled=False)
         if got:
             return got
     for m in re.finditer(
         rf"(?i)([{_TAX_OCR}]{{10}})\s*(?:A\.?\s*[SŞ]\.?|LTD|V\.?\s*D\.?)\b",
         head,
     ):
-        got = _ok_supplier_vkn(m.group(1))
+        got = _ok_supplier_vkn(m.group(1), labeled=False)
         if got:
             return got
 
@@ -2871,7 +2887,8 @@ def recover_supplier_vkn_from_header(text: str) -> tuple[str, str] | None:
         prefix = window[max(0, start - 24) : start]
         if re.search(r"(?i)(?:Tel|Telefon|Fax|TCKN|M[üu][şs]teri)\s*:?\s*$", prefix):
             continue
-        got = _ok_supplier_vkn(m.group(1))
+        labeled = bool(re.search(r"(?i)(?:VKN|Vergi\s*No|V\.?\s*N\.?)\s*:?\s*$", prefix))
+        got = _ok_supplier_vkn(m.group(1), labeled=labeled)
         if got:
             return got
 
@@ -4183,12 +4200,12 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         r"(?:^|\n)\s*(?!Tel|Fax|TCKN|Telefon)[A-ZÇĞİÖŞÜa-zçğıöşü]{3,}"
         r"(?:\s*/\s*|\s+)(\d{10})\b",
     )
-    # Reject phone-looking 10-digit (starts with 5) as supplier VKN
+    # Reject phone-looking 10-digit (starts with 5) unless GİB checksum validates
     def _ok_vkn(v: str | None) -> str | None:
         if not v or len(v) != 10:
             return None
         if v.startswith("5"):
-            return None
+            return v if is_valid_vkn(v) else None
         return v
 
     supplier_vkn = _ok_vkn(spaced_vkn) or _ok_vkn(vd_vkn) or _ok_vkn(district_vkn)
@@ -4202,8 +4219,12 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
     elif not supplier.taxId and supplier_vkn:
         supplier.taxId = supplier_vkn
         supplier.taxIdScheme = "VKN"
-    # Spaced VKN in supplier head: "836 014 4393"
-    if not supplier.taxId or (supplier.taxId and supplier.taxId.startswith("5")):
+    # Spaced VKN in supplier head: "836 014 4393" (or labeled 5-start valid VKN)
+    st_now = normalize_ocr_digits(supplier.taxId) or digits_only(supplier.taxId)
+    need_recover = not st_now or (
+        len(st_now) == 10 and st_now.startswith("5") and not is_valid_vkn(st_now)
+    )
+    if need_recover:
         recovered = recover_supplier_vkn_from_header(text)
         if recovered and recovered[1] == "VKN":
             supplier.taxId, supplier.taxIdScheme = recovered
@@ -4214,7 +4235,7 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
             )
             if head_vkn:
                 hv = re.sub(r"\s+", "", head_vkn)
-                if len(hv) == 10 and not hv.startswith("5"):
+                if _ok_vkn(hv):
                     supplier.taxId = hv
                     supplier.taxIdScheme = "VKN"
 
