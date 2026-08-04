@@ -2915,9 +2915,9 @@ def extract_supplier(text: str) -> Party:
         and not re.search(r"<!--\s*image", ln.strip(), re.I)
         and not _is_registry_or_chrome_line(ln.strip())
     ]
-    # Explicit Satıcı: / Satıcı Ünvanı: label (GİB / ERP / HF synth layouts)
+    # Explicit Satıcı Ünvanı: / Satıcı:  (require colon to avoid swallowing label)
     sat_m = re.search(
-        r"Sat[ıi]c[ıi]\s*(?:Ünvan[ıi]?|Unvan|Ad[ıi])?\s*:?\s*"
+        r"Sat[ıi]c[ıi]\s*(?:[ÜU]nvan[ıiI]?|Unvan|Ad[ıi])?\s*:\s*"
         r"([A-ZÇĞİÖŞÜa-zçğıöşü0-9].{2,120})",
         head,
         re.I,
@@ -2926,13 +2926,16 @@ def extract_supplier(text: str) -> Party:
         cand = re.split(r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi|VKN|TCKN", sat_m.group(1), maxsplit=1)[
             0
         ].strip(" :.-[]{}")
-        cand = re.sub(r"^(?:şube|sube|Ünvan[ıi]?|Unvan|Ad[ıi])\]?\s*:?\s*", "", cand, flags=re.I).strip(
-            " :.-[]{}"
-        )
+        cand = re.sub(
+            r"^(?:şube|sube|[ÜU]nvan[ıiI]?|Unvan|Ad[ıi]|Bilgileri)\s*:?\s*",
+            "",
+            cand,
+            flags=re.I,
+        ).strip(" :.-[]{}")
         if (
             len(cand) >= 4
             and not _is_registry_or_chrome_line(cand)
-            and not re.match(r"^(?:Bilgileri|Ünvan|Unvan)\b", cand, re.I)
+            and not re.match(r"^(?:Bilgileri|[ÜU]nvan)\b", cand, re.I)
         ):
             party.name = cand[:180]
     # Prefer a line that looks like a company title (legal form / retail trade words)
@@ -3004,11 +3007,12 @@ def extract_supplier(text: str) -> Party:
     if party.name:
         party.name = re.sub(r"^#+\s*", "", party.name).strip()
         party.name = re.sub(
-            r"^(?:Sat[ıi]c[ıi]\s*(?:\([^)]*\)|\{[^}]*\}|\[[^\]]*\])?\s*:?\s*)",
+            r"^(?:Sat[ıi]c[ıi]\s*(?:\([^)]*\)|\{[^}]*\}|\[[^\]]*\]|[ÜU]nvan[ıiI]?|Unvan|Ad[ıi])?\s*:?\s*)",
             "",
             party.name,
             flags=re.I,
         )
+        party.name = re.sub(r"^(?:[ÜU]nvan[ıiI]?|Unvan)\s*:?\s*", "", party.name, flags=re.I)
         # Docling / markdown headings
         party.name = re.sub(r"^#+\s*", "", party.name).strip()
         party.name = re.sub(r"\bHAGAZACILIK\b", "MAGAZACILIK", party.name, flags=re.I)
@@ -3052,9 +3056,32 @@ def extract_supplier(text: str) -> Party:
         party.taxOffice = re.split(r"\s{2,}|Vergi\s*num", party.taxOffice, maxsplit=1)[0].strip()
     # Prefer role-labeled Satıcı VKN, then head-only (never SAYIN block)
     if not party.taxId:
-        role_tid = find_role_tax_id(text, "supplier") or find_tax_id_in_region(head)
-        if role_tid:
-            party.taxId, party.taxIdScheme = role_tid
+        role_tid = find_role_tax_id(text, "supplier")
+        head_tid = find_tax_id_in_region(head)
+        # Company suppliers: prefer 10-digit VKN over a TCKN that leaked into head
+        companyish = bool(
+            party.name
+            and re.search(r"(?:A\.?\s*[SŞ]\.?|LTD|ŞT[İI]|T[İI]C(?:ARET)?)", party.name, re.I)
+        )
+        chosen = role_tid or head_tid
+        if companyish and chosen and chosen[1] == "TCKN":
+            vkn_only = None
+            for cand in (role_tid, head_tid):
+                if cand and cand[1] == "VKN":
+                    vkn_only = cand
+                    break
+            if not vkn_only:
+                # re-scan head for VKN-sized ids only
+                m = re.search(
+                    rf"(?i)(?:VKN|Vergi\s*No|V\.?\s*N\.?|Vergi\s*Dairesi\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{{0,40}})"
+                    rf"\s*:?[.\s]*([{_TAX_OCR}]{{10}})\b",
+                    head,
+                )
+                if m:
+                    vkn_only = coerce_tax_id(m.group(1))
+            chosen = vkn_only or (None if companyish else chosen)
+        if chosen:
+            party.taxId, party.taxIdScheme = chosen
     party.email = first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
     party.website = first_match(head, r"Web\s*Sitesi\s*:?\s*([^\s]+)")
     phone_raw = first_match(head, r"(?:Tel|Telefon)\s*:?\s*([0-9\s()\-]{10,})")
@@ -3124,20 +3151,29 @@ def extract_customer(text: str) -> Party:
             party.phone = phone
         return party
 
-    # Explicit Alıcı: (ERP / e-Fatura)
+    # Explicit Alıcı Ünvanı: / Alıcı: (ERP / e-Fatura) — require colon
     alici = re.search(
-        r"Al[ıi]c[ıi]\s*[^:\nA-ZÇĞİÖŞÜ]{0,20}:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü].{2,80})",
+        r"Al[ıi]c[ıi]\s*(?:[ÜU]nvan[ıiI]?|Unvan|Ad[ıi])?\s*:\s*"
+        r"([A-ZÇĞİÖŞÜa-zçğıöşü].{2,80})",
         text,
         re.I,
     )
     if alici:
         cand = re.split(
-            r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi|Özelleştirme|Senaryo|Fatura",
+            r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi|VKN|TCKN|Özelleştirme|Senaryo|Fatura",
             alici.group(1),
             maxsplit=1,
         )[0].strip(" :.-[]{}")
-        cand = re.sub(r"^(?:şube|sube)\)?\s*:?\s*", "", cand, flags=re.I).strip(" :.-[]{}()")
-        if len(cand) >= 3 and not re.search(r"Nihai|T[uü]ketici", cand, re.I):
+        cand = re.sub(
+            r"^(?:şube|sube|[ÜU]nvan[ıiI]?|Unvan|Ad[ıi]|Bilgileri)\)?\s*:?\s*",
+            "",
+            cand,
+            flags=re.I,
+        ).strip(" :.-[]{}()")
+        if (
+            len(cand) >= 3
+            and not re.search(r"Nihai|T[uü]ketici|Bilgileri", cand, re.I)
+        ):
             party.name = cand[:120]
 
     sayin = re.search(r"\bSAYIN\b", text, re.I)
@@ -3147,11 +3183,11 @@ def extract_customer(text: str) -> Party:
         if role_tid:
             party.taxId, party.taxIdScheme = role_tid
         alici_sec = re.search(
-            r"(?is)Al[ıi]c[ıi]\s*(?:Ünvan[ıi]?|Unvan)\s*:?\s*"
+            r"(?is)Al[ıi]c[ıi]\s*(?:[ÜU]nvan[ıiI]?|Unvan)\s*:\s*"
             r"([A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&'\-]{3,90})",
             text,
         )
-        if alici_sec and not party.name:
+        if alici_sec:
             cand = alici_sec.group(1).strip(" :.-")
             cand = re.split(r"\s{2,}|VKN|TCKN|Adres|Vergi", cand, maxsplit=1)[0].strip()
             if len(cand) >= 3 and not re.match(r"^(?:Bilgileri)\b", cand, re.I):
