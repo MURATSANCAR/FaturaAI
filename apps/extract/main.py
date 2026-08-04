@@ -981,104 +981,243 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     if out:
         return out
 
-    # Glued classic GİB amount row (Yılmaz-style):
-    # "1,0Adet14.583,33TL %20,002.916,67TL14.583,33TL"
-    glued_gib = re.compile(
-        rf"(?P<qty>\d{{1,3}}(?:[.,]\d+)?)\s*(?P<unit>Adet|adet|AD|kg|NIU|C62)?\s*"
-        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL\s*"
-        rf"%\s*(?P<vat>\d{{1,2}})(?:[.,]\d{{2}})?"
-        rf"(?P<vatAmt>{_MONEY_TOKEN})\s*TL\s*"
-        rf"(?P<total>{_MONEY_TOKEN})\s*TL?",
-        re.I,
+    # ------------------------------------------------------------------
+    # Wide generic row patterns (layout-tolerant OCR fallback ladder)
+    # 1 Klasik GİB  2 Retail/telefon  3 Miktar önce
+    # 4 Miktarsız+%KDV  5 İsim+tutar  6 Serbest güvenlik ağı
+    # ------------------------------------------------------------------
+    _wide_skip_name = re.compile(
+        r"(?i)^(?:S[ıi]ra|Mal\s*Hizmet|Birim\s*Fiyat|Miktar|A[çc][ıi]klama|AÇIKLAMA|"
+        r"TOPLAM|KDV|ÖDEN|ODEN|Vergi|Not:|YALNIZ|ETTN|Fatura|Seri\s*No|"
+        r"BIRIM\s*FIYAT|MIKTAR|TUTAR|İrsaliye|Ozellestirme|Özelleştirme|"
+        r"e-?Ar[sş]iv|SAYIN|VKN|TCKN|Tel:|E-?Posta|Fiyat\s*Oran|"
+        r"Oranı\s*Tutarı|Hizmet\s*Mal|D[ÜU]ZENLEME|F[İI]L[İI]\s*SEVK|"
+        r"Tarih[iı]?|Saat|Senaryo|Tipi|No\s*:|Kredi\s*Kart|Banka\s*Kart|"
+        r"Ara\s*Toplam|Genel\s*Toplam|Toplam\s*[İI]skonto|Matrah)",
     )
-    for i, m in enumerate(glued_gib.finditer(text), start=1):
-        total = parse_tr_money(m.group("total"))
+
+    def _wide_append(
+        *,
+        name: str,
+        qty: float | None,
+        unit_price: float | None,
+        vat_rate: float | None,
+        vat_amt: float | None,
+        total: float | None,
+        unit: str = "Adet",
+    ) -> None:
         if total is None or total < 1:
-            continue
-        # Prefer a product-ish name from nearby lines (skip headers/totals)
-        name = _nearby_product_name(text, m.start()) or f"Kalem {i}"
+            return
+        nm = re.sub(r"\s+", " ", (name or "")).strip(" -|")
+        nm = re.sub(r"^\d{1,3}\s+", "", nm).strip()
+        if not nm or len(nm) < 2:
+            nm = f"Kalem {len(out) + 1}"
+        if _wide_skip_name.search(nm) or _is_registry_or_chrome_line(nm):
+            return
+        if _is_amount_in_words_name(nm):
+            return
+        if re.search(r"(?i)Toplam|Iskonto|[İI]skonto|Ödenecek|Matrah|Kredi\s*Kart", nm):
+            return
         out.append(
             Line(
-                id=str(i),
-                name=name[:240],
-                quantity=parse_tr_money(m.group("qty"))
-                or float(m.group("qty").replace(",", ".")),
-                unit=(m.group("unit") or "Adet"),
-                unitPrice=parse_tr_money(m.group("unitPrice")),
-                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
-                vatAmount=parse_tr_money(m.group("vatAmt")),
+                id=str(len(out) + 1),
+                name=nm[:240],
+                quantity=qty if qty and qty > 0 else 1.0,
+                unit=unit or "Adet",
+                unitPrice=unit_price,
+                vatRate=vat_rate,
+                vatAmount=vat_amt,
                 lineTotal=total,
             )
+        )
+
+    # Pattern 1 — Klasik GİB (spaced or glued):
+    # "1 DESC 1 Adet 14.583,33TL %20 2.916,67TL 14.583,33TL"
+    # "1,0Adet14.583,33TL %20,002.916,67TL14.583,33TL"
+    p1 = re.compile(
+        rf"(?m)^(?:(?P<seq>\d{{1,3}})\s+)?"
+        rf"(?P<name>.{{0,160}}?)\s*"
+        rf"(?P<qty>\d{{1,3}}(?:[.,]\d+)?)\s*(?P<unit>Adet|adet|AD|kg|NIU|C62)?\s*"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL?\s*"
+        rf"%\s*(?P<vat>\d{{1,2}})(?:[.,]\d{{2}})?"
+        rf"\s*(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s*"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL?\s*$",
+        re.I,
+    )
+    for m in p1.finditer(text):
+        name = (m.group("name") or "").strip()
+        if not name or _wide_skip_name.search(name):
+            name = _nearby_product_name(text, m.start()) or name
+        _wide_append(
+            name=name,
+            qty=parse_tr_money(m.group("qty"))
+            or float(m.group("qty").replace(",", ".")),
+            unit_price=parse_tr_money(m.group("unitPrice")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=parse_tr_money(m.group("vatAmt")),
+            total=parse_tr_money(m.group("total")),
+            unit=(m.group("unit") or "Adet"),
         )
     if out:
         return out
 
-    # Retail/scanned row: name + unitPrice + qty + KDV(no %) + total
-    # e.g. "APPLE IPHONE 15 128 BLACK 49.166,67 1 20 49.166,67"
-    retail_row = re.compile(
+    # Pattern 2 — Retail / telefon: name + unitPrice + qty + KDV(no %) + total
+    # "APPLE IPHONE 15 128 BLACK 49.166,67 1 20 49.166,67"
+    p2 = re.compile(
         rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,140}}?)\s+"
         rf"(?P<unitPrice>{_MONEY_TOKEN})\s+"
         rf"(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s+"
         rf"(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
         rf"(?P<total>{_MONEY_TOKEN})\s*$"
     )
-    skip_retail = re.compile(
-        r"(?i)^(?:S[ıi]ra|Mal\s*Hizmet|Birim\s*Fiyat|Miktar|A[çc][ıi]klama|"
-        r"TOPLAM|KDV|ÖDEN|ODEN|Vergi|Not:|YALNIZ|ETTN|Fatura)",
-    )
-    for i, m in enumerate(retail_row.finditer(text), start=1):
-        name = re.sub(r"\s+", " ", m.group("name")).strip(" -|")
-        if skip_retail.search(name) or _is_registry_or_chrome_line(name):
-            continue
-        if re.search(r"(?i)Toplam|Iskonto|[İI]skonto|Ödenecek|Matrah", name):
-            continue
-        total = parse_tr_money(m.group("total"))
-        if total is None or total < 1:
-            continue
-        out.append(
-            Line(
-                id=str(i),
-                name=name[:240],
-                quantity=parse_tr_money(m.group("qty"))
-                or float(m.group("qty").replace(",", ".")),
-                unit="Adet",
-                unitPrice=parse_tr_money(m.group("unitPrice")),
-                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
-                lineTotal=total,
-            )
+    for m in p2.finditer(text):
+        _wide_append(
+            name=m.group("name"),
+            qty=parse_tr_money(m.group("qty"))
+            or float(m.group("qty").replace(",", ".")),
+            unit_price=parse_tr_money(m.group("unitPrice")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=None,
+            total=parse_tr_money(m.group("total")),
         )
     if out:
         return out
 
-    # Amounts-only row with product name on previous lines (Gürkan-style):
-    # "BIRIM FIYAT MIKTAR KDV TUTAR" / "49.166,67 1 20 49.166,67"
-    amounts_only = re.compile(
+    # Pattern 2b — amounts-only row; name from previous lines (Gürkan)
+    p2b = re.compile(
         rf"(?m)^(?P<unitPrice>{_MONEY_TOKEN})\s+"
         rf"(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s+"
         rf"(?P<vat>\d{{1,2}})\s+"
         rf"(?P<total>{_MONEY_TOKEN})\s*$"
     )
-    for i, m in enumerate(amounts_only.finditer(text), start=1):
-        total = parse_tr_money(m.group("total"))
-        unit_price = parse_tr_money(m.group("unitPrice"))
-        if total is None or total < 1 or unit_price is None:
-            continue
-        # Same unit+total often means net (ex-VAT) line extension
-        name = _nearby_product_name(text, m.start()) or f"Kalem {i}"
-        if skip_retail.search(name):
-            continue
-        out.append(
-            Line(
-                id=str(i),
-                name=name[:240],
-                quantity=parse_tr_money(m.group("qty"))
-                or float(m.group("qty").replace(",", ".")),
-                unit="Adet",
-                unitPrice=unit_price,
-                vatRate=normalize_vat_rate(parse_percent(m.group("vat"))),
-                lineTotal=total,
-            )
+    for m in p2b.finditer(text):
+        _wide_append(
+            name=_nearby_product_name(text, m.start()) or "",
+            qty=parse_tr_money(m.group("qty"))
+            or float(m.group("qty").replace(",", ".")),
+            unit_price=parse_tr_money(m.group("unitPrice")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=None,
+            total=parse_tr_money(m.group("total")),
         )
+    if out:
+        return out
+
+    # Pattern 3 — Miktar önce: qty unit unitPrice … %vat … total
+    p3 = re.compile(
+        rf"(?m)^(?P<qty>\d{{1,4}}(?:[.,]\d+)?)\s*"
+        rf"(?P<unit>Adet|adet|AD|kg|NIU|C62)\s+"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL?\s+"
+        rf"(?:.{{0,40}}?)?"
+        rf"%\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+        rf"(?:(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s+)?"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL?\s*$",
+        re.I,
+    )
+    for m in p3.finditer(text):
+        _wide_append(
+            name=_nearby_product_name(text, m.start()) or "",
+            qty=parse_tr_money(m.group("qty"))
+            or float(m.group("qty").replace(",", ".")),
+            unit_price=parse_tr_money(m.group("unitPrice")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=parse_tr_money(m.group("vatAmt")) if m.group("vatAmt") else None,
+            total=parse_tr_money(m.group("total")),
+            unit=m.group("unit") or "Adet",
+        )
+    if out:
+        return out
+
+    # Pattern 4 — Miktarsız + %KDV: name + money + %vat + money
+    p4 = re.compile(
+        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,160}}?)\s+"
+        rf"(?P<unitPrice>{_MONEY_TOKEN})\s*TL?\s+"
+        rf"%\s*(?P<vat>\d{{1,2}}(?:[.,]\d+)?)\s+"
+        rf"(?:(?P<vatAmt>{_MONEY_TOKEN})\s*TL?\s+)?"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL?\s*$",
+        re.I,
+    )
+    for m in p4.finditer(text):
+        _wide_append(
+            name=m.group("name"),
+            qty=1.0,
+            unit_price=parse_tr_money(m.group("unitPrice")),
+            vat_rate=normalize_vat_rate(parse_percent(m.group("vat"))),
+            vat_amt=parse_tr_money(m.group("vatAmt")) if m.group("vatAmt") else None,
+            total=parse_tr_money(m.group("total")),
+        )
+    if out:
+        return out
+
+    # Pattern 5 — Sadece isim + tutar (tek tutarlı satır)
+    p5 = re.compile(
+        rf"(?m)^(?P<name>(?=.*[A-Za-zÇĞİÖŞÜçğıöşü]{{3,}}).{{6,160}}?)\s+"
+        rf"(?P<total>{_MONEY_TOKEN})\s*TL?\s*$",
+        re.I,
+    )
+    for m in p5.finditer(text):
+        name = m.group("name")
+        if re.search(r"(?i)%\d|\bKDV\b|\bAdet\b", name):
+            continue
+        total = parse_tr_money(m.group("total"))
+        if total is None or total < 5:
+            continue
+        _wide_append(
+            name=name,
+            qty=1.0,
+            unit_price=total,
+            vat_rate=None,
+            vat_amt=None,
+            total=total,
+        )
+    if out:
+        return out
+
+    # Pattern 6 — Serbest güvenlik ağı: satırda ≥2 money token, isim solda
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or len(s) < 8:
+            continue
+        if _wide_skip_name.search(s) or re.search(
+            r"(?i)Mal\s*Hizmet\s*Toplam|Ödenecek|Hesaplanan\s*KDV|Vergiler\s*Dahil",
+            s,
+        ):
+            continue
+        money_hits = list(re.finditer(rf"({_MONEY_TOKEN})\s*(?:TL|TRY)?", s, re.I))
+        if len(money_hits) < 1:
+            continue
+        total = parse_tr_money(money_hits[-1].group(1))
+        if total is None or total < 5:
+            continue
+        name = s[: money_hits[0].start()].strip(" -|")
+        name = re.sub(r"\s+", " ", name)
+        if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", name)) < 4:
+            # Try previous-line name when this line is mostly numbers
+            continue
+        unit_price = (
+            parse_tr_money(money_hits[0].group(1)) if len(money_hits) >= 2 else total
+        )
+        vat_rate = None
+        vat_m = re.search(r"%\s*(\d{1,2}(?:[.,]\d+)?)", s)
+        if vat_m:
+            vat_rate = normalize_vat_rate(parse_percent(vat_m.group(1)))
+        qty = 1.0
+        qty_m = re.search(r"(\d+[.,]\d+|\d+)\s*(?:Adet|adet|kg)\b", s, re.I)
+        if qty_m:
+            qty = parse_tr_money(qty_m.group(1)) or float(
+                qty_m.group(1).replace(",", ".")
+            )
+        before = len(out)
+        _wide_append(
+            name=name,
+            qty=qty,
+            unit_price=unit_price,
+            vat_rate=vat_rate,
+            vat_amt=None,
+            total=total,
+        )
+        if len(out) > before and len(out) >= 12:
+            break
     if out:
         return out
 
