@@ -3309,6 +3309,14 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         or sum_labeled_amounts(text, r"Kdv Matrah\w*")
     )
     ocr_lines = parse_ocr_line_items(text)
+    if ocr_lines:
+        ocr_lines = [
+            ln
+            for ln in ocr_lines
+            if ln.name
+            and not _is_bank_or_iban_line(ln.name)
+            and not re.search(r"(?i)Kredi\s*Kart|Banka\s*Kart|\bIBAN\b|\bTR\d{2}", ln.name or "")
+        ]
     if not ocr_lines:
         ocr_lines = parse_retail_pos_lines(text)
     # Docling / GİB HTML→markdown pipe tables (generic; not OCR regex lines)

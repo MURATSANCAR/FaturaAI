@@ -769,6 +769,16 @@ def parse_vl_markdown(text: str, file_name: str = ""):
         vl_lines = parse_ocr_line_items(cleaned)
     if vl_lines and (not inv.lines or len(vl_lines) >= len(inv.lines)):
         inv.lines = vl_lines
+    # Drop payment/IBAN/bank rows that slipped through as product lines
+    if inv.lines:
+        from main import _is_bank_or_iban_line
+        inv.lines = [
+            ln
+            for ln in inv.lines
+            if ln.name
+            and not _is_bank_or_iban_line(ln.name)
+            and not re.search(r"(?i)Kredi\s*Kart|Banka\s*Kart|IBAN|\bTR\d{2}", ln.name or "")
+        ]
 
     # Document type hints
     if re.search(r"(?i)e-?Ar[sş]iv", cleaned):
