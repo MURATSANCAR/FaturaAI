@@ -1622,18 +1622,24 @@ def nearly_equal(a: float, b: float, eps: float = 0.05) -> bool:
 
 
 def status_from(warnings: list[str], validation: Validation) -> Literal["ok", "partial", "failed"]:
-    # Soft warnings that shouldn't block ok after reconcile
+    # Soft: ETTN / alıcı tax / unvan / kuruş — shouldn't alone force weak status
     soft = [
         w
         for w in warnings
-        if re.search(r"uyuşmuyor|0\.0[12]|kuruş|ETTN bulunamadı", w, re.I)
+        if re.search(
+            r"uyuşmuyor|0\.0[12]|kuruş|ETTN bulunamadı|"
+            r"Alıcı\s+(?:VKN|TCKN|unvanı)|Alıcı vergi",
+            w,
+            re.I,
+        )
     ]
     hard = [w for w in warnings if w not in soft]
+    # Primary weight: fatura no + ödenecek; supplier / lines also material
     critical = [
         w
         for w in hard
         if re.search(
-            r"Fatura numarası|Ödenecek tutar|Satıcı|Alıcı|kalemi|tarihi|VKN|TCKN",
+            r"Fatura numarası|Ödenecek tutar|Satıcı|kalemi|Fatura tarihi",
             w,
         )
     ]
@@ -1644,6 +1650,21 @@ def status_from(warnings: list[str], validation: Validation) -> Literal["ok", "p
     if validation.confidence < 0.5:
         return "partial"
     return "ok" if validation.confidence >= 0.75 else "partial"
+
+
+def has_any_invoice_field(inv: Invoice) -> bool:
+    """True when at least one useful invoice field was bound (no empty-'failed')."""
+    if inv.invoiceNumber or inv.uuid or inv.issueDate:
+        return True
+    if inv.totals.payableAmount is not None or inv.totals.taxInclusiveAmount is not None:
+        return True
+    if inv.supplier.taxId or inv.customer.taxId:
+        return True
+    if inv.lines:
+        return True
+    if inv.supplier.name or inv.customer.name:
+        return True
+    return False
 
 
 def sniff_extension(data: bytes, filename: str) -> str:
@@ -2935,6 +2956,25 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         d, tm = parse_issue_date(fatura_tr.replace(",", "."))
         if d:
             return d, tm
+
+    # Düzenleme / Belge / Fiili Sevk — common GİB / ERP alternate labels
+    for label_pat in (
+        rf"D[uü]zenleme\s*Tarihi\s*:?\s*{_date_tok}",
+        rf"Belge\s*Tarihi\s*:?\s*{_date_tok}",
+        rf"Fiili\s*Sevk\s*Tarihi\s*:?\s*{_date_tok}",
+        rf"Sevk\s*Tarihi\s*:?\s*{_date_tok}",
+    ):
+        alt = first_match(scrubbed, label_pat)
+        if alt:
+            d, tm = parse_issue_date(alt.replace(",", "."))
+            if d:
+                return d, tm
+    for label in ("Düzenleme Tarihi", "Belge Tarihi", "Fiili Sevk Tarihi", "Sevk Tarihi"):
+        alt = right_field(scrubbed, label)
+        if alt:
+            d, tm = parse_issue_date(alt.replace(",", "."))
+            if d:
+                return d, tm
 
     tarih_lbl = re.search(
         rf"TAR[İI]H\s*:?\s*{_date_tok}(?:\s+(\d{{1,2}}:\d{{2}}))?",
@@ -4810,17 +4850,17 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
         checks.append(f"fail:{w}")
         score -= 0.1
 
-    need(bool(inv.invoiceNumber), "Fatura numarası bulunamadı")
-    need(bool(inv.uuid), "ETTN bulunamadı", 0.08)
-    need(bool(inv.issueDate), "Fatura tarihi bulunamadı")
-    need(bool(inv.supplier.name), "Satıcı unvanı bulunamadı")
-    need(bool(inv.customer.name), "Alıcı unvanı bulunamadı")
+    need(bool(inv.invoiceNumber), "Fatura numarası bulunamadı", 0.16)
+    need(bool(inv.uuid), "ETTN bulunamadı", 0.04)
+    need(bool(inv.issueDate), "Fatura tarihi bulunamadı", 0.08)
+    need(bool(inv.supplier.name), "Satıcı unvanı bulunamadı", 0.1)
+    need(bool(inv.customer.name), "Alıcı unvanı bulunamadı", 0.04)
     if not supplier_tax_warnings:
         need(bool(inv.supplier.taxId), "Satıcı VKN/TCKN bulunamadı", 0.1)
     if not customer_tax_warnings:
-        need(bool(inv.customer.taxId), "Alıcı VKN/TCKN bulunamadı", 0.1)
-    need(inv.totals.payableAmount is not None, "Ödenecek tutar bulunamadı")
-    need(len(inv.lines) > 0, "Mal/hizmet kalemi bulunamadı", 0.18)
+        need(bool(inv.customer.taxId), "Alıcı VKN/TCKN bulunamadı", 0.04)
+    need(inv.totals.payableAmount is not None, "Ödenecek tutar bulunamadı", 0.16)
+    need(len(inv.lines) > 0, "Mal/hizmet kalemi bulunamadı", 0.14)
 
     totals_match = True
     le, vat, ti, pay, wh = (
@@ -5460,8 +5500,11 @@ async def extract(
 
         preview = (md or text)[:2500] if (md or text) else None
         status = status_from(warnings, validation)
-        if not invoice.invoiceNumber and not invoice.totals.payableAmount and not invoice.lines:
+        # Empty → failed. Any bound field (no/payable/lines/VKN/ETTN/date) → ≥ partial
+        if not has_any_invoice_field(invoice):
             status = "failed"
+        elif status == "failed":
+            status = "partial"
 
         if status == "ok":
             _metrics["extract_ok"] += 1
