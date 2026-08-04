@@ -13,6 +13,7 @@ opencv-python-headless>=4.8
 rapidocr>=3.9.0
 numpy<2.3
 # Layout-agnostic VL (PaddleOCR-VL-1.6). paddlepaddle installed by deploy from CPU index.
-paddleocr[doc-parser]>=3.0.0
+# Need >=3.2 for PaddleOCRVL export (3.0.x only has classic PaddleOCR).
+paddleocr>=3.2.0
 psutil>=5.9
 Pillow>=10.0
