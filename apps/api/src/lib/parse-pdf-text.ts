@@ -1,6 +1,93 @@
 import { parsePercent, parseTrMoney } from "./money.js";
-import { digitsOnly, isValidTaxId } from "./tax-id.js";
+import {
+  coerceTaxId,
+  digitsOnly,
+  isPlaceholderTaxId,
+  isValidTaxId,
+  normalizeOcrDigits,
+} from "./tax-id.js";
 import type { InvoiceLine, InvoiceParty, ParsedInvoice } from "../types.js";
+
+const TAX_OCR = "0-9OoОİIiılLSsBbGgZz";
+const TAX_LABEL =
+  "(?:VKN\\s*/\\s*TCKN|TCKN\\s*/\\s*VKN|VKN|TCKN|VIN|V\\.?\\s*N\\.?|Vergi\\s*(?:No|Numaras[ıi]|Kimlik(?:\\s*No)?))";
+
+function findTaxIdInRegion(text: string): { taxId: string; scheme: "VKN" | "TCKN" } | null {
+  if (!text) return null;
+  const patterns = [
+    new RegExp(`${TAX_LABEL}\\s*:?[.\\s]*([${TAX_OCR}]{10,11})\\b`, "i"),
+    new RegExp(
+      `${TAX_LABEL}\\s*:?[.\\s]*((?:[${TAX_OCR}]{3}\\s+){2}[${TAX_OCR}]{4})\\b`,
+      "i",
+    ),
+    new RegExp(
+      `Vergi\\s*Dairesi\\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{0,48}?\\s+([${TAX_OCR}]{10})\\b`,
+      "i",
+    ),
+    /(?<!\d)((?:\d{3}\s+){2}\d{4})(?!\d)/,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (!m?.[1]) continue;
+    const got = coerceTaxId(m[1]);
+    if (got) return got;
+  }
+  return null;
+}
+
+function findRoleTaxId(
+  text: string,
+  role: "supplier" | "customer",
+): { taxId: string; scheme: "VKN" | "TCKN" } | null {
+  if (role === "supplier") {
+    const labeled = text.match(
+      new RegExp(
+        `Sat[ıi]c[ıi](?:\\s*Bilgileri)?[^\\n]{0,80}?${TAX_LABEL}\\s*:?[.\\s]*([${TAX_OCR}]{10,11})\\b`,
+        "i",
+      ),
+    );
+    if (labeled?.[1]) {
+      const got = coerceTaxId(labeled[1]);
+      if (got) return got;
+    }
+    const sec = text.match(
+      /Sat[ıi]c[ıi]\s*Bilgileri([\s\S]{0,500}?)(?:Al[ıi]c[ıi]\s*Bilgileri|SAYIN|Mal\s*\/?\s*Hizmet|$)/i,
+    );
+    if (sec?.[1]) {
+      const got = findTaxIdInRegion(sec[1]);
+      if (got) return got;
+    }
+  } else {
+    const labeled = text.match(
+      new RegExp(
+        `Al[ıi]c[ıi](?:\\s*Bilgileri)?[^\\n]{0,80}?${TAX_LABEL}\\s*:?[.\\s]*([${TAX_OCR}]{10,11})\\b`,
+        "i",
+      ),
+    );
+    if (labeled?.[1]) {
+      const got = coerceTaxId(labeled[1]);
+      if (got) return got;
+    }
+    const musteri = text.match(
+      new RegExp(
+        `M[üu][şs]teri\\s*(?:VKN|TCKN|Vergi\\s*No)\\s*:?[.\\s]*([${TAX_OCR}]{10,11})\\b`,
+        "i",
+      ),
+    );
+    if (musteri?.[1]) {
+      const got = coerceTaxId(musteri[1]);
+      if (got) return got;
+    }
+    const sec = text.match(
+      /Al[ıi]c[ıi]\s*Bilgileri([\s\S]{0,500}?)(?:Mal\s*\/?\s*Hizmet|Ara\s*Toplam|Ödenecek|$)/i,
+    );
+    if (sec?.[1]) {
+      const got = findTaxIdInRegion(sec[1]);
+      if (got) return got;
+    }
+  }
+  return null;
+}
 
 function rightField(text: string, label: string): string | null {
   // "Fatura No: X" or "Fatura No             X" (colon optional)
@@ -32,8 +119,31 @@ function emptyParty(): InvoiceParty {
 
 function parseIssueDateTime(raw: string | null): { date: string | null; time: string | null } {
   if (!raw) return { date: null, time: null };
+  // OCR: O4.O6.2O24 → 04.06.2024
+  const normalized = [...raw]
+    .map((ch) => {
+      const map: Record<string, string> = {
+        O: "0",
+        o: "0",
+        О: "0",
+        İ: "1",
+        I: "1",
+        i: "1",
+        ı: "1",
+        l: "1",
+        L: "1",
+        "|": "1",
+        S: "5",
+        s: "5",
+        B: "8",
+        G: "6",
+        Z: "2",
+      };
+      return map[ch] ?? ch;
+    })
+    .join("");
   // ISO (Docling/GİB tables): 2026-07-30 13:14:02
-  const iso = raw.match(
+  const iso = normalized.match(
     /(?<!\d)(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/,
   );
   if (iso) {
@@ -49,11 +159,18 @@ function parseIssueDateTime(raw: string | null): { date: string | null; time: st
       return { date, time };
     }
   }
-  const m = raw.match(
-    /(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/,
+  const m = normalized.match(
+    /(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/,
   );
   if (!m) return { date: null, time: null };
-  const date = `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  let year = Number(m[3]);
+  if (year < 100) year += year < 70 ? 2000 : 1900;
+  const month = Number(m[2]);
+  const day = Number(m[1]);
+  if (!(month >= 1 && month <= 12 && day >= 1 && day <= 31 && year >= 1990 && year <= 2100)) {
+    return { date: null, time: null };
+  }
+  const date = `${String(year).padStart(4, "0")}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   const time = m[4] && m[5] ? `${m[4].padStart(2, "0")}:${m[5]}:00` : null;
   return { date, time };
 }
@@ -152,14 +269,14 @@ function extractSupplier(text: string): InvoiceParty {
     ?.split(/\s{2,}/)[0]
     ?.trim() || null;
 
-  const tckn = firstMatch(head, /TCKN\s*:\s*(\d{11})/i);
-  const vkn = firstMatch(head, /VKN\s*:\s*(\d{10})/i);
-  if (tckn) {
-    party.taxId = tckn;
-    party.taxIdScheme = "TCKN";
-  } else if (vkn) {
-    party.taxId = vkn;
-    party.taxIdScheme = "VKN";
+  const tckn = firstMatch(head, /TCKN\s*:?\s*([0-9OoİIiılL]{11})/i);
+  const vkn = firstMatch(head, /(?:VKN|VIN|Vergi\s*No|V\.?\s*N\.?)\s*:?\s*([0-9OoİIiılL\s]{10,14})/i);
+  const role = findRoleTaxId(text, "supplier");
+  const region = findTaxIdInRegion(head);
+  const chosen = role || region || coerceTaxId(tckn) || coerceTaxId(vkn);
+  if (chosen) {
+    party.taxId = chosen.taxId;
+    party.taxIdScheme = chosen.scheme;
   }
 
   return party;
@@ -177,7 +294,23 @@ function looksLikeAddressLine(line: string): boolean {
 function extractCustomer(text: string): InvoiceParty {
   const party = emptyParty();
   const sayinIdx = text.search(/\bSAYIN\b/i);
-  if (sayinIdx < 0) return party;
+  if (sayinIdx < 0) {
+    const role = findRoleTaxId(text, "customer");
+    if (role) {
+      party.taxId = role.taxId;
+      party.taxIdScheme = role.scheme;
+    }
+    const alici = text.match(
+      /Al[ıi]c[ıi]\s*(?:Bilgileri|Ünvan[ıi]?)\s*:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&'\-]{3,90})/i,
+    );
+    if (alici?.[1]) {
+      party.name = alici[1]
+        .split(/\s{2,}|VKN|TCKN|Adres|Vergi/i)[0]
+        ?.trim()
+        ?.slice(0, 120) || null;
+    }
+    return party;
+  }
 
   const block = text.slice(sayinIdx);
   const lines = block
@@ -230,18 +363,15 @@ function extractCustomer(text: string): InvoiceParty {
     firstMatch(near, /Vergi\s*Dairesi\s*:\s*([^\n]+)/i)
       ?.split(/\s{2,}/)[0]
       ?.trim() || null;
-  const vkn = firstMatch(near, /VKN\s*:\s*(\d{10})/i);
-  const tckn = firstMatch(near, /TCKN\s*:\s*(\d{11})/i);
-  const vknTckn = firstMatch(near, /VKN\s*\/\s*TCKN\s*:?\s*(\d{10,11})/i);
-  if (tckn) {
-    party.taxId = tckn;
-    party.taxIdScheme = "TCKN";
-  } else if (vkn) {
-    party.taxId = vkn;
-    party.taxIdScheme = "VKN";
-  } else if (vknTckn) {
-    party.taxId = vknTckn;
-    party.taxIdScheme = vknTckn.length === 11 ? "TCKN" : "VKN";
+  const chosen =
+    findRoleTaxId(text, "customer") ||
+    findTaxIdInRegion(near) ||
+    coerceTaxId(firstMatch(near, /TCKN\s*:?\s*([0-9OoİIiılL]{10,11})/i)) ||
+    coerceTaxId(firstMatch(near, /VKN\s*:?\s*([0-9OoİIiılL\s]{10,14})/i)) ||
+    coerceTaxId(firstMatch(near, /VKN\s*\/\s*TCKN\s*:?\s*([0-9OoİIiılL]{10,11})/i));
+  if (chosen) {
+    party.taxId = chosen.taxId;
+    party.taxIdScheme = chosen.scheme;
   }
 
   party.email = firstMatch(near, /E-?Posta\s*:\s*([^\s]+)/i);
@@ -773,7 +903,7 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     rightField(normalized, "Düzenleme Tarihi") ||
     firstMatch(
       normalized,
-      /(?:^|\n)[^\n]*?\bTarih\s*:\s*(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4})/i,
+      /(?:^|\n)[^\n]*?\bTarih\s*:\s*([0-9OoİIiılL]{1,2}\s*[-./]\s*[0-9OoİIiılL]{1,2}\s*[-./]\s*[0-9OoİIiılL]{2,4})/i,
     );
   const { date: issueDate, time: issueTimeFromDate } = parseIssueDateTime(issueRaw);
   const saati = rightField(normalized, "Fatura Saati");
@@ -790,10 +920,35 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     duzenlemeZamani?.match(/(\d{1,2}:\d{2}:\d{2})/)?.[1] ??
     null;
 
-  const uuid = firstMatch(
-    normalized,
-    /ETTN\s*:?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
-  )?.toLowerCase() || null;
+  const uuidRaw =
+    firstMatch(
+      normalized,
+      /(?:ETT\s*N|ETTN|UUID)\s*:?\s*([0-9A-Fa-fİIiılLOSs]{8}[-‑]?[0-9A-Fa-fİIiılLOSs]{4}[-‑]?[0-9A-Fa-fİIiılLOSs]{4}[-‑]?[0-9A-Fa-fİIiılLOSs]{4}[-‑]?[0-9A-Fa-fİIiılLOSs]{12})/i,
+    ) ||
+    firstMatch(
+      normalized,
+      /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i,
+    ) ||
+    firstMatch(normalized, /(?:ETT\s*N|ETTN|UUID)\s*:?\s*([0-9A-Fa-fİIiılLOSs]{32})\b/i);
+  const uuid = uuidRaw
+    ? (() => {
+        const mapped = [...uuidRaw.toUpperCase()]
+          .map((ch) => {
+            const map: Record<string, string> = {
+              O: "0",
+              İ: "1",
+              I: "1",
+              L: "1",
+              S: "5",
+            };
+            return map[ch] ?? ch;
+          })
+          .join("");
+        const hex = mapped.replace(/[^0-9A-F]/g, "");
+        if (hex.length !== 32) return null;
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`.toLowerCase();
+      })()
+    : null;
 
   const notesBlock = normalized.split(/NOTLAR\s*:/i)[1] ?? "";
   const notesFromBlock = notesBlock
@@ -857,8 +1012,8 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
 
 function sanitizePartyTaxId(party: InvoiceParty, role: string): string[] {
   const warnings: string[] = [];
-  const raw = digitsOnly(party.taxId);
-  if (!raw) {
+  const raw = normalizeOcrDigits(party.taxId) || digitsOnly(party.taxId);
+  if (!raw || isPlaceholderTaxId(raw)) {
     party.taxId = null;
     party.taxIdScheme = null;
     return warnings;

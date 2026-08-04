@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from tax_id import digits_only, is_valid_tax_id
+from tax_id import coerce_tax_id, digits_only, is_valid_tax_id, normalize_ocr_digits
 
 PORT = int(os.getenv("PORT", "8106"))
 ALLOWED_ORIGINS = [
@@ -2540,9 +2540,9 @@ def parse_retail_pos_lines(text: str) -> list[Line]:
 def extract_ettn_candidate(text: str) -> str | None:
     """Find ETTN even when OCR glues/truncates label (ETN…, ETTNe…) or mangles hex."""
     hexish = r"0-9A-Fa-fİILOSBloşPGQZpgqzRrTtHhNnUuYyWwMm"
-    # Labeled; tolerate OCR junk labels (ETTı{ / ETİN) and underscore escapes
+    # Labeled; tolerate OCR junk labels (ETTı{ / ETİN / ETT N / UUID) and underscore escapes
     m = re.search(
-        rf"(?i)ETT[İIıiNnNne\{{]{{0,4}}\s*[:\-]?\s*"
+        rf"(?i)(?:ETT\s*N|ETT[İIıiNnNne\{{]{{0,4}}|UUID)\s*[:\-]?\s*"
         rf"([{hexish}_\\]{{6,12}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?"
         rf"[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{3,6}}[-‑]?[{hexish}_\\]{{10,16}})",
         text,
@@ -2570,6 +2570,7 @@ def extract_ettn_candidate(text: str) -> str | None:
         got = format_uuid_hex(m.group(1))
         if got:
             return got
+    # OCR-mangled dashed UUID (letters mixed in)
     m = re.search(
         rf"\b([{hexish}]{{6,10}}[-‑][{hexish}]{{3,5}}[-‑][{hexish}]{{3,5}}[-‑]"
         rf"[{hexish}]{{3,5}}[-‑][{hexish}]{{10,14}})\b",
@@ -2580,9 +2581,100 @@ def extract_ettn_candidate(text: str) -> str | None:
         got = format_uuid_hex(m.group(1).replace("‑", "-"))
         if got:
             return got
-    m = re.search(rf"(?i)ETT?Ne?\s*[:\-]?\s*([{hexish}]{{30,36}})\b", text)
+    # Compact 32-hex (labeled or bare)
+    m = re.search(rf"(?i)(?:ETT\s*N|ETT?Ne?|UUID)\s*[:\-]?\s*([{hexish}]{{30,40}})\b", text)
     if m:
-        return format_uuid_hex(m.group(1))
+        got = format_uuid_hex(m.group(1))
+        if got:
+            return got
+    m = re.search(rf"(?i)\b([{hexish}]{{32}})\b", text)
+    if m:
+        got = format_uuid_hex(m.group(1))
+        if got:
+            return got
+    return None
+
+
+_TAX_OCR = r"0-9OoОİIiılLSsBbGgZz"
+_TAX_LABEL = (
+    r"(?:VKN\s*/\s*TCKN|TCKN\s*/\s*VKN|VKN|TCKN|VIN|V\.?\s*N\.?|"
+    r"Vergi\s*(?:No|Numaras[ıi]|Kimlik(?:\s*No)?))"
+)
+
+
+def _match_tax_id_token(raw: str) -> tuple[str, str] | None:
+    return coerce_tax_id(raw)
+
+
+def find_tax_id_in_region(text: str) -> tuple[str, str] | None:
+    """Wide VKN/TCKN finder for a text region (OCR-tolerant)."""
+    if not text:
+        return None
+    patterns = [
+        rf"(?i){_TAX_LABEL}\s*:?[.\s]*([{_TAX_OCR}]{{10,11}})\b",
+        rf"(?i){_TAX_LABEL}\s*:?[.\s]*((?:[{_TAX_OCR}]{{3}}\s+){{2}}[{_TAX_OCR}]{{4}})\b",
+        rf"(?i){_TAX_LABEL}\s*:?[.\s]*((?:[{_TAX_OCR}]{{3}}\s+){{3}}[{_TAX_OCR}]{{2}})\b",
+        # "Marmara Kurumlar Vergi Dairesi 6130636884"
+        rf"(?i)Vergi\s*Dairesi\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{{0,48}}?\s+([{_TAX_OCR}]{{10}})\b",
+        rf"(?i)\bV\.?\s*D\.?\s*[.:]?\s*[A-ZÇĞİÖŞÜa-zçğıöşü .]{{0,40}}?\s+([{_TAX_OCR}]{{10}})\b",
+        # Spaced classic VKN without label nearby
+        rf"(?<!\d)((?:\d{{3}}\s+){{2}}\d{{4}})(?!\d)",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            got = _match_tax_id_token(m.group(1))
+            if got:
+                return got
+    return None
+
+
+def find_role_tax_id(text: str, role: str) -> tuple[str, str] | None:
+    """role: 'supplier' | 'customer' — prefer Satıcı/Alıcı labeled ids."""
+    if role == "supplier":
+        labeled = re.search(
+            rf"(?i)Sat[ıi]c[ıi](?:\s*Bilgileri)?[^\n]{{0,80}}?{_TAX_LABEL}\s*:?[.\s]*"
+            rf"([{_TAX_OCR}]{{10,11}})\b",
+            text,
+        )
+        if labeled:
+            got = _match_tax_id_token(labeled.group(1))
+            if got:
+                return got
+        # Section: Satıcı Bilgileri … VKN
+        sec = re.search(
+            r"(?is)Sat[ıi]c[ıi]\s*Bilgileri(.{0,500}?)(?:Al[ıi]c[ıi]\s*Bilgileri|SAYIN|Mal\s*/?\s*Hizmet|$)",
+            text,
+        )
+        if sec:
+            got = find_tax_id_in_region(sec.group(1))
+            if got:
+                return got
+    else:
+        labeled = re.search(
+            rf"(?i)Al[ıi]c[ıi](?:\s*Bilgileri)?[^\n]{{0,80}}?{_TAX_LABEL}\s*:?[.\s]*"
+            rf"([{_TAX_OCR}]{{10,11}})\b",
+            text,
+        )
+        if labeled:
+            got = _match_tax_id_token(labeled.group(1))
+            if got:
+                return got
+        labeled = re.search(
+            rf"(?i)M[üu][şs]teri\s*(?:VKN|TCKN|Vergi\s*No)\s*:?[.\s]*([{_TAX_OCR}]{{10,11}})\b",
+            text,
+        )
+        if labeled:
+            got = _match_tax_id_token(labeled.group(1))
+            if got:
+                return got
+        sec = re.search(
+            r"(?is)Al[ıi]c[ıi]\s*Bilgileri(.{0,500}?)(?:Mal\s*/?\s*Hizmet|Ara\s*Toplam|Ödenecek|$)",
+            text,
+        )
+        if sec:
+            got = find_tax_id_in_region(sec.group(1))
+            if got:
+                return got
     return None
 
 
@@ -2594,6 +2686,7 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         text,
         flags=re.I,
     )
+    _date_tok = rf"([{_TAX_OCR}]{{1,2}}\s*[-./]\s*[{_TAX_OCR}]{{1,2}}\s*[-./]\s*[{_TAX_OCR}]{{4}})"
     # Explicit Fatura Tarihi first (ISO table cells from Docling/GİB)
     fatura_iso = first_match(
         scrubbed,
@@ -2606,8 +2699,8 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
             return d, tm
     fatura_tr = first_match(
         scrubbed,
-        r"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|(]*\s*"
-        r"(\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+        rf"Fatura\s*(?:Tarihi|Yarihi|Tanible)\s*:?\s*[|(]*\s*"
+        rf"{_date_tok}(?:\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?)?",
     ) or right_field(scrubbed, "Fatura Tarihi")
     if fatura_tr:
         d, tm = parse_issue_date(fatura_tr.replace(",", "."))
@@ -2615,7 +2708,7 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
             return d, tm
 
     tarih_lbl = re.search(
-        r"TAR[İI]H\s*:?\s*(\d{1,2}[./]\d{1,2}[./]\d{4})(?:\s+(\d{1,2}:\d{2}))?",
+        rf"TAR[İI]H\s*:?\s*{_date_tok}(?:\s+(\d{{1,2}}:\d{{2}}))?",
         scrubbed,
         re.I,
     )
@@ -2627,7 +2720,7 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         if d:
             return d, tm
     retail = re.search(
-        r"(?:^|\n)\s*(\d{1,2}[./]\d{1,2}[./]\d{4})\s+(?:Saat\s*:?\s*)?(\d{1,2}:\d{2})?",
+        rf"(?:^|\n)\s*{_date_tok}\s+(?:Saat\s*:?\s*)?(\d{{1,2}}:\d{{2}})?",
         scrubbed,
         re.I,
     )
@@ -2644,16 +2737,16 @@ def prefer_invoice_issue_date(text: str) -> tuple[str | None, str | None]:
         or right_field(scrubbed, "Tarth")
         or first_match(
             scrubbed,
-            r"(?:Fatera\s*No|Fatura\s*No)[^\n]{0,40}?\n[^\n]*?"
-            r"(?:Tarih|Tarth)\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+            rf"(?:Fatera\s*No|Fatura\s*No)[^\n]{{0,40}}?\n[^\n]*?"
+            rf"(?:Tarih|Tarth)\s*:?\s*{_date_tok}",
         )
         or first_match(
             scrubbed,
-            r"(?:Tarih|Tarth)\s*:?\s*(\d{1,2}\s*[-./,]\s*\d{1,2}\s*[-./,]\s*\d{4})",
+            rf"(?:Tarih|Tarth|D[uü]zenleme\s*Tarihi)\s*:?\s*{_date_tok}",
         )
         or first_match(
             scrubbed,
-            r"(?<!\d)(\d{1,2}/\d{1,2}/\d{4})(?!\d)",
+            rf"(?<!\d){_date_tok}(?!\d)",
         )
     )
     if issue_raw:
@@ -2744,6 +2837,28 @@ def tesseract_ocr(path: Path) -> str:
 def parse_issue_date(raw: str | None) -> tuple[str | None, str | None]:
     if not raw:
         return None, None
+    # OCR: O4.O6.2O24 → 04.06.2024
+    raw = raw.translate(
+        str.maketrans(
+            {
+                "O": "0",
+                "o": "0",
+                "О": "0",
+                "İ": "1",
+                "I": "1",
+                "i": "1",
+                "ı": "1",
+                "l": "1",
+                "L": "1",
+                "|": "1",
+                "S": "5",
+                "s": "5",
+                "B": "8",
+                "G": "6",
+                "Z": "2",
+            }
+        )
+    )
     # ISO from Docling/GİB tables: 2026-07-30 13:14:02
     iso = re.search(
         r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?",
@@ -2759,12 +2874,14 @@ def parse_issue_date(raw: str | None) -> tuple[str | None, str | None]:
                 time_ = f"{int(iso.group(4)):02d}:{iso.group(5)}:{sec}"
             return date, time_
     m = re.search(
-        r"(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{4})(?:\s+(\d{1,2}):(\d{2}))?",
+        r"(\d{1,2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?",
         raw,
     )
     if not m:
         return None, None
     day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if year < 100:
+        year += 2000 if year < 70 else 1900
     if not (1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100):
         return None, None
     date = f"{year:04d}-{month:02d}-{day:02d}"
@@ -2798,18 +2915,25 @@ def extract_supplier(text: str) -> Party:
         and not re.search(r"<!--\s*image", ln.strip(), re.I)
         and not _is_registry_or_chrome_line(ln.strip())
     ]
-    # Explicit Satıcı: label (GİB / ERP layouts)
+    # Explicit Satıcı: / Satıcı Ünvanı: label (GİB / ERP / HF synth layouts)
     sat_m = re.search(
-        r"Sat[ıi]c[ıi]\s*[^:\n]{0,24}:?\s*([A-ZÇĞİÖŞÜa-zçğıöşü0-9].{2,120})",
+        r"Sat[ıi]c[ıi]\s*(?:Ünvan[ıi]?|Unvan|Ad[ıi])?\s*:?\s*"
+        r"([A-ZÇĞİÖŞÜa-zçğıöşü0-9].{2,120})",
         head,
         re.I,
     )
     if sat_m:
-        cand = re.split(r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi", sat_m.group(1), maxsplit=1)[
+        cand = re.split(r"\s{2,}|Adres\s*:|Tel(?:efon)?\s*:|Vergi|VKN|TCKN", sat_m.group(1), maxsplit=1)[
             0
         ].strip(" :.-[]{}")
-        cand = re.sub(r"^(?:şube|sube)\]?\s*:?\s*", "", cand, flags=re.I).strip(" :.-[]{}")
-        if len(cand) >= 4 and not _is_registry_or_chrome_line(cand):
+        cand = re.sub(r"^(?:şube|sube|Ünvan[ıi]?|Unvan|Ad[ıi])\]?\s*:?\s*", "", cand, flags=re.I).strip(
+            " :.-[]{}"
+        )
+        if (
+            len(cand) >= 4
+            and not _is_registry_or_chrome_line(cand)
+            and not re.match(r"^(?:Bilgileri|Ünvan|Unvan)\b", cand, re.I)
+        ):
             party.name = cand[:180]
     # Prefer a line that looks like a company title (legal form / retail trade words)
     if not party.name:
@@ -2908,14 +3032,14 @@ def extract_supplier(text: str) -> Party:
         party.address = ", ".join(addr_parts[:3])[:240]
     # Vergi No / Dairesi: 4470211661 / KADIKÖY
     vkn_office = re.search(
-        r"Vergi\s*No\s*/?\s*Dairesi?\s*:?[.\s]*(\d{10,11})\s*/\s*([A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
+        rf"(?i)Vergi\s*No\s*/?\s*Dairesi?\s*:?[.\s]*([{_TAX_OCR}]{{10,11}})\s*/\s*"
+        r"([A-ZÇĞİÖŞÜa-zçğıöşü ]{2,40})",
         head,
-        re.I,
     )
     if vkn_office:
-        tid = vkn_office.group(1)
-        party.taxId = tid
-        party.taxIdScheme = "TCKN" if len(tid) == 11 else "VKN"
+        coerced = coerce_tax_id(vkn_office.group(1))
+        if coerced:
+            party.taxId, party.taxIdScheme = coerced
         party.taxOffice = vkn_office.group(2).strip()
     if not party.taxOffice:
         party.taxOffice = (
@@ -2926,21 +3050,11 @@ def extract_supplier(text: str) -> Party:
         ).strip() or None
     if party.taxOffice:
         party.taxOffice = re.split(r"\s{2,}|Vergi\s*num", party.taxOffice, maxsplit=1)[0].strip()
-    tckn = first_match(head, r"TCKN\s*:?\s*(\d{11})")
-    vkn = first_match(head, r"(?:VKN|VIN|Vergi\s*numar\w*|Vergi\s*No)\s*:?[.\s]*(\d{10})")
-    if not vkn:
-        spaced = first_match(head, r"\b(\d{3}\s+\d{3}\s+\d{4})\b")
-        if spaced:
-            vkn = re.sub(r"\s+", "", spaced)
-    if not vkn:
-        vkn = first_match(head, r"\bV\.?\s*N\.?\s*:?[.\s]*(\d{10})\b")
-    if not vkn:
-        vkn = first_match(head, r"Vergi\s*No\s*/?\s*Dairesi?\s*:?[.\s]*(\d{10})")
-    # Prefer VKN for company suppliers when both appear
-    if vkn and not vkn.startswith("5") and not party.taxId:
-        party.taxId, party.taxIdScheme = vkn, "VKN"
-    elif tckn and not party.taxId:
-        party.taxId, party.taxIdScheme = tckn, "TCKN"
+    # Prefer role-labeled Satıcı VKN, then head-only (never SAYIN block)
+    if not party.taxId:
+        role_tid = find_role_tax_id(text, "supplier") or find_tax_id_in_region(head)
+        if role_tid:
+            party.taxId, party.taxIdScheme = role_tid
     party.email = first_match(head, r"(?:E-?Posta|E-?Mall|E-?Mail)\s*:?\s*([^\s]+)")
     party.website = first_match(head, r"Web\s*Sitesi\s*:?\s*([^\s]+)")
     phone_raw = first_match(head, r"(?:Tel|Telefon)\s*:?\s*([0-9\s()\-]{10,})")
@@ -3028,6 +3142,22 @@ def extract_customer(text: str) -> Party:
 
     sayin = re.search(r"\bSAYIN\b", text, re.I)
     if not sayin and not party.name:
+        # HF / ERP layouts: Alıcı Bilgileri without SAYIN
+        role_tid = find_role_tax_id(text, "customer")
+        if role_tid:
+            party.taxId, party.taxIdScheme = role_tid
+        alici_sec = re.search(
+            r"(?is)Al[ıi]c[ıi]\s*(?:Ünvan[ıi]?|Unvan)\s*:?\s*"
+            r"([A-ZÇĞİÖŞÜa-zçğıöşü0-9 .&'\-]{3,90})",
+            text,
+        )
+        if alici_sec and not party.name:
+            cand = alici_sec.group(1).strip(" :.-")
+            cand = re.split(r"\s{2,}|VKN|TCKN|Adres|Vergi", cand, maxsplit=1)[0].strip()
+            if len(cand) >= 3 and not re.match(r"^(?:Bilgileri)\b", cand, re.I):
+                party.name = cand[:120]
+        if party.name or party.taxId:
+            return party
         return party
     if sayin:
         block = text[sayin.start() :]
@@ -3109,27 +3239,12 @@ def extract_customer(text: str) -> Party:
     else:
         near = text[alici.start() : alici.start() + 1500] if alici else text[:1500]
 
-    vkn_tckn = first_match(near, r"VKN\s*/\s*TCKN\s*:?\s*(\d{10,11})")
-    tckn = first_match(near, r"TCKN\s*:?\s*(\d{11})")
-    if not tckn:
-        # OCR often drops one digit from placeholder 11111111111
-        tckn10 = first_match(near, r"TCKN\s*:?\s*(\d{10})\b")
-        if tckn10 and len(set(tckn10)) == 1:
-            tckn = tckn10 + tckn10[0]
-    vkn = first_match(near, r"VKN\s*:?\s*(\d{10})")
-    if not vkn:
-        vkn = first_match(near, r"Vergi\s*No\s*/?\s*Dairesi?\s*:?\s*(\d{10,11})")
-    if tckn:
-        party.taxId, party.taxIdScheme = tckn, "TCKN"
-    elif vkn_tckn:
-        tid = vkn_tckn
-        if len(tid) == 10 and len(set(tid)) == 1:
-            tid = tid + tid[0]
-        party.taxId = tid
-        party.taxIdScheme = "TCKN" if len(tid) == 11 else "VKN"
-    elif vkn:
-        party.taxId = vkn
-        party.taxIdScheme = "TCKN" if len(vkn) == 11 else "VKN"
+    # Prefer Alıcı / SAYIN-region tax id; never steal from satıcı head
+    role_tid = find_role_tax_id(text, "customer")
+    region_tid = find_tax_id_in_region(near) if near else None
+    chosen = role_tid or region_tid
+    if chosen:
+        party.taxId, party.taxIdScheme = chosen
     party.taxOffice = (first_match(near, r"Vergi\s*Dairesi\s*:?\s*([^\n]+)") or "").split("  ")[0].strip() or None
     party.email = first_match(near, r"E-?Posta\s*:?\s*([^\s]+)")
     return party
@@ -4366,7 +4481,7 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
 def _sanitize_party_tax_id(party: Party, role: str) -> list[str]:
     """Clear checksum-invalid tax IDs so false positives are not reported as success."""
     warnings: list[str] = []
-    raw = digits_only(party.taxId)
+    raw = normalize_ocr_digits(party.taxId) or digits_only(party.taxId)
     if not raw:
         party.taxId = None
         party.taxIdScheme = None

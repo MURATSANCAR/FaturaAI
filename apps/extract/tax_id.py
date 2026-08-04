@@ -7,11 +7,39 @@ import re
 # GİB e-Arşiv anonymous / final-consumer placeholder (checksum fails by design).
 PLACEHOLDER_TCKN = "11111111111"
 
+# OCR lookalikes inside numeric tax-id / date tokens
+_OCR_DIGIT_TRANS = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "О": "0",  # Cyrillic
+        "İ": "1",
+        "I": "1",
+        "i": "1",
+        "ı": "1",
+        "l": "1",
+        "L": "1",
+        "|": "1",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "G": "6",
+        "Z": "2",
+    }
+)
+
 
 def digits_only(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"\D", "", value)
+
+
+def normalize_ocr_digits(value: str | None) -> str:
+    """Map common OCR letter→digit confusions, then keep digits only."""
+    if not value:
+        return ""
+    return digits_only(value.translate(_OCR_DIGIT_TRANS))
 
 
 def is_placeholder_tckn(value: str | None) -> bool:
@@ -20,18 +48,19 @@ def is_placeholder_tckn(value: str | None) -> bool:
 
 def is_placeholder_tax_id(value: str | None) -> bool:
     """Reject GİB anonymous / all-same-digit / zero tax ids (not real parties)."""
-    n = digits_only(value)
+    n = digits_only(value) or normalize_ocr_digits(value)
     if not n:
         return False
     if n in {PLACEHOLDER_TCKN, "0000000000", "00000000000"}:
         return True
+    # 111…, 222…, 000… etc.
     if len(n) in (10, 11) and len(set(n)) == 1:
         return True
     return False
 
 
 def is_valid_tckn(value: str | None) -> bool:
-    n = digits_only(value)
+    n = normalize_ocr_digits(value) or digits_only(value)
     # Placeholder is known, but not a real identity — treat as invalid for binding.
     if is_placeholder_tax_id(n):
         return False
@@ -46,7 +75,7 @@ def is_valid_tckn(value: str | None) -> bool:
 
 
 def is_valid_vkn(value: str | None) -> bool:
-    n = digits_only(value)
+    n = normalize_ocr_digits(value) or digits_only(value)
     if is_placeholder_tax_id(n):
         return False
     if len(n) != 10 or not n.isdigit():
@@ -63,7 +92,7 @@ def is_valid_vkn(value: str | None) -> bool:
 
 
 def is_valid_tax_id(value: str | None, scheme: str | None = None) -> bool:
-    n = digits_only(value)
+    n = normalize_ocr_digits(value) or digits_only(value)
     if not n or is_placeholder_tax_id(n):
         return False
     scheme_u = (scheme or "").upper()
@@ -76,3 +105,15 @@ def is_valid_tax_id(value: str | None, scheme: str | None = None) -> bool:
     if len(n) == 10:
         return is_valid_vkn(n)
     return False
+
+
+def coerce_tax_id(value: str | None) -> tuple[str, str] | None:
+    """Normalize OCR tax id → (digits, scheme) if length looks like VKN/TCKN."""
+    n = normalize_ocr_digits(value)
+    if not n or is_placeholder_tax_id(n):
+        return None
+    if len(n) == 11:
+        return n, "TCKN"
+    if len(n) == 10:
+        return n, "VKN"
+    return None
