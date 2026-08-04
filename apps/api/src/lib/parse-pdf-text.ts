@@ -703,16 +703,57 @@ function asciiUpper(s: string): string {
 
 function normalizeProfileId(raw: string | null | undefined): string | null {
   if (!raw) return null;
-  const p = asciiUpper(raw.trim());
-  return p || null;
+  let p = asciiUpper(raw.trim());
+  p = p.replace(/[^A-Z0-9_]/g, "");
+  if (p.length > 24 && !/(EARSIV|TEMEL|TICARI|IHRACAT|KAMU)/.test(p)) return null;
+  return p.slice(0, 32) || null;
 }
+
+const KNOWN_INVOICE_TYPES = [
+  "TEVKIFATIADE",
+  "OZELMATRAH",
+  "KONAKLAMA",
+  "TEVKIFAT",
+  "ISTISNA",
+  "KOMISYON",
+  "SATIS",
+  "IADE",
+  "SGK",
+  "HKS",
+] as const;
 
 function normalizeInvoiceTypeCode(raw: string | null | undefined): string | null {
   if (!raw) return null;
-  const t = asciiUpper(raw.trim());
-  // common UI typos / spaced forms
-  if (t === "SATIS" || t === "SATIŞ") return "SATIS";
+  let t = asciiUpper(raw.trim()).replace(/[^A-Z0-9_]/g, "");
+  if (t === "SATTS" || t === "SATI5" || t === "SAT1S" || t === "SATIS") return "SATIS";
+  for (const code of KNOWN_INVOICE_TYPES) {
+    if (t === code || t.startsWith(code)) return code;
+  }
+  if (t.length > 24) return null;
   return t || null;
+}
+
+function normalizeCustomizationId(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = asciiUpper(raw).replace(/\s+/g, "");
+  const m = s.match(/^(TR[12](?:\.\d)?)/);
+  if (m) {
+    return m[1].replace(/^TR([12])(\d)$/, "TR$1.$2");
+  }
+  const m2 = s.match(/^TR([12])(\d)/);
+  return m2 ? `TR${m2[1]}.${m2[2]}` : null;
+}
+
+function sanitizeTaxOffice(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let s = raw.split(
+    /\s{2,}|Vergi\s*(?:No|Num|Kimlik)|VKN\s*\/?\s*TCKN|\bVKN\b|\bTCKN\b|\bETTN\b|Malzeme|Fatura\s*No|Tel\s*:|E-?Posta|MERS[İI]S/i,
+  )[0];
+  s = s.replace(/\s*Vergi\s*No\s*$/i, "").replace(/^[\s:.\-|,/]+|[\s:.\-|,/]+$/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length < 2 || s.length > 48) return null;
+  if (/\d{7,}|Malzeme|Adet|ETTN|SATIS/i.test(s)) return null;
+  return s;
 }
 
 function detectDocumentType(
@@ -876,7 +917,9 @@ export function reconcileTotals(invoice: ParsedInvoice): void {
 export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
   const normalized = text.replace(/\u000c/g, "\n");
 
-  const customizationId = rightField(normalized, "Özelleştirme No");
+  const customizationId = normalizeCustomizationId(
+    rightField(normalized, "Özelleştirme No"),
+  );
   const profileIdRaw =
     rightField(normalized, "Senaryo") ||
     firstMatch(normalized, /ProfileID\s*:?\s*([A-Z0-9_]+)/i);
@@ -1006,6 +1049,8 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
     bankName,
     bankBranch,
   };
+  invoice.supplier.taxOffice = sanitizeTaxOffice(invoice.supplier.taxOffice);
+  invoice.customer.taxOffice = sanitizeTaxOffice(invoice.customer.taxOffice);
   reconcileTotals(invoice);
   return invoice;
 }

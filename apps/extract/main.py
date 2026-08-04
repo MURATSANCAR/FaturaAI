@@ -1587,7 +1587,22 @@ def parse_ocr_line_items(text: str) -> list[Line]:
     return out
 
 
+_KNOWN_INVOICE_TYPES = (
+    "TEVKIFATIADE",
+    "OZELMATRAH",
+    "KONAKLAMA",
+    "TEVKIFAT",
+    "ISTISNA",
+    "KOMISYON",
+    "SATIS",
+    "IADE",
+    "SGK",
+    "HKS",
+)
+
+
 def normalize_invoice_type(raw: str | None) -> str | None:
+    """Map OCR/glued PDF soup to a short GİB InvoiceTypeCode (SATIS, IADE, …)."""
     if not raw:
         return None
     t = (
@@ -1603,7 +1618,48 @@ def normalize_invoice_type(raw: str | None) -> str | None:
     # OCR: SATTS / SATI5 → SATIS
     if t in {"SATTS", "SATI5", "SAT1S", "SATIS"}:
         return "SATIS"
+    # Glued PDF: "SATISEPOSTABILGIARCELIK…" → SATIS
+    for code in _KNOWN_INVOICE_TYPES:
+        if t == code or t.startswith(code):
+            return code
+    if len(t) > 24:
+        return None
     return t or None
+
+
+def normalize_customization_id(raw: str | None) -> str | None:
+    """Keep only TR1.2 / TR1.0 style ids; drop glued branch/phone soup."""
+    if not raw:
+        return None
+    s = re.sub(r"\s+", "", raw.upper().replace("İ", "I"))
+    m = re.match(r"(TR[12](?:\.\d)?)", s)
+    if not m:
+        m = re.match(r"TR([12])(\d)", s)
+        if m:
+            return f"TR{m.group(1)}.{m.group(2)}"
+        return None
+    got = m.group(1)
+    return re.sub(r"^TR([12])(\d)$", r"TR\1.\2", got)
+
+
+def sanitize_tax_office(raw: str | None) -> str | None:
+    """Trim Vergi Dairesi to a short office name; drop glued line-item soup."""
+    if not raw:
+        return None
+    s = re.split(
+        r"\s{2,}|Vergi\s*(?:No|Num|Kimlik)|VKN\s*/?\s*TCKN|\bVKN\b|\bTCKN\b|"
+        r"\bETTN\b|Malzeme|Fatura\s*No|Tel\s*:|E-?Posta|MERS[İI]S",
+        raw,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    s = re.sub(r"(?i)\s*Vergi\s*No\s*$", "", s).strip(" :.-|,/")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) < 2 or len(s) > 48:
+        return None
+    if re.search(r"\d{7,}|Malzeme|Adet|ETTN|SATIS", s, re.I):
+        return None
+    return s
 
 
 def parse_percent(raw: str | None) -> float | None:
@@ -3339,7 +3395,7 @@ def extract_supplier(text: str) -> Party:
             or ""
         ).strip() or None
     if party.taxOffice:
-        party.taxOffice = re.split(r"\s{2,}|Vergi\s*num", party.taxOffice, maxsplit=1)[0].strip()
+        party.taxOffice = sanitize_tax_office(party.taxOffice)
     # Prefer role-labeled Satıcı VKN, then head-only (never SAYIN block)
     if not party.taxId:
         role_tid = find_role_tax_id(text, "supplier")
@@ -3569,6 +3625,8 @@ def extract_customer(text: str) -> Party:
     if chosen:
         party.taxId, party.taxIdScheme = chosen
     party.taxOffice = (first_match(near, r"Vergi\s*Dairesi\s*:?\s*([^\n]+)") or "").split("  ")[0].strip() or None
+    if party.taxOffice:
+        party.taxOffice = sanitize_tax_office(party.taxOffice)
     party.email = first_match(near, r"E-?Posta\s*:?\s*([^\s]+)")
     return party
 
@@ -3800,6 +3858,14 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         profile = re.sub(r"[^A-Z0-9_]", "", profile.upper().replace("İ", "I").replace("İ", "I"))
     inv_type = right_field(text, "Fatura Tipi")
     inv_type = normalize_invoice_type(inv_type)
+    if profile:
+        # Glued soup after Senaryo — keep leading profile token only
+        profile = re.split(r"(?:FATURA|SATIS|TR\d)", profile, maxsplit=1)[0] or profile
+        profile = re.sub(r"[^A-Z0-9_]", "", profile)[:32] or None
+        if profile and len(profile) > 24 and not re.search(
+            r"EARSIV|TEMEL|TICARI|IHRACAT|KAMU", profile
+        ):
+            profile = None
 
     if profile and "EARSIV" in profile:
         doc_type = "earsiv"
@@ -4537,9 +4603,12 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         or first_match(text, r"Ozellestirme\s*No\s*:?\s*(TR[\d.]+)")
         or first_match(text, r"Özelleştirme\s*No\s*:?\s*(TR[\d.]+)")
     )
-    if customization:
-        customization = re.sub(r"\s+", "", customization.upper())
-        customization = re.sub(r"^TR([12])(\d)$", r"TR\1.\2", customization)
+    customization = normalize_customization_id(customization)
+
+    if supplier.taxOffice:
+        supplier.taxOffice = sanitize_tax_office(supplier.taxOffice)
+    if customer.taxOffice:
+        customer.taxOffice = sanitize_tax_office(customer.taxOffice)
 
     inv = Invoice(
         documentType=doc_type,
