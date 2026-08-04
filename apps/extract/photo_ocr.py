@@ -448,19 +448,22 @@ def looks_like_garbage_ocr(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return True
-    if structure_score(t) > 1:
-        return False
-    if _GIB_HINT_RE.search(t):
-        return False
-    if _AMOUNT_RE.search(t) and (_has_gib_serial(t) or _ettn_hex_count(t) >= 20):
-        return False
-    # Very short / no invoice vocabulary
-    if len(t) < 120 and not re.search(
-        r"(?i)fatura|ettn|vkn|tckn|ödenecek|sayin|kdv|toplam",
+    # PDF viewer / ERP chrome without invoice vocabulary
+    if re.search(r"(?i)file://|AppData\\\\Local|Page\s*\d+\s*of\s*\d+|Rar\$EX", t):
+        if not re.search(
+            r"(?i)\b(?:e-?Ar[sş]iv|e-?Fatura|SAYIN|Ödenecek|ETTN|VKN\s*:|Fatura\s*No)\b",
+            t,
+        ):
+            return True
+    struct = structure_score(t)
+    # Allow struct≤2 (amount/date noise) when no real invoice labels
+    if struct <= 2 and not re.search(
+        r"(?i)\b(?:e-?Ar[sş]iv|e-?Fatura|SAYIN|Ödenecek|ETTN|VKN\s*:|"
+        r"Fatura\s*No|Mal\s*/?\s*Hizmet|Senaryo)\b",
         t,
     ):
         return True
-    return structure_score(t) <= 1 and not _GIB_HINT_RE.search(t)
+    return False
 
 
 def _rank_key(c: tuple[str, str, float, int]) -> tuple:

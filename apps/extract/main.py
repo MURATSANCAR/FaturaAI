@@ -2660,7 +2660,7 @@ def is_garbage_photo_ocr(inv: Invoice, photo_meta: dict[str, Any] | None = None)
     Used to skip Docling/VL on Vulkan/DeFacto-style garbage photos (~15–25s waste).
     """
     struct = int((photo_meta or {}).get("structureScore") or 0)
-    if struct > 1:
+    if struct > 2:
         return False
     if inv.invoiceNumber:
         return False
