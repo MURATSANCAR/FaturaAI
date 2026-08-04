@@ -49,7 +49,7 @@ PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "120"))
 VL_OCR_ENABLED = os.getenv("VL_OCR_ENABLED", "0") == "1"
 VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "900"))
 VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
-PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "250")))
+PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "200")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
@@ -3977,13 +3977,19 @@ async def extract(
                     if photo_text.strip():
                         text = photo_text
                         md = photo_text
-                        inv_photo = parse_text_invoice(photo_text, name)
+                        from parse_vl_markdown import invoice_from_ocr_text
+
+                        inv_photo = invoice_from_ocr_text(
+                            photo_text, name, engine=str(photo_meta.get("engine") or "")
+                        )
                         invoice = merge_invoice(invoice, inv_photo)
                         if not invoice.lines and inv_photo.lines:
                             invoice.lines = inv_photo.lines
                         warnings_ph, validation_ph = validate_invoice(invoice)
                         if strong_photo_invoice(invoice, validation_ph):
                             pipeline.append("photo-ocr-fast-path")
+                        if "paddleocr-vl" in str(photo_meta.get("engine") or ""):
+                            pipeline.append("vl-field-binder")
                 except Exception as exc:  # noqa: BLE001
                     pipeline.append(f"photo-ocr-error:{exc}")
 
@@ -4164,6 +4170,7 @@ async def extract(
         )
         # Scanned / broken-text PDFs: prod keeps ENABLE_DOCLING_OCR=0 for speed,
         # so force raster photo-OCR (and optional Docling OCR) when extract is weak.
+        # Scanned / broken-text PDFs only — do NOT send clean digital partials to VL.
         force_raster = (
             not as_image
             and "fast-path" not in pipeline
@@ -4182,8 +4189,6 @@ async def extract(
                     bool(invoice.supplier.name)
                     and sum(1 for c in (invoice.supplier.name or "") if ord(c) < 32) >= 2
                 )
-                # Generic retry: partial parses (missing tax id / weak fields) get VL/raster
-                or status_from(warnings, validation) == "partial"
             )
         )
         if force_raster:
@@ -4196,7 +4201,13 @@ async def extract(
                         f"p{raster_meta.get('pages', 0)}"
                     )
                     _metrics["photo_ocr"] += 1
-                    inv_r = parse_text_invoice(raster_txt, name)
+                    from parse_vl_markdown import invoice_from_ocr_text
+
+                    inv_r = invoice_from_ocr_text(
+                        raster_txt, name, engine=str(raster_meta.get("engine") or "")
+                    )
+                    if "paddleocr-vl" in str(raster_meta.get("engine") or ""):
+                        pipeline.append("vl-field-binder")
                     # Drop binary junk supplier before merge
                     if invoice.supplier and invoice.supplier.name:
                         if sum(1 for c in invoice.supplier.name if ord(c) < 32) >= 2:
