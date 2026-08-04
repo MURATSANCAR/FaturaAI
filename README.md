@@ -17,14 +17,34 @@ API (:8105)
   ├─ rate limit (IP)
   ├─ job queue (max inflight 6, max queue 500)
   ├─ PDF fast-path: pdf-inspector → pdftotext / UBL (~ms–sn)
-  └─ weak PDF / foto → Extract v2
-Extract (:8106, uvicorn workers=5 × 8 OCR threads)
+  └─ weak PDF / photo → Extract v2
+Extract (:8106, uvicorn workers=5 × PHOTO_OCR_THREADS=6)
   ├─ pdf-inspector (text/CID) → pdftotext fallback
   ├─ FAST_PATH_PDF (text-layer güçlüyse OCR/Docling skip)
-  ├─ Photo/raster OCR: PP-OCRv6 Small → (conf<0.90 / alan fail) → Medium
+  ├─ Photo/raster OCR (prod-tuned):
+  │    PP-OCRv6 Small → (conf<0.78 / alan fail) → Medium
+  │    variants (nodeskew/strong/binary) sadece çok zayıf structure’ta
+  │    target≈1800 / max≈2400 / raster DPI=180 / inflight=2
   │    backend: OpenVINO (auto) → ONNX Runtime fallback
-  └─ Docling structure (+ optional OCR)
+  └─ Docling structure (+ optional OCR; VL_OCR_ENABLED=0 on CPU prod)
 ```
+
+### Photo OCR varsayılanları (CPU prod)
+
+| Env | Default | Not |
+|-----|---------|-----|
+| `PHOTO_OCR_TARGET_SIDE` | 1800 | uzun kenar hedefi |
+| `PHOTO_OCR_MAX_SIDE` | 2400 | üst sınır |
+| `PHOTO_OCR_MIN_SIDE` | 1200 | upscale eşiği |
+| `PHOTO_OCR_CONF_THRESHOLD` | 0.78 | Medium tetik eşiği |
+| `PHOTO_OCR_EARLY_STRUCT` | 6 | early-exit structure skoru |
+| `PHOTO_OCR_MAX_INFLIGHT` | 2 | worker başına eşzamanlı OCR |
+| `PHOTO_OCR_SERIALIZE` | 1 | OOM güvenliği (load test sonrası 0 denenebilir) |
+| `PHOTO_OCR_TIMEOUT_S` | 90 | |
+| `PDF_RASTER_DPI` | 180 | taranmış PDF raster |
+| `VL_OCR_ENABLED` | 0 | CPU prod’da kapalı |
+
+Tipik taranmış sayfa hedefi: **2.5–7 sn** (eski 8–25+ sn); çoğu sayfa **1–2 inference pass**.
 
 ## Desteklenen girdiler
 
@@ -32,7 +52,7 @@ Extract (:8106, uvicorn workers=5 × 8 OCR threads)
 - Fotoğraf — JPG/PNG/WEBP (+ HEIC best-effort); mobilde **Foto çek**
 - Sync `POST /extract` hâlâ var (script/load test)
 
-Zayıf / taranmış / bozuk metin PDF ve fotoğraflarda **PaddleOCR-VL-1.6** (layout-agnostic) kullanılır; RapidOCR PP-OCRv6 yedek yoldur. Temiz dijital/UBL PDF’ler fast-path’te kalır.
+Ana yol **RapidOCR PP-OCRv6** (Small→Medium). PaddleOCR-VL CPU prod’da kapalı (`VL_OCR_ENABLED=0`); sadece opt-in escalation. Temiz dijital/UBL PDF’ler fast-path’te kalır.
 
 ## Deploy
 
@@ -42,13 +62,22 @@ Zayıf / taranmış / bozuk metin PDF ve fotoğraflarda **PaddleOCR-VL-1.6** (la
 
 Servisler: `fatura-extract`, `fatura-api`
 
+Sunucuda systemd yenileme:
+
+```bash
+sudo cp apps/extract/fatura-extract.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart fatura-extract
+curl -s http://127.0.0.1:8106/health | jq
+```
+
 ## OCR CPU playground
 
 PP-StructureV3 / PaddleOCR-VL / RapidOCR karşılaştırması (CPU+RAM):
 
 ```bash
 cd playground/ocr-bench && ./setup.sh
-./run.sh --all --limit 5
+./run.sh --engine rapid --limit 10
 ```
 
 Detay: `playground/ocr-bench/README.md`

@@ -42,14 +42,14 @@ PHOTO_OCR_MIN_CONF = float(os.getenv("PHOTO_OCR_MIN_CONF", "0.55"))
 PHOTO_OCR_WARMUP = os.getenv("PHOTO_OCR_WARMUP", "1") == "1"
 # Do not preload Medium on every worker — major RAM saver under parallel load.
 PHOTO_OCR_WARMUP_MEDIUM = os.getenv("PHOTO_OCR_WARMUP_MEDIUM", "0") == "1"
-# Cap concurrent OCR threads per uvicorn worker (1 = safest vs OOM).
-PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "1")))
-PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "120"))
-# Layout-agnostic VL document parse (PaddleOCR-VL-1.6); RapidOCR remains fallback.
+# Cap concurrent OCR per uvicorn worker (2 = prod-tuned; SERIALIZE=1 still OOM-safe).
+PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "2")))
+PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "90"))
+# PaddleOCR-VL: keep OFF on CPU prod (too slow). Opt-in for escalation experiments.
 VL_OCR_ENABLED = os.getenv("VL_OCR_ENABLED", "0") == "1"
 VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "900"))
 VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
-PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "200")))
+PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "180")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))

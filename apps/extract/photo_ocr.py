@@ -1,11 +1,12 @@
 """High-quality photo OCR for Turkish invoices / receipts.
 
-Prod stack (CPU):
-  OpenCV preprocess
+Prod-tuned CPU stack (speed + quality):
+  OpenCV preprocess (target ~1800px long side)
   → PP-OCRv6 Small (OpenVINO, else ONNX Runtime)
-  → if confidence < threshold or field validation fails
-  → PP-OCRv6 Medium
-  → Tesseract tur+eng only as last-resort if structure is still weak
+  → Medium only if conf < 0.78 or field validation fails
+  → Extra preprocess variants (nodeskew/strong/binary) only when
+    structure is still very weak — most scanned pages finish in 1–2 passes
+  → Tesseract tur+eng last-resort if structure is still critically weak
 """
 
 from __future__ import annotations
@@ -21,18 +22,19 @@ import cv2
 import numpy as np
 
 PHOTO_OCR_ENABLED = os.getenv("PHOTO_OCR_ENABLED", "1") == "1"
-PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1400"))
-PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "2200"))
-PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "2800"))
+PHOTO_OCR_MIN_SIDE = int(os.getenv("PHOTO_OCR_MIN_SIDE", "1200"))
+PHOTO_OCR_TARGET_SIDE = int(os.getenv("PHOTO_OCR_TARGET_SIDE", "1800"))
+PHOTO_OCR_MAX_SIDE = int(os.getenv("PHOTO_OCR_MAX_SIDE", "2400"))
 PHOTO_OCR_CLAHE = os.getenv("PHOTO_OCR_CLAHE", "1") == "1"
 PHOTO_OCR_TESSERACT = os.getenv("PHOTO_OCR_TESSERACT", "1") == "1"
 PHOTO_OCR_COLUMNS = os.getenv("PHOTO_OCR_COLUMNS", "1") == "1"
-PHOTO_OCR_EARLY_STRUCT = int(os.getenv("PHOTO_OCR_EARLY_STRUCT", "8"))
+PHOTO_OCR_EARLY_STRUCT = int(os.getenv("PHOTO_OCR_EARLY_STRUCT", "6"))
 # Prefer OpenVINO; fall back to ONNX when init/infer fails (auto).
 PHOTO_OCR_ENGINE = os.getenv("PHOTO_OCR_ENGINE", "auto").strip().lower()
 # Keep threads modest under multi-worker; high values OOM OpenVINO.
 PHOTO_OCR_THREADS = max(1, int(os.getenv("PHOTO_OCR_THREADS", "4")))
-PHOTO_OCR_CONF_THRESHOLD = float(os.getenv("PHOTO_OCR_CONF_THRESHOLD", "0.90"))
+# 0.78: Medium much less often than the old 0.90 gate (prod-tuned).
+PHOTO_OCR_CONF_THRESHOLD = float(os.getenv("PHOTO_OCR_CONF_THRESHOLD", "0.78"))
 # Force Medium on every page (debug / quality A/B). Default: Small → Medium ladder.
 PHOTO_OCR_FORCE_MEDIUM = os.getenv("PHOTO_OCR_FORCE_MEDIUM", "0") == "1"
 # Serialize OCR inside a process — concurrent OpenVINO/ONNX in one worker OOMs.
@@ -262,9 +264,13 @@ def preprocess_bgr(
     long_side = max(h, w)
     if target_side is None:
         if long_side < 700:
-            target_side = min(PHOTO_OCR_MAX_SIDE, 2600 if strong else 2400)
+            # Tiny inputs: upscale more aggressively within MAX_SIDE.
+            target_side = PHOTO_OCR_MAX_SIDE if strong else PHOTO_OCR_TARGET_SIDE
         elif strong:
-            target_side = min(PHOTO_OCR_MAX_SIDE, max(PHOTO_OCR_TARGET_SIDE, 2200))
+            target_side = min(
+                PHOTO_OCR_MAX_SIDE,
+                max(PHOTO_OCR_TARGET_SIDE, min(2000, PHOTO_OCR_MAX_SIDE)),
+            )
         else:
             target_side = PHOTO_OCR_TARGET_SIDE
 
@@ -513,7 +519,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
     small, medium, backend = get_engines(need_medium=force_medium)
     candidates: list[tuple[str, str, float, int]] = []
 
-    target = 2400 if screenshotish else None
+    target = PHOTO_OCR_MAX_SIDE if screenshotish else None
     img = preprocess_bgr(
         raw, strong=False, deskew=not screenshotish, target_side=target
     )
@@ -521,6 +527,7 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
     used_medium = False
     early = False
     fallback_reason: str | None = None
+    critical_struct = max(3, PHOTO_OCR_EARLY_STRUCT // 2)
 
     if force_medium:
         if medium is None:
@@ -555,36 +562,57 @@ def _ocr_image_unlocked(path: Path) -> tuple[str, dict[str, Any]]:
                     early = True
 
     if not early:
-        # Extra preprocess only when Small (+ Medium) still weak
-        if medium is None:
+        # Extra preprocess only when structure is still very weak.
+        # Medium on variants only if still critically weak after that pass.
+        struct = structure_score(best[1]) if candidates else 0
+        very_weak = struct < PHOTO_OCR_EARLY_STRUCT
+        if medium is None and (very_weak or screenshotish):
             _, medium, backend = get_engines(need_medium=True)
         primary = medium if used_medium and medium is not None else small
-        primary_label = "ppocrv6-medium" if primary is medium and medium else "ppocrv6-small"
+        primary_label = (
+            "ppocrv6-medium" if primary is medium and medium else "ppocrv6-small"
+        )
 
-        if screenshotish or structure_score(best[1]) < PHOTO_OCR_EARLY_STRUCT + 2:
+        if screenshotish or struct < critical_struct:
             img_nd = preprocess_bgr(raw, strong=False, deskew=False)
             _run_engine(primary, img_nd, f"{primary_label}-nodeskew", candidates)
+            best = max(candidates, key=_rank_key)
+            struct = structure_score(best[1])
             if (
                 medium is not None
                 and primary is not medium
-                and structure_score(max(candidates, key=_rank_key)[1]) < 10
+                and struct < critical_struct
             ):
                 _run_engine(medium, img_nd, "ppocrv6-medium-nodeskew", candidates)
                 used_medium = True
-            best = max(candidates, key=_rank_key)
+                best = max(candidates, key=_rank_key)
+                struct = structure_score(best[1])
 
-        if structure_score(best[1]) < (10 if tiny else 8):
+        if struct < max(4, PHOTO_OCR_EARLY_STRUCT - 1):
             img2 = preprocess_bgr(raw, strong=True, deskew=not screenshotish)
             _run_engine(primary, img2, f"{primary_label}-strong", candidates)
-            if medium is not None and primary is not medium:
+            best = max(candidates, key=_rank_key)
+            struct = structure_score(best[1])
+            if (
+                medium is not None
+                and primary is not medium
+                and struct < critical_struct
+            ):
                 _run_engine(medium, img2, "ppocrv6-medium-strong", candidates)
                 used_medium = True
-            best = max(candidates, key=_rank_key)
+                best = max(candidates, key=_rank_key)
+                struct = structure_score(best[1])
 
-        if tiny or structure_score(best[1]) < 8:
+        if tiny or struct < critical_struct:
             img_bin = preprocess_bgr(raw, strong=True, deskew=False, binary=True)
             _run_engine(primary, img_bin, f"{primary_label}-binary", candidates)
-            if medium is not None and primary is not medium:
+            best = max(candidates, key=_rank_key)
+            struct = structure_score(best[1])
+            if (
+                medium is not None
+                and primary is not medium
+                and struct < critical_struct
+            ):
                 _run_engine(medium, img_bin, "ppocrv6-medium-binary", candidates)
                 used_medium = True
 
