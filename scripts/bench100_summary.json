@@ -1,0 +1,405 @@
+{
+  "n": 100,
+  "wallSec": 423.5,
+  "workers": 2,
+  "sources": {
+    "local": 49,
+    "hf_synth": 51
+  },
+  "status": {
+    "partial": 76,
+    "ok": 21,
+    "failed": 3
+  },
+  "latencyMs": {
+    "min": 80,
+    "p50": 8955.0,
+    "p90": 12314.0,
+    "p95": 23555.0,
+    "max": 32881,
+    "mean": 8385.9
+  },
+  "fieldMissingCounts": {
+    "supplier.taxId": 58,
+    "issueDate": 37,
+    "invoiceNumber": 14,
+    "totals.payable": 6,
+    "lines": 6,
+    "customer.name": 5
+  },
+  "issueCounts": {
+    "customer_placeholder_taxId": 4
+  },
+  "topWarnings": {
+    "Alıcı VKN/TCKN bulunamadı": 76,
+    "ETTN bulunamadı": 69,
+    "Satıcı VKN/TCKN bulunamadı": 58,
+    "Fatura tarihi bulunamadı": 37,
+    "Matrah + KDV, vergiler dahil toplam ile uyuşmuyor": 33,
+    "Fatura numarası bulunamadı": 14,
+    "Ödenecek tutar bulunamadı": 6,
+    "Mal/hizmet kalemi bulunamadı": 6,
+    "Alıcı unvanı bulunamadı": 5,
+    "Ödenecek tutar, tevkifat düşülmüş toplam ile uyuşmuyor": 2
+  },
+  "completeCritical": 83,
+  "slowest": [
+    {
+      "file": "local_002_images-c3f58676-6fff-4195-8c8b-e152e8c37b0f.png",
+      "ms": 32881,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_033_06-defacto.png",
+      "ms": 26694,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_026_05-defacto.png",
+      "ms": 24819,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_018_images__2_-692a8f1f-05d4-4afe-9375-43d37b7a37d0.png",
+      "ms": 24462,
+      "status": "failed",
+      "method": "nanobase-ai",
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_025_02-vulkan-ihracat.png",
+      "ms": 23957,
+      "status": "failed",
+      "method": "nanobase-ai",
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_035_04-vulkan.png",
+      "ms": 23555,
+      "status": "failed",
+      "method": "nanobase-ai",
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ]
+    },
+    {
+      "file": "local_004_images__3_-5767a231-73d1-45e6-9695-b262e2778878.png",
+      "ms": 14465,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "local_030_05-mango.png",
+      "ms": 14164,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "local_023_04-afeks.png",
+      "ms": 14087,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "hf_invoice_000013.png",
+      "ms": 12543,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "hf_invoice_000015.png",
+      "ms": 12314,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "issueDate",
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "local_011_images__1_-640b7e18-63dc-4bce-8db9-8722e87a0384.png",
+      "ms": 12277,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "local_040_02.04.24 35317604986-NURTEKIN ÖZDİNÇ 46.490.pdf",
+      "ms": 12000,
+      "status": "ok",
+      "method": "nanobase-ai",
+      "missing": []
+    },
+    {
+      "file": "hf_invoice_000024.png",
+      "ms": 11811,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "supplier.taxId"
+      ]
+    },
+    {
+      "file": "hf_invoice_000017.png",
+      "ms": 11613,
+      "status": "partial",
+      "method": "nanobase-ai",
+      "missing": [
+        "supplier.taxId"
+      ]
+    }
+  ],
+  "problemCases": [
+    {
+      "file": "local_000_3.pdf",
+      "status": "ok",
+      "ms": 174,
+      "missing": [],
+      "issues": [
+        "customer_placeholder_taxId"
+      ],
+      "warnings": [],
+      "supplierName": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ.",
+      "lineCount": 3,
+      "error": null
+    },
+    {
+      "file": "local_002_images-c3f58676-6fff-4195-8c8b-e152e8c37b0f.png",
+      "status": "partial",
+      "ms": 32881,
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "DeFacto",
+      "lineCount": 0,
+      "error": null
+    },
+    {
+      "file": "local_005_2.pdf",
+      "status": "ok",
+      "ms": 89,
+      "missing": [],
+      "issues": [
+        "customer_placeholder_taxId"
+      ],
+      "warnings": [],
+      "supplierName": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ.",
+      "lineCount": 2,
+      "error": null
+    },
+    {
+      "file": "local_007_1.pdf",
+      "status": "ok",
+      "ms": 105,
+      "missing": [],
+      "issues": [
+        "customer_placeholder_taxId"
+      ],
+      "warnings": [],
+      "supplierName": "ÖZELCAN BABYMALL MAĞAZACILIK DAĞITIM TİC VE SAN.AŞ.",
+      "lineCount": 4,
+      "error": null
+    },
+    {
+      "file": "local_018_images__2_-692a8f1f-05d4-4afe-9375-43d37b7a37d0.png",
+      "status": "failed",
+      "ms": 24462,
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "Fatura numarası bulunamadı",
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "PAŞA ARANAN",
+      "lineCount": 0,
+      "error": null
+    },
+    {
+      "file": "local_021_earsiv_faturaKVI2026000009854.pdf..pdf",
+      "status": "ok",
+      "ms": 113,
+      "missing": [],
+      "issues": [
+        "customer_placeholder_taxId"
+      ],
+      "warnings": [],
+      "supplierName": "KAMPVEÖTESİ SANAYİ VE TİCARET ANONİM ŞİRKETİ",
+      "lineCount": 2,
+      "error": null
+    },
+    {
+      "file": "local_025_02-vulkan-ihracat.png",
+      "status": "failed",
+      "ms": 23957,
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "Fatura numarası bulunamadı",
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "PAŞA ARANAN",
+      "lineCount": 0,
+      "error": null
+    },
+    {
+      "file": "local_026_05-defacto.png",
+      "status": "partial",
+      "ms": 24819,
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "DeFacto",
+      "lineCount": 0,
+      "error": null
+    },
+    {
+      "file": "local_033_06-defacto.png",
+      "status": "partial",
+      "ms": 26694,
+      "missing": [
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "DeFacto",
+      "lineCount": 0,
+      "error": null
+    },
+    {
+      "file": "local_035_04-vulkan.png",
+      "status": "failed",
+      "ms": 23555,
+      "missing": [
+        "invoiceNumber",
+        "issueDate",
+        "supplier.taxId",
+        "totals.payable",
+        "lines"
+      ],
+      "issues": [],
+      "warnings": [
+        "Fatura numarası bulunamadı",
+        "ETTN bulunamadı",
+        "Fatura tarihi bulunamadı",
+        "Satıcı VKN/TCKN bulunamadı",
+        "Alıcı VKN/TCKN bulunamadı",
+        "Ödenecek tutar bulunamadı",
+        "Mal/hizmet kalemi bulunamadı"
+      ],
+      "supplierName": "PAŞA ARANAN",
+      "lineCount": 0,
+      "error": null
+    }
+  ]
+}
