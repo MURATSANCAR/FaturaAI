@@ -99,6 +99,8 @@ def normalize_vl_markdown(raw: str) -> str:
         return ""
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
     text = html.unescape(text)
+    # VL sometimes emits literal "\n" sequences inside table cells
+    text = text.replace("\\n", "\n")
 
     # HTML tables → rows of cell text
     def _table_repl(m: re.Match[str]) -> str:
@@ -181,7 +183,8 @@ def _best_amount(text: str, labels: list[str]) -> float | None:
 
 def _first_labeled_value(text: str, labels: list[str], value_re: str) -> str | None:
     alt = _label_alt(labels)
-    m = re.search(rf"(?is){alt}\s*:?\s*[|]?\s*({value_re})", text)
+    # VL/HTML often emits "VKN | : 6200080458" or "TCKN : 353..."
+    m = re.search(rf"(?is){alt}[\s|:.-]*({value_re})", text)
     return m.group(1).strip() if m else None
 
 
@@ -258,6 +261,7 @@ def _person_name_from_block(block: str) -> str | None:
     )
     for ln in block.splitlines()[:15]:
         s = re.sub(r"(?i)\b(?:paragraph_title|text|image|table)\b", " ", ln)
+        s = re.sub(r"(?i)^SAYIN\s+", "", s)
         s = re.sub(r"\s+", " ", s).strip(" :|-")
         if len(s) < 5 or junk.match(s):
             continue
@@ -265,8 +269,14 @@ def _person_name_from_block(block: str) -> str | None:
             continue
         if re.search(r"(?i)LTD|A\.?\s*Ş|SAN\.|T[İI]C\.", s):
             continue
+        # VL often glues the name twice: "ALI VELIALI VELI"
         words = s.split()
-        if 2 <= len(words) <= 5 and all(re.match(r"(?i)^[A-ZÇĞİÖŞÜa-zçğıöşü'.-]+$", w) for w in words):
+        if len(words) >= 4 and len(words) % 2 == 0:
+            half = len(words) // 2
+            if [w.casefold() for w in words[:half]] == [w.casefold() for w in words[half:]]:
+                s = " ".join(words[:half])
+                words = s.split()
+        if 2 <= len(words) <= 6 and all(re.match(r"(?i)^[A-ZÇĞİÖŞÜa-zçğıöşü'.-]+$", w) for w in words):
             return s[:120]
         if 1 <= len(words) <= 4 and re.match(r"(?i)^[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü'. -]+$", s):
             letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", s)
@@ -537,6 +547,22 @@ def parse_vl_markdown(text: str, file_name: str = ""):
                     break
     if c_office:
         inv.customer.taxOffice = c_office
+
+    # Retail / unlabeled buyer label is not a party name; don't mirror supplier tax
+    if inv.customer.name and re.search(r"(?i)Nihai\s*T[uü]ketici", inv.customer.name):
+        inv.customer.name = None
+        if inv.customer.taxId and inv.supplier.taxId and inv.customer.taxId == inv.supplier.taxId:
+            inv.customer.taxId = None
+            inv.customer.taxIdScheme = None
+    elif (
+        inv.customer.taxId
+        and inv.supplier.taxId
+        and inv.customer.taxId == inv.supplier.taxId
+        and inv.customer.taxIdScheme == "VKN"
+    ):
+        # Buyer shouldn't inherit supplier VKN
+        inv.customer.taxId = None
+        inv.customer.taxIdScheme = None
 
     # If supplier tax equals customer TCKN and a VKN exists in head, prefer VKN for supplier
     if (

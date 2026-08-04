@@ -3634,6 +3634,47 @@ def _lines_useful(lines: list[Line] | list[dict] | None) -> bool:
     return totaled > 0 and named >= max(1, totaled // 2)
 
 
+def _adopt_vl_invoice(vl: Invoice, prior: Invoice) -> Invoice:
+    """After VL escalate: VL wins; prior only fills gaps. Keep distinct tax IDs from prior."""
+    merged = merge_invoice(vl, prior)
+    # If VL mirrored the same tax onto both parties, restore a distinct prior supplier tax
+    if (
+        merged.supplier.taxId
+        and merged.customer.taxId
+        and merged.supplier.taxId == merged.customer.taxId
+        and prior.supplier.taxId
+        and prior.supplier.taxId != merged.supplier.taxId
+    ):
+        from tax_id import is_valid_tax_id
+
+        scheme = prior.supplier.taxIdScheme or (
+            "TCKN" if len(digits_only(prior.supplier.taxId) or "") == 11 else "VKN"
+        )
+        if is_valid_tax_id(prior.supplier.taxId, scheme):
+            merged.supplier.taxId = prior.supplier.taxId
+            merged.supplier.taxIdScheme = scheme  # type: ignore[assignment]
+            if prior.supplier.taxOffice:
+                merged.supplier.taxOffice = prior.supplier.taxOffice
+    if (
+        merged.customer.taxId
+        and merged.supplier.taxId
+        and merged.customer.taxId == merged.supplier.taxId
+        and prior.customer.taxId
+        and prior.customer.taxId != merged.supplier.taxId
+    ):
+        from tax_id import is_valid_tax_id
+
+        scheme = prior.customer.taxIdScheme or (
+            "TCKN" if len(digits_only(prior.customer.taxId) or "") == 11 else "VKN"
+        )
+        if is_valid_tax_id(prior.customer.taxId, scheme):
+            merged.customer.taxId = prior.customer.taxId
+            merged.customer.taxIdScheme = scheme  # type: ignore[assignment]
+    if _lines_useful(vl.lines):
+        merged.lines = vl.lines
+    return merged
+
+
 def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
     data = base.model_dump()
     over = overlay.model_dump()
@@ -3679,7 +3720,21 @@ def merge_invoice(base: Invoice, overlay: Invoice) -> Invoice:
             elif q_old < 8 and q_new >= 8:
                 data[side][k] = v
     for k, v in over["totals"].items():
-        if v is not None and data["totals"].get(k) is None:
+        if v is None:
+            continue
+        cur = data["totals"].get(k)
+        if cur is None:
+            data["totals"][k] = v
+            continue
+        # Prefer overlay when base looks like a stray unit/footnote amount
+        # (RapidOCR often binds "23,00" while VL has the real ödenecek).
+        if (
+            k in ("payableAmount", "taxInclusiveAmount", "lineExtensionAmount", "vatAmount")
+            and isinstance(cur, (int, float))
+            and isinstance(v, (int, float))
+            and float(cur) < float(v) * 0.5
+            and float(v) >= 50
+        ):
             data["totals"][k] = v
     if over["lines"]:
         def _line_sum(lines: list) -> float:
@@ -4060,9 +4115,7 @@ async def extract(
                                 vl_text, name, engine=str(vl_meta.get("engine") or "")
                             )
                             pipeline.append("vl-field-binder")
-                            invoice = merge_invoice(invoice, inv_vl)
-                            if _lines_useful(inv_vl.lines):
-                                invoice.lines = inv_vl.lines
+                            invoice = _adopt_vl_invoice(inv_vl, invoice)
                             text = vl_text
                             md = vl_text
                             warnings, validation = validate_invoice(invoice)
@@ -4315,9 +4368,7 @@ async def extract(
                             vl_txt, name, engine=str(vl_meta.get("engine") or "")
                         )
                         pipeline.append("vl-field-binder")
-                        invoice = merge_invoice(invoice, inv_vl)
-                        if _lines_useful(inv_vl.lines):
-                            invoice.lines = inv_vl.lines
+                        invoice = _adopt_vl_invoice(inv_vl, invoice)
                         text = (text + "\n\n" + vl_txt).strip() if text else vl_txt
                         md = (md + "\n\n" + vl_txt).strip() if md else vl_txt
                         warnings, validation = validate_invoice(invoice)
