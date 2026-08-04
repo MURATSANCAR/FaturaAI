@@ -565,10 +565,7 @@ def parse_vl_markdown(text: str, file_name: str = ""):
 
 
 def invoice_from_ocr_text(text: str, file_name: str = "", engine: str | None = None):
-    """Route VL engines to parse_vl_markdown; others keep classic parser."""
-    from main import parse_text_invoice
-
-    eng = (engine or "").lower()
-    if "paddleocr-vl" in eng or "vl-ocr" in eng or eng.startswith("vl"):
-        return parse_vl_markdown(text, file_name)
-    return parse_text_invoice(text, file_name)
+    """OCR/raster text → generic binder (VL markdown or RapidOCR plain text)."""
+    # Engine hint kept for pipeline tagging; binder is layout-agnostic.
+    _ = engine
+    return parse_vl_markdown(text, file_name)

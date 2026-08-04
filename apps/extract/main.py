@@ -106,16 +106,18 @@ def get_photo_ocr_sem() -> asyncio.Semaphore:
     return _photo_ocr_sem
 
 
-async def run_photo_ocr(path: Path) -> tuple[str, dict[str, Any]]:
+async def run_photo_ocr(
+    path: Path, *, prefer_vl: bool = False
+) -> tuple[str, dict[str, Any]]:
     """Run photo OCR with per-worker concurrency + timeout (OOM-safe).
 
-    Prefers PaddleOCR-VL when enabled; falls back to RapidOCR PP-OCRv6.
+    Default ladder: RapidOCR first. VL only when prefer_vl=True (escalation).
     """
     sem = get_photo_ocr_sem()
     await sem.acquire()
     _metrics["photo_ocr_inflight"] += 1
     try:
-        if VL_OCR_ENABLED:
+        if prefer_vl and VL_OCR_ENABLED:
             try:
                 from vl_ocr import ocr_document
 
@@ -126,8 +128,7 @@ async def run_photo_ocr(path: Path) -> tuple[str, dict[str, Any]]:
                 _metrics["vl_ocr"] += 1
                 return text, meta
             except Exception as exc:  # noqa: BLE001
-                # Fall through to RapidOCR
-                meta_err = {"engine": "vl-fallback", "vlError": str(exc)}
+                meta_err = {"engine": "vl-error", "vlError": str(exc)}
                 from photo_ocr import ocr_image
 
                 text, meta = await asyncio.wait_for(
@@ -149,7 +150,7 @@ async def run_photo_ocr(path: Path) -> tuple[str, dict[str, Any]]:
 
 
 async def run_pdf_raster_ocr(
-    path: Path, tmp: Path, max_pages: int = 2
+    path: Path, tmp: Path, max_pages: int = 2, *, prefer_vl: bool = False
 ) -> tuple[str, dict[str, Any]]:
     """Rasterize PDF pages + OCR under the same inflight cap as photo OCR."""
     sem = get_photo_ocr_sem()
@@ -158,11 +159,13 @@ async def run_pdf_raster_ocr(
     try:
         timeout = (
             max(VL_OCR_TIMEOUT_S * max_pages, 180)
-            if VL_OCR_ENABLED
+            if prefer_vl and VL_OCR_ENABLED
             else max(PHOTO_OCR_TIMEOUT_S * max_pages, 180)
         )
         return await asyncio.wait_for(
-            asyncio.to_thread(pdf_raster_ocr_text, path, tmp, max_pages),
+            asyncio.to_thread(
+                pdf_raster_ocr_text, path, tmp, max_pages, prefer_vl
+            ),
             timeout=timeout,
         )
     finally:
@@ -1400,9 +1403,55 @@ def is_unusable_extract_text(text: str) -> bool:
     return False
 
 
-def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[str, dict[str, Any]]:
-    """Render PDF pages and run VL (preferred) or photo OCR for scanned/broken PDFs."""
-    out_prefix = tmp / "raster"
+def needs_ocr_escalation(
+    inv: Invoice, validation: Validation, warnings: list[str]
+) -> bool:
+    """Generic field-quality gate — escalate to VL when cheap OCR/parse is weak.
+
+    No supplier/template rules: only critical-field presence, confidence,
+    status, and coarse amount consistency.
+    """
+    if not inv.invoiceNumber:
+        return True
+    if inv.totals.payableAmount is None:
+        return True
+    if not (inv.supplier.taxId or inv.customer.taxId):
+        return True
+    if validation.confidence < 0.8:
+        return True
+    st = status_from(warnings, validation)
+    if st in ("partial", "failed"):
+        return True
+    pay = float(inv.totals.payableAmount or 0)
+    line_sum = sum(float(l.lineTotal or 0) for l in inv.lines if l.lineTotal is not None)
+    if pay >= 100 and not inv.lines:
+        return True
+    if line_sum >= 50 and pay > 0:
+        ratio = pay / line_sum if line_sum else 0
+        # payable far below / above line sum → likely wrong total binding
+        if ratio < 0.4 or ratio > 2.5:
+            return True
+    le, vat = inv.totals.lineExtensionAmount, inv.totals.vatAmount
+    if le is not None and vat is not None and pay > 0:
+        expected = float(le) + float(vat)
+        if expected >= 50 and abs(pay - expected) / expected > 0.15:
+            return True
+    # junk party names that slipped through
+    for nm in (inv.supplier.name, inv.customer.name):
+        if nm and re.match(r"(?i)^(?:e-Belge|table|image|text|Nihai\s*T|ERP\s*Fatura)\b", nm):
+            if not inv.supplier.taxId or not inv.customer.taxId:
+                return True
+    return False
+
+
+def pdf_raster_ocr_text(
+    pdf_path: Path,
+    tmp: Path,
+    max_pages: int = 2,
+    prefer_vl: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Render PDF pages; RapidOCR by default, VL only on escalation (prefer_vl)."""
+    out_prefix = tmp / ("raster_vl" if prefer_vl else "raster")
     r = subprocess.run(
         [
             "pdftoppm",
@@ -1421,7 +1470,7 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
         timeout=90,
         check=False,
     )
-    pages = sorted(tmp.glob("raster*.png"))
+    pages = sorted(tmp.glob(f"{out_prefix.name}*.png"))
     if not pages:
         raise RuntimeError(r.stderr.strip() or "pdftoppm produced no pages")
 
@@ -1431,26 +1480,29 @@ def pdf_raster_ocr_text(pdf_path: Path, tmp: Path, max_pages: int = 2) -> tuple[
         "engine": None,
         "elapsedMs": 0,
         "dpi": PDF_RASTER_DPI,
+        "preferVl": prefer_vl,
     }
 
-    use_vl = VL_OCR_ENABLED
     for page in pages[:max_pages]:
         page_text = ""
         page_meta: dict[str, Any] = {}
-        if use_vl:
+        if prefer_vl and VL_OCR_ENABLED:
             try:
                 from vl_ocr import ocr_document
 
                 page_text, page_meta = ocr_document(page)
                 _metrics["vl_ocr"] += 1
             except Exception as exc:  # noqa: BLE001
-                use_vl = False
                 page_meta = {"vlError": str(exc)}
         if not page_text.strip():
             from photo_ocr import ocr_image
 
             page_text, rapid_meta = ocr_image(page)
-            page_meta = {**page_meta, **rapid_meta, "fallbackFrom": "vl" if VL_OCR_ENABLED else None}
+            page_meta = {
+                **page_meta,
+                **rapid_meta,
+                "fallbackFrom": "vl" if prefer_vl and VL_OCR_ENABLED else None,
+            }
         if page_text.strip():
             chunks.append(page_text.strip())
         meta["pages"] = int(meta["pages"]) + 1
@@ -3967,7 +4019,7 @@ async def extract(
             photo_meta: dict[str, Any] = {}
             if PHOTO_OCR_ENABLED:
                 try:
-                    photo_text, photo_meta = await run_photo_ocr(path)
+                    photo_text, photo_meta = await run_photo_ocr(path, prefer_vl=False)
                     pipeline.append(
                         f"photo-ocr:{photo_meta.get('engine', '?')}:"
                         f"{photo_meta.get('elapsedMs', 0)}ms:"
@@ -3986,10 +4038,34 @@ async def extract(
                         if not invoice.lines and inv_photo.lines:
                             invoice.lines = inv_photo.lines
                         warnings_ph, validation_ph = validate_invoice(invoice)
+                        warnings, validation = warnings_ph, validation_ph
+                        pipeline.append("ocr-field-binder")
                         if strong_photo_invoice(invoice, validation_ph):
                             pipeline.append("photo-ocr-fast-path")
-                        if "paddleocr-vl" in str(photo_meta.get("engine") or ""):
+
+                    if (
+                        VL_OCR_ENABLED
+                        and needs_ocr_escalation(invoice, validation, warnings)
+                    ):
+                        pipeline.append("vl-escalate")
+                        vl_text, vl_meta = await run_photo_ocr(path, prefer_vl=True)
+                        if vl_text.strip():
+                            pipeline.append(
+                                f"photo-vl:{vl_meta.get('engine', '?')}:"
+                                f"{vl_meta.get('elapsedMs', 0)}ms"
+                            )
+                            from parse_vl_markdown import invoice_from_ocr_text
+
+                            inv_vl = invoice_from_ocr_text(
+                                vl_text, name, engine=str(vl_meta.get("engine") or "")
+                            )
                             pipeline.append("vl-field-binder")
+                            invoice = merge_invoice(invoice, inv_vl)
+                            if _lines_useful(inv_vl.lines):
+                                invoice.lines = inv_vl.lines
+                            text = vl_text
+                            md = vl_text
+                            warnings, validation = validate_invoice(invoice)
                 except Exception as exc:  # noqa: BLE001
                     pipeline.append(f"photo-ocr-error:{exc}")
 
@@ -4168,9 +4244,7 @@ async def extract(
                 or any("kalemi" in w for w in warnings)
             )
         )
-        # Scanned / broken-text PDFs: prod keeps ENABLE_DOCLING_OCR=0 for speed,
-        # so force raster photo-OCR (and optional Docling OCR) when extract is weak.
-        # Scanned / broken-text PDFs only — do NOT send clean digital partials to VL.
+        # Scanned / broken-text: RapidOCR first, escalate to VL only if fields weak.
         force_raster = (
             not as_image
             and "fast-path" not in pipeline
@@ -4189,11 +4263,14 @@ async def extract(
                     bool(invoice.supplier.name)
                     and sum(1 for c in (invoice.supplier.name or "") if ord(c) < 32) >= 2
                 )
+                or needs_ocr_escalation(invoice, validation, warnings)
             )
         )
         if force_raster:
             try:
-                raster_txt, raster_meta = await run_pdf_raster_ocr(path, Path(tmp), 2)
+                raster_txt, raster_meta = await run_pdf_raster_ocr(
+                    path, Path(tmp), 2, prefer_vl=False
+                )
                 if raster_txt.strip():
                     pipeline.append(
                         f"pdf-raster-ocr:{raster_meta.get('engine', '?')}:"
@@ -4206,9 +4283,7 @@ async def extract(
                     inv_r = invoice_from_ocr_text(
                         raster_txt, name, engine=str(raster_meta.get("engine") or "")
                     )
-                    if "paddleocr-vl" in str(raster_meta.get("engine") or ""):
-                        pipeline.append("vl-field-binder")
-                    # Drop binary junk supplier before merge
+                    pipeline.append("ocr-field-binder")
                     if invoice.supplier and invoice.supplier.name:
                         if sum(1 for c in invoice.supplier.name if ord(c) < 32) >= 2:
                             invoice.supplier.name = None
@@ -4218,6 +4293,34 @@ async def extract(
                     text = (text + "\n\n" + raster_txt).strip() if text else raster_txt
                     md = (md + "\n\n" + raster_txt).strip() if md else raster_txt
                     warnings, validation = validate_invoice(invoice)
+
+                # VL last resort — only when RapidOCR/parse still fails generic gate
+                if (
+                    VL_OCR_ENABLED
+                    and needs_ocr_escalation(invoice, validation, warnings)
+                ):
+                    pipeline.append("vl-escalate")
+                    vl_txt, vl_meta = await run_pdf_raster_ocr(
+                        path, Path(tmp), 2, prefer_vl=True
+                    )
+                    if vl_txt.strip():
+                        pipeline.append(
+                            f"pdf-raster-vl:{vl_meta.get('engine', '?')}:"
+                            f"{vl_meta.get('elapsedMs', 0)}ms:"
+                            f"p{vl_meta.get('pages', 0)}"
+                        )
+                        from parse_vl_markdown import invoice_from_ocr_text
+
+                        inv_vl = invoice_from_ocr_text(
+                            vl_txt, name, engine=str(vl_meta.get("engine") or "")
+                        )
+                        pipeline.append("vl-field-binder")
+                        invoice = merge_invoice(invoice, inv_vl)
+                        if _lines_useful(inv_vl.lines):
+                            invoice.lines = inv_vl.lines
+                        text = (text + "\n\n" + vl_txt).strip() if text else vl_txt
+                        md = (md + "\n\n" + vl_txt).strip() if md else vl_txt
+                        warnings, validation = validate_invoice(invoice)
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"pdf-raster-ocr-error:{exc}")
 
