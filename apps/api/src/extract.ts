@@ -20,8 +20,12 @@ function isRetryableExtractError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const e = err as { name?: string; message?: string; cause?: unknown };
   const msg = `${e.name ?? ""} ${e.message ?? ""}`.toLowerCase();
+  // Do NOT retry abort/timeout: the extract service is almost certainly still
+  // OCR'ing the same scanned PDF, so a retry re-runs the whole raster+OCR
+  // pipeline and multiplies latency 2-3x. Only retry genuine connection
+  // failures (service down / socket reset), which are cheap to re-attempt.
   if (
-    /abort|timeout|econnreset|econnrefused|fetch failed|socket|network|und_err|other side closed/.test(
+    /econnreset|econnrefused|fetch failed|socket|network|und_err|other side closed/.test(
       msg,
     )
   ) {

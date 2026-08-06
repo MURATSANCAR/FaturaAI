@@ -51,12 +51,18 @@ PHOTO_OCR_WARMUP = os.getenv("PHOTO_OCR_WARMUP", "1") == "1"
 PHOTO_OCR_WARMUP_MEDIUM = os.getenv("PHOTO_OCR_WARMUP_MEDIUM", "0") == "1"
 # Cap concurrent OCR per uvicorn worker (3; SERIALIZE=1 after race seen in load test).
 PHOTO_OCR_MAX_INFLIGHT = max(1, int(os.getenv("PHOTO_OCR_MAX_INFLIGHT", "3")))
+# Serialize OCR inference inside a worker (OOM-safe). When on, effective
+# per-worker OCR concurrency is 1 regardless of MAX_INFLIGHT.
+PHOTO_OCR_SERIALIZE = os.getenv("PHOTO_OCR_SERIALIZE", "1") == "1"
 PHOTO_OCR_TIMEOUT_S = int(os.getenv("PHOTO_OCR_TIMEOUT_S", "90"))
 # PaddleOCR-VL: keep OFF on CPU prod (too slow). Opt-in for escalation experiments.
 VL_OCR_ENABLED = os.getenv("VL_OCR_ENABLED", "0") == "1"
 VL_OCR_TIMEOUT_S = int(os.getenv("VL_OCR_TIMEOUT_S", "900"))
 VL_OCR_WARMUP = os.getenv("VL_OCR_WARMUP", "0") == "1"
-PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "180")))
+PDF_RASTER_DPI = max(72, int(os.getenv("PDF_RASTER_DPI", "200")))
+# Pages rasterized/OCR'd for scanned PDFs. Was hardcoded to 2; 3 recovers
+# totals/line-items that spill to a 3rd page without a big latency hit.
+PDF_RASTER_MAX_PAGES = max(1, int(os.getenv("PDF_RASTER_MAX_PAGES", "3")))
 DOCLING_MAX_INFLIGHT = max(1, int(os.getenv("DOCLING_MAX_INFLIGHT", "1")))
 DOCLING_TIMEOUT_S = int(os.getenv("DOCLING_TIMEOUT_S", "120"))
 IMAGE_OCR_SCALE = float(os.getenv("IMAGE_OCR_SCALE", "2.0"))
@@ -83,6 +89,7 @@ app.add_middleware(
 )
 
 _docling_converter = None
+_docling_converters: dict[tuple[bool, bool], Any] = {}
 _docling_sem: asyncio.Semaphore | None = None
 _photo_ocr_sem: asyncio.Semaphore | None = None
 _metrics = {
@@ -109,7 +116,11 @@ def get_docling_sem() -> asyncio.Semaphore:
 def get_photo_ocr_sem() -> asyncio.Semaphore:
     global _photo_ocr_sem
     if _photo_ocr_sem is None:
-        _photo_ocr_sem = asyncio.Semaphore(PHOTO_OCR_MAX_INFLIGHT)
+        # When inference is serialized inside the worker (_infer_lock in
+        # photo_ocr), admitting >1 here only piles threads up on that lock,
+        # wasting RAM/threads. Cap admission at 1 to match reality.
+        cap = 1 if PHOTO_OCR_SERIALIZE else PHOTO_OCR_MAX_INFLIGHT
+        _photo_ocr_sem = asyncio.Semaphore(cap)
     return _photo_ocr_sem
 
 
@@ -5203,7 +5214,13 @@ def get_docling_converter(ocr: bool, for_image: bool = False):
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
 
-    # Cache non-OCR PDF converter (common path)
+    # Cache every (ocr, for_image) combo — building a DocumentConverter is
+    # expensive and the image-OCR converter was previously rebuilt per request.
+    cache_key = (ocr, for_image)
+    cached = _docling_converters.get(cache_key)
+    if cached is not None:
+        return cached
+    # Back-compat: keep the legacy single-slot global in sync for the common path
     if not ocr and not for_image and _docling_converter is not None:
         return _docling_converter
 
@@ -5249,6 +5266,7 @@ def get_docling_converter(ocr: bool, for_image: bool = False):
         format_options[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=options)
 
     converter = DocumentConverter(format_options=format_options)
+    _docling_converters[cache_key] = converter
     if not ocr and not for_image:
         _docling_converter = converter
     return converter
@@ -5589,6 +5607,13 @@ async def extract(
             texts, text_tags = await asyncio.to_thread(extract_pdf_texts, path)
             pipeline.extend(text_tags)
             text = "\n\n".join(texts)
+            # pdf-inspector already classified this as image-only: Docling
+            # structure would only emit "<!-- image -->" stubs. Skip it and go
+            # straight to raster OCR (big latency win on scanned PDFs).
+            is_scanned_pdf = any(
+                t in ("pdf-inspector-type:scanned", "pdf-inspector-type:image_based")
+                for t in text_tags
+            )
 
             invoice = Invoice()
             for blob in texts:
@@ -5603,6 +5628,8 @@ async def extract(
             if FAST_PATH_PDF and strong_text_invoice(invoice, validation_fp):
                 pipeline.append("fast-path")
                 _metrics["fast_path"] += 1
+            elif is_scanned_pdf:
+                pipeline.append("skip-docling:scanned")
             elif ENABLE_DOCLING:
                 try:
                     md, table_lines = await run_docling(path, ocr=False, for_image=False)
@@ -5696,7 +5723,7 @@ async def extract(
         if force_raster:
             try:
                 raster_txt, raster_meta = await run_pdf_raster_ocr(
-                    path, Path(tmp), 2, prefer_vl=False
+                    path, Path(tmp), PDF_RASTER_MAX_PAGES, prefer_vl=False
                 )
                 if raster_txt.strip():
                     pipeline.append(
@@ -5742,7 +5769,7 @@ async def extract(
                 ):
                     pipeline.append("vl-escalate")
                     vl_txt, vl_meta = await run_pdf_raster_ocr(
-                        path, Path(tmp), 2, prefer_vl=True
+                        path, Path(tmp), PDF_RASTER_MAX_PAGES, prefer_vl=True
                     )
                     if vl_txt.strip():
                         pipeline.append(
@@ -5768,7 +5795,13 @@ async def extract(
             or validation.confidence < 0.55
             or is_unusable_extract_text(md or text)
         )
-        if need_ocr or (force_raster and still_weak and ENABLE_DOCLING):
+        # Docling's own OCR is a slow, redundant second full-document OCR after
+        # RapidOCR already ran. Only run it when Docling OCR is explicitly
+        # enabled (ENABLE_DOCLING_OCR); prod keeps it off. `need_ocr` already
+        # requires ENABLE_DOCLING_OCR, so gate the raster-fallback clause too.
+        if need_ocr or (
+            force_raster and still_weak and ENABLE_DOCLING and ENABLE_DOCLING_OCR
+        ):
             try:
                 md2, table_lines2 = await run_docling(path, ocr=True, for_image=False)
                 pipeline.append("docling-ocr")

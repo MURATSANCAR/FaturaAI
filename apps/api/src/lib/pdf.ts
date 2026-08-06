@@ -35,21 +35,22 @@ export async function extractPdfTextDetailed(
     let inspectorText = "";
     let popplerText = "";
 
-    if (PDF_INSPECTOR_ENABLED) {
-      try {
-        const inspected = await runPdfInspector(pdfPath);
-        if (inspected.text.trim().length >= 40) {
-          inspectorText = inspected.text;
-        }
-      } catch {
-        // optional
-      }
-    }
+    // Run both extractors concurrently — they are independent subprocesses and
+    // sequencing them just doubled fast-path latency on every PDF.
+    const [inspectedRes, popplerRes] = await Promise.allSettled([
+      PDF_INSPECTOR_ENABLED ? runPdfInspector(pdfPath) : Promise.resolve(null),
+      runPdftotext(pdfPath),
+    ]);
 
-    try {
-      popplerText = await runPdftotext(pdfPath);
-    } catch {
-      // optional if inspector already succeeded
+    if (
+      inspectedRes.status === "fulfilled" &&
+      inspectedRes.value &&
+      inspectedRes.value.text.trim().length >= 40
+    ) {
+      inspectorText = inspectedRes.value.text;
+    }
+    if (popplerRes.status === "fulfilled") {
+      popplerText = popplerRes.value;
     }
 
     if (inspectorText && popplerText.trim().length >= 40) {
