@@ -174,6 +174,8 @@ def run_batch(
     n = len(files)
     print(f"\n=== LOAD TEST {label}: {n} uploads ===", flush=True)
     t0 = time.time()
+    sampler = ResourceSampler(interval=2.0)
+    sampler.start()
 
     # health snapshot
     try:
@@ -297,6 +299,9 @@ def run_batch(
                 )
 
     t1 = time.time()
+    sampler.stop()
+    sampler.join(timeout=5)
+    resources = sampler.summary()
     wall = t1 - t0
     submit_wall = t_submit_done - t0
     processed = ok + partial + failed
@@ -343,6 +348,7 @@ def run_batch(
         },
         "healthBefore": health0,
         "healthAfter": health1,
+        "resources": resources,
     }
 
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +371,8 @@ def run_batch(
 | Extract min / max | {report['durationMs']['min']} / {report['durationMs']['max']} ms |
 | Submit workers | {submit_workers} |
 | Create interval | {create_interval_ms} ms |
+| **CPU** (avg / peak) | **{resources['cpuPctAvg']}% / {resources['cpuPctPeak']}%** of {resources['cores']} cores ({resources['coresBusyAvg']} / {resources['coresBusyPeak']} cores busy) |
+| **RAM used** (avg / peak) | **{resources['ramUsedAvgGb']} / {resources['ramUsedPeakGb']} GB** of {resources['ramTotalGb']} GB |
 
 Started: `{report['startedAt']}` · Finished: `{report['finishedAt']}`
 """
@@ -418,16 +426,20 @@ def main() -> int:
         summary.append(rep)
 
     # Combined summary markdown
-    lines = ["# FaturaAI Load Test Summary\n", "| Batch | N | Wall (s) | Wall (min) | job/s | job/min | OK | Partial | Failed | p50 ms | p95 ms | p99 ms |",
-             "|-------|---|----------|------------|-------|---------|----|---------|--------|--------|--------|--------|"]
+    lines = ["# FaturaAI Load Test Summary\n", "| Batch | N | Wall (s) | Wall (min) | job/s | job/min | OK | Partial | Failed | p50 ms | p95 ms | p99 ms | CPU avg/peak | cores busy | RAM avg/peak GB |",
+             "|-------|---|----------|------------|-------|---------|----|---------|--------|--------|--------|--------|-------------|------------|-----------------|"]
     for r in summary:
         d = r["durationMs"]
         c = r["counts"]
+        rs = r.get("resources") or {}
         lines.append(
             f"| {r['label']} | {r['n']} | {r['wallSeconds']} | {r['wallSeconds']/60:.1f} | "
             f"{r['throughputJobsPerSec']} | {r['throughputJobsPerMin']} | "
             f"{c['ok']} | {c['partial']} | {c['failed']} | "
-            f"{d['p50']} | {d['p95']} | {d['p99']} |"
+            f"{d['p50']} | {d['p95']} | {d['p99']} | "
+            f"{rs.get('cpuPctAvg')}%/{rs.get('cpuPctPeak')}% | "
+            f"{rs.get('coresBusyAvg')}/{rs.get('coresBusyPeak')} | "
+            f"{rs.get('ramUsedAvgGb')}/{rs.get('ramUsedPeakGb')} |"
         )
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(args.reports) / f"SUMMARY-{stamp}.md"
