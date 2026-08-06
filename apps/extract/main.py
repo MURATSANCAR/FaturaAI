@@ -2800,16 +2800,25 @@ def rebalance_party_tax_ids(inv: Invoice, text: str = "") -> None:
     # Same id on both sides
     if st and ct and st == ct:
         if len(st) == 11:
-            # Person TCKN belongs to customer
+            # Person TCKN belongs to customer, not supplier
             s.taxId = None
             s.taxIdScheme = None
             st = ""
             c.taxId, c.taxIdScheme = ct, "TCKN"
         elif len(st) == 10 and st.startswith("5") and not is_valid_vkn(st):
-            # Likely phone fragment, not company VKN
+            # Likely phone fragment, not a company VKN — drop from both
             s.taxId = None
             s.taxIdScheme = None
             st = ""
+            c.taxId = None
+            c.taxIdScheme = None
+            ct = ""
+        else:
+            # Same company VKN on both sides: the buyer grabbed the seller's id
+            # (MERSİS/footer bleed). Supplier owns it — clear the customer copy.
+            c.taxId = None
+            c.taxIdScheme = None
+            ct = ""
 
     st = normalize_ocr_digits(s.taxId) or digits_only(s.taxId)
     ct = normalize_ocr_digits(c.taxId) or digits_only(c.taxId)
@@ -5164,7 +5173,12 @@ def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
     if not supplier_tax_warnings:
         need(bool(inv.supplier.taxId), "Satıcı VKN/TCKN bulunamadı", 0.1)
     if not customer_tax_warnings:
-        need(bool(inv.customer.taxId), "Alıcı VKN/TCKN bulunamadı", 0.04)
+        # e-Arşiv B2C: final-consumer buyer legitimately has no real tax id
+        # (GİB placeholder 11111111111) — not a defect, so don't warn.
+        if inv.documentType == "earsiv":
+            checks.append("ok:Alıcı VKN (nihai tüketici / e-Arşiv)")
+        else:
+            need(bool(inv.customer.taxId), "Alıcı VKN/TCKN bulunamadı", 0.04)
     need(inv.totals.payableAmount is not None, "Ödenecek tutar bulunamadı", 0.16)
     need(len(inv.lines) > 0, "Mal/hizmet kalemi bulunamadı", 0.14)
 

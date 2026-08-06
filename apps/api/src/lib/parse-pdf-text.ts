@@ -216,6 +216,20 @@ function extractSupplier(text: string): InvoiceParty {
 
   if (companyIdx >= 0) {
     let name = lines[companyIdx];
+    // If the matched line is only a legal-suffix continuation (e.g.
+    // "TAŞ.SAN.VE TİC.LTD.ŞTİ."), the company name began on the previous line
+    // ("MODA JANT LASTİK OTO TUR.İNŞ.GIDA"). Prepend it.
+    const prev = lines[companyIdx - 1];
+    if (
+      companyIdx > 0 &&
+      prev &&
+      /^(?:VE\s+)?(?:SAN|T[İI]C|LTD|TA[ŞS]|A\.?\s*Ş)/i.test(name) &&
+      !/^(?:Tel|Web|E-?Posta|Vergi|TCKN|VKN|Adres|ŞUBE|Kurumsal\s+Ofis)/i.test(prev) &&
+      !isRegistryOrChromeLine(prev) &&
+      !looksLikeAddressLine(prev)
+    ) {
+      name = `${prev} ${name}`;
+    }
     const nxt = lines[companyIdx + 1];
     if (
       nxt &&
