@@ -121,6 +121,15 @@ function LineCard({
             {formatMoney(line.vatAmount, currency)}
           </div>
         </div>
+        {(line.discountAmount != null || line.discountRate != null) && (
+          <div>
+            <div className="label">İskonto</div>
+            <div className="mt-0.5 font-semibold text-slate-800">
+              {formatMoney(line.discountAmount, currency)}
+              {line.discountRate != null ? ` (%${line.discountRate})` : ""}
+            </div>
+          </div>
+        )}
       </div>
     </article>
   );
@@ -227,6 +236,15 @@ function InvoiceResult({
                 />
                 <Field label="Vergi Dairesi" value={inv.customer.taxOffice} />
                 <Field label="Adres" value={inv.customer.address} />
+                {inv.customer.phone && (
+                  <Field label="Telefon" value={inv.customer.phone} />
+                )}
+                {inv.customer.email && (
+                  <Field label="E-posta" value={inv.customer.email} />
+                )}
+                {inv.customer.website && (
+                  <Field label="Web" value={inv.customer.website} />
+                )}
               </div>
             </section>
           </div>
@@ -258,6 +276,7 @@ function InvoiceResult({
                     <th className="px-2 py-2 font-semibold">Açıklama</th>
                     <th className="px-2 py-2 font-semibold">Miktar</th>
                     <th className="px-2 py-2 font-semibold">Birim fiyat</th>
+                    <th className="px-2 py-2 font-semibold">İskonto</th>
                     <th className="px-2 py-2 font-semibold">KDV</th>
                     <th className="px-2 py-2 font-semibold">KDV tutarı</th>
                     <th className="px-2 py-2 font-semibold">Tutar</th>
@@ -285,6 +304,13 @@ function InvoiceResult({
                         {formatMoney(line.unitPrice, currency)}
                       </td>
                       <td className="whitespace-nowrap px-2 py-3">
+                        {line.discountAmount != null
+                          ? formatMoney(line.discountAmount, currency)
+                          : line.discountRate != null
+                            ? `%${line.discountRate}`
+                            : "—"}
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-3">
                         {line.vatRate != null ? `%${line.vatRate}` : "—"}
                       </td>
                       <td className="whitespace-nowrap px-2 py-3">
@@ -297,7 +323,7 @@ function InvoiceResult({
                   ))}
                   {inv.lines.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-2 py-6 text-center text-slate-500">
+                      <td colSpan={8} className="px-2 py-6 text-center text-slate-500">
                         Kalem bulunamadı
                       </td>
                     </tr>
