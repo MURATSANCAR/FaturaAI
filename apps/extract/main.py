@@ -4094,7 +4094,15 @@ def parse_text_invoice(text: str, file_name: str = "") -> Invoice:
         tax_inclusive = payable
     # Photo OCR often flips the leading digit (36.994 vs 26.994). Prefer the
     # candidate that matches line totals × (1+KDV) when available.
-    if lines_sum and lines_sum >= 10:
+    # But when the document explicitly states ÖDENECEK and VERGİ DAHİL and they
+    # agree, they are authoritative — never let a line-sum estimate clobber them
+    # (rounded line totals can differ from the real matrah by 1 kuruş).
+    stated_total_authoritative = (
+        odenecek is not None
+        and vergi_dahil is not None
+        and abs(odenecek - vergi_dahil) < 0.05
+    )
+    if lines_sum and lines_sum >= 10 and not stated_total_authoritative:
         expected_cands = [round(lines_sum * (1 + r), 2) for r in (0.20, 0.18, 0.10, 0.08, 0.01, 0.0)]
         pool = [a for a in (payable, tax_inclusive, odenecek, vergi_dahil) if a is not None]
         best = None

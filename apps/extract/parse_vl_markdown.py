@@ -360,6 +360,9 @@ def _unglue_repeated_name(s: str) -> str:
     return s
 
 
+_OCR_ACCENT_FIX = str.maketrans({"Í": "İ", "Ì": "İ", "Ï": "İ", "í": "i", "ì": "i", "ï": "i"})
+
+
 def _person_name_from_block(block: str) -> str | None:
     junk = re.compile(
         r"(?i)^(?:Tel|Fax|Web|E-?Posta|Vergi|VKN|TCKN|Adres|SAYIN|Kap[ıi]|"
@@ -386,11 +389,16 @@ def _person_name_from_block(block: str) -> str | None:
         if am and am.start() >= 6:
             s = s[: am.start()].strip(" -/")
         s = _unglue_repeated_name(s)
+        # Normalize OCR accent lookalikes back to Turkish İ/i (ÇEVÍK → ÇEVİK).
+        s = s.translate(_OCR_ACCENT_FIX)
         words = s.split()
-        if 2 <= len(words) <= 6 and all(re.match(r"(?i)^[A-ZÇĞİÖŞÜa-zçğıöşü'.-]+$", w) for w in words):
+        # Include OCR-accented Latin lookalikes (Í/í/Î/Â… for İ/i) so a name like
+        # "GÜRKAN ÇEVÍK" isn't rejected and we fall through to a city line.
+        _NM = r"A-ZÇĞİÖŞÜÂÊÎÔÛÍÌÏÉÈa-zçğıöşüâêîôûíìïéè"
+        if 2 <= len(words) <= 6 and all(re.match(rf"(?i)^[{_NM}'.-]+$", w) for w in words):
             return s[:120]
-        if 1 <= len(words) <= 4 and re.match(r"(?i)^[A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜa-zçğıöşü'. -]+$", s):
-            letters = re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü]", "", s)
+        if 1 <= len(words) <= 4 and re.match(rf"(?i)^[{_NM}][{_NM}'. -]+$", s):
+            letters = re.sub(rf"[^{_NM}]", "", s)
             if len(letters) >= 6:
                 return s[:120]
     return None
