@@ -84,7 +84,9 @@ class ResourceSampler(threading.Thread):
     def __init__(self, interval: float = 2.0):
         super().__init__(daemon=True)
         self.interval = interval
-        self._stop = threading.Event()
+        # Do not name this `_stop` — that shadows threading.Thread._stop() and
+        # breaks join(). Use a distinct attribute.
+        self._stop_evt = threading.Event()
         self.cpu_samples: list[float] = []
         self.ram_used: list[float] = []
         self.ram_total_gb = 0.0
@@ -92,7 +94,7 @@ class ResourceSampler(threading.Thread):
 
     def run(self) -> None:
         prev_idle, prev_total = _read_cpu()
-        while not self._stop.wait(self.interval):
+        while not self._stop_evt.wait(self.interval):
             idle, total = _read_cpu()
             d_total = total - prev_total
             d_idle = idle - prev_idle
@@ -104,7 +106,7 @@ class ResourceSampler(threading.Thread):
             self.ram_total_gb = tot
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
     def summary(self) -> dict:
         cpu = self.cpu_samples
