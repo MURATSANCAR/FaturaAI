@@ -25,7 +25,7 @@ cd "$DIR"
 
 if ! command -v pdftotext >/dev/null 2>&1; then
   sudo apt-get update -qq
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y poppler-utils
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y poppler-utils libzbar0
 fi
 
 # --- Extract venv (reuse Docling from QA venv via --system-site-packages if needed) ---

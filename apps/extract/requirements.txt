@@ -10,6 +10,8 @@ pillow-heif>=0.16.0; platform_system != "Windows"
 onnxruntime>=1.17
 openvino>=2024.0
 opencv-python-headless>=4.8
+# GİB QR code reader (needs system libzbar0 — installed by deploy)
+pyzbar>=0.1.9
 rapidocr>=3.9.0
 numpy<2.3
 # Layout-agnostic VL (PaddleOCR-VL-1.6). paddlepaddle installed by deploy from CPU index.

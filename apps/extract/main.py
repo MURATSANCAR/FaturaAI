@@ -5147,6 +5147,52 @@ def heal_invoice_totals(inv: Invoice, text: str = "") -> None:
         t.payableAmount = ti
 
 
+def apply_qr_fields(inv: Invoice, qr: dict[str, Any]) -> list[str]:
+    """Overlay authoritative GİB-QR fields onto a parsed invoice.
+
+    QR carries exact identity fields and bottom-line totals. We only trust the
+    unambiguous ones (identity + ödenecek/vergidahil); matrah/KDV vary by ERP
+    (some emit kdvmatrah == KDV amount), so those are left to the parser.
+    """
+    from tax_id import is_placeholder_tax_id
+
+    applied: list[str] = []
+
+    no = (qr.get("invoiceNumber") or "").strip()
+    if no and re.match(r"(?i)^[A-Z0-9]{3,5}\d{10,16}$", no) and inv.invoiceNumber != no:
+        inv.invoiceNumber = no
+        applied.append("no")
+    if qr.get("issueDate") and inv.issueDate != qr["issueDate"]:
+        inv.issueDate = qr["issueDate"]
+        applied.append("date")
+    if qr.get("uuid") and not inv.uuid:
+        inv.uuid = qr["uuid"]
+        applied.append("ettn")
+    if qr.get("documentType") and inv.documentType in (None, "", "unknown"):
+        inv.documentType = qr["documentType"]
+        applied.append("docType")
+
+    for who, key in ((inv.supplier, "supplierTaxId"), (inv.customer, "customerTaxId")):
+        tx = qr.get(key)
+        if tx and len(tx) in (10, 11) and not is_placeholder_tax_id(tx) and who.taxId != tx:
+            who.taxId = tx
+            who.taxIdScheme = "TCKN" if len(tx) == 11 else "VKN"
+            applied.append(key)
+
+    # Bottom-line totals: authoritative. ödenecek preferred, else vergidahil.
+    pay = qr.get("payableAmount")
+    if pay is None:
+        pay = qr.get("taxInclusiveAmount")
+    if pay is not None and pay > 0 and inv.totals.payableAmount != pay:
+        inv.totals.payableAmount = pay
+        applied.append("payable")
+    ti = qr.get("taxInclusiveAmount")
+    if ti is not None and ti > 0 and inv.totals.taxInclusiveAmount is None:
+        inv.totals.taxInclusiveAmount = ti
+        applied.append("taxInclusive")
+    return applied
+
+
 def validate_invoice(inv: Invoice) -> tuple[list[str], Validation]:
     warnings: list[str] = []
     checks: list[str] = []
@@ -5834,6 +5880,22 @@ async def extract(
                 warnings, validation = validate_invoice(invoice)
             except Exception as exc:  # noqa: BLE001
                 pipeline.append(f"docling-ocr-error:{exc}")
+
+        # GİB QR code: authoritative identity + total fields (100% accurate when
+        # present). Overlays parser/OCR guesses. Free-ish: one page-1 render.
+        try:
+            from qr_invoice import read_invoice_qr
+
+            qr = read_invoice_qr(path)
+            if qr:
+                applied = apply_qr_fields(invoice, qr)
+                if applied:
+                    rebalance_party_tax_ids(invoice, text)
+                    pipeline.append(f"qr:{','.join(applied)}")
+                else:
+                    pipeline.append("qr:detected")
+        except Exception as exc:  # noqa: BLE001
+            pipeline.append(f"qr-error:{exc}")
 
         scrub_invoice_lines(invoice)
         warnings, validation = validate_invoice(invoice)
