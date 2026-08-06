@@ -55,6 +55,73 @@ def get_job(job_id: str, timeout: float = 60) -> dict:
     return data
 
 
+def _read_cpu() -> tuple[int, int]:
+    """Return (idle, total) jiffies from /proc/stat aggregate cpu line."""
+    with open("/proc/stat") as f:
+        parts = f.readline().split()
+    vals = [int(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+    total = sum(vals)
+    return idle, total
+
+
+def _read_mem() -> tuple[float, float]:
+    """Return (used_gb, total_gb) from /proc/meminfo (MemTotal-MemAvailable)."""
+    total_kb = avail_kb = 0
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                total_kb = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                avail_kb = int(line.split()[1])
+    used_gb = (total_kb - avail_kb) / 1024 / 1024
+    return used_gb, total_kb / 1024 / 1024
+
+
+class ResourceSampler(threading.Thread):
+    """Sample system-wide CPU% and RAM used every `interval` seconds."""
+
+    def __init__(self, interval: float = 2.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self._stop = threading.Event()
+        self.cpu_samples: list[float] = []
+        self.ram_used: list[float] = []
+        self.ram_total_gb = 0.0
+        self.cores = os.cpu_count() or 1
+
+    def run(self) -> None:
+        prev_idle, prev_total = _read_cpu()
+        while not self._stop.wait(self.interval):
+            idle, total = _read_cpu()
+            d_total = total - prev_total
+            d_idle = idle - prev_idle
+            prev_idle, prev_total = idle, total
+            if d_total > 0:
+                self.cpu_samples.append(100.0 * (d_total - d_idle) / d_total)
+            used, tot = _read_mem()
+            self.ram_used.append(used)
+            self.ram_total_gb = tot
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def summary(self) -> dict:
+        cpu = self.cpu_samples
+        ram = self.ram_used
+        return {
+            "cores": self.cores,
+            "samples": len(cpu),
+            "cpuPctAvg": round(statistics.mean(cpu), 1) if cpu else None,
+            "cpuPctPeak": round(max(cpu), 1) if cpu else None,
+            "coresBusyAvg": round(statistics.mean(cpu) / 100 * self.cores, 1) if cpu else None,
+            "coresBusyPeak": round(max(cpu) / 100 * self.cores, 1) if cpu else None,
+            "ramTotalGb": round(self.ram_total_gb, 1),
+            "ramUsedAvgGb": round(statistics.mean(ram), 1) if ram else None,
+            "ramUsedPeakGb": round(max(ram), 1) if ram else None,
+        }
+
+
 def ensure_corpus(src_dir: Path, corpus_dir: Path, total: int) -> list[Path]:
     sources = sorted(src_dir.glob("*.pdf"))
     if len(sources) < 1:
