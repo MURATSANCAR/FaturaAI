@@ -210,6 +210,9 @@ function InvoiceResult({
                 <Field label="Adres" value={inv.supplier.address} />
                 <Field label="Telefon" value={inv.supplier.phone} />
                 <Field label="E-posta" value={inv.supplier.email} />
+                {inv.supplier.website && (
+                  <Field label="Web" value={inv.supplier.website} />
+                )}
               </div>
             </section>
             <section className="glass p-4 sm:p-5">
