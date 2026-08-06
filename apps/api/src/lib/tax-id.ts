@@ -46,6 +46,9 @@ export function isPlaceholderTaxId(value: string | null | undefined): boolean {
 
 export function isValidTckn(value: string | null | undefined): boolean {
   const n = normalizeOcrDigits(value) || digitsOnly(value);
+  // GİB final-consumer placeholder is a legitimate identifier (checksum fails
+  // by design) — accept it so e-Arşiv B2C invoices don't look "invalid".
+  if (n === PLACEHOLDER_TCKN) return true;
   if (isPlaceholderTaxId(n)) return false;
   if (n.length !== 11 || !/^\d+$/.test(n) || n[0] === "0") return false;
   const d = n.split("").map((c) => Number(c));
@@ -88,7 +91,10 @@ export function coerceTaxId(
   value: string | null | undefined,
 ): { taxId: string; scheme: "VKN" | "TCKN" } | null {
   const n = normalizeOcrDigits(value);
-  if (!n || isPlaceholderTaxId(n)) return null;
+  if (!n) return null;
+  // Keep the GİB final-consumer placeholder so the buyer party can carry it.
+  if (n === PLACEHOLDER_TCKN) return { taxId: PLACEHOLDER_TCKN, scheme: "TCKN" };
+  if (isPlaceholderTaxId(n)) return null;
   if (n.length === 11) return { taxId: n, scheme: "TCKN" };
   if (n.length === 10) return { taxId: n, scheme: "VKN" };
   return null;

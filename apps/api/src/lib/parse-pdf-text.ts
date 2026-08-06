@@ -3,8 +3,10 @@ import {
   coerceTaxId,
   digitsOnly,
   isPlaceholderTaxId,
+  isPlaceholderTckn,
   isValidTaxId,
   normalizeOcrDigits,
+  PLACEHOLDER_TCKN,
 } from "./tax-id.js";
 import type { InvoiceLine, InvoiceParty, ParsedInvoice } from "../types.js";
 
@@ -1158,7 +1160,25 @@ export function parseGibPdfText(text: string, fileName = ""): ParsedInvoice {
 function sanitizePartyTaxId(party: InvoiceParty, role: string): string[] {
   const warnings: string[] = [];
   const raw = normalizeOcrDigits(party.taxId) || digitsOnly(party.taxId);
-  if (!raw || isPlaceholderTaxId(raw)) {
+  if (!raw) {
+    party.taxId = null;
+    party.taxIdScheme = null;
+    return warnings;
+  }
+  // GİB final-consumer placeholder (11111111111): a legitimate buyer identifier
+  // on e-Arşiv B2C invoices. Keep it for the buyer (no "missing tax id" warning);
+  // a supplier never carries it, so drop it there.
+  if (isPlaceholderTckn(raw)) {
+    if (role === "Alıcı") {
+      party.taxId = PLACEHOLDER_TCKN;
+      party.taxIdScheme = "TCKN";
+    } else {
+      party.taxId = null;
+      party.taxIdScheme = null;
+    }
+    return warnings;
+  }
+  if (isPlaceholderTaxId(raw)) {
     party.taxId = null;
     party.taxIdScheme = null;
     return warnings;
